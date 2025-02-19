@@ -265,8 +265,15 @@ class SparseAttention(Module):
         fk = rearrange(fk, 'b h (w n) d -> b h w n d', w = num_fine_blocks)
         fv = rearrange(fv, 'b h (w n) d -> b h w n d', w = num_fine_blocks)
 
-        fk = einx.get_at('b h [w] j d, b h i selected -> b h i selected j d', fk, selected_block_indices)
-        fv = einx.get_at('b h [w] j d, b h i selected -> b h i selected j d', fv, selected_block_indices)
+        # get_at("b h [w] j d, b h i selected -> b h i selected j d", fkv, selected_block_indices)
+
+        fk = repeat(fk, 'b h w j d -> b h i w j d', i = selected_block_indices.shape[2])
+        fv = repeat(fv, 'b h w j d -> b h i w j d', i = selected_block_indices.shape[2])
+
+        selected_block_indices = repeat(selected_block_indices, 'b h i sel -> b h i sel j d', j = fk.shape[-2], d = fk.shape[-1])
+
+        fk = fk.gather(3, selected_block_indices)
+        fv = fv.gather(3, selected_block_indices)
 
         # handle maybe gating
 
