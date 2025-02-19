@@ -63,6 +63,11 @@ def round_down_mult(n, mult):
 def round_up_mult(n, mult):
     return ceil(n / mult) * mult
 
+def pad_at_dim(t, pad, dim = -1, value = 0.):
+    dims_from_right = (- dim - 1) if dim < 0 else (t.ndim - dim - 1)
+    zeros = ((0, 0) * dims_from_right)
+    return F.pad(t, (*zeros, *pad), value = value)
+
 # classes
 
 class SparseAttention(Module):
@@ -213,8 +218,8 @@ class SparseAttention(Module):
 
         if seq_len < fine_divisible_seq_len:
             remainder = fine_divisible_seq_len - seq_len
-            fk = F.pad(fk, (0, 0, 0, remainder), value = 0.)
-            fv = F.pad(fv, (0, 0, 0, remainder), value = 0.)
+            fk = pad_at_dim(fk, (0, remainder), value = 0., dim = -2)
+            fv = pad_at_dim(fv, (0, remainder), value = 0., dim = -2)
             fmask = F.pad(fmask, (0, remainder), value = False)
 
         fk = rearrange(fk, 'b h (w n) d -> b h w n d', w = num_fine_blocks)
@@ -226,7 +231,7 @@ class SparseAttention(Module):
 
         fsim = einsum(q, fk, 'b h i d, b h i j d -> b h i j') * self.scale
 
-        fsim = fsim.masked_fill(fmask, -torch.finfo(fsim.dtype).max)
+        fsim = fsim.masked_fill(fmask, mask_value)
 
         fattn = fsim.softmax(dim = -1)
 
