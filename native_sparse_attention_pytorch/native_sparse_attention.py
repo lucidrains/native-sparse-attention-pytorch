@@ -206,7 +206,7 @@ class SparseAttention(Module):
         ck_seq = ((arange(num_compress_blocks, device = device) + 1) * self.compress_block_size) - 1
         ck_seq = F.pad(ck_seq, (num_mem_compress_kv, 0), value = -1)
 
-        cmask = einx.less('j, i -> i j', ck_seq, cq_seq)
+        cmask = einx.less_equal('j, i -> i j', ck_seq, cq_seq)
 
         mask_value = -torch.finfo(csim.dtype).max
 
