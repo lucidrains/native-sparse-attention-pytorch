@@ -7,8 +7,6 @@ from torch import nn, arange, stack, cat
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
 
-from colt5_attention import topk as differentiable_topk
-
 from local_attention import LocalAttention
 
 from rotary_embedding_torch import RotaryEmbedding
@@ -87,7 +85,6 @@ class SparseAttention(Module):
         num_compressed_mem_kv = 4,
         norm = True,
         use_diff_topk = False,
-        diff_topk_coor_descent_iters = 10.
     ):
         super().__init__()
         self.heads = heads
@@ -142,7 +139,6 @@ class SparseAttention(Module):
         # selection related
 
         self.use_diff_topk = use_diff_topk
-        self.diff_topk_coor_descent_iters = diff_topk_coor_descent_iters
 
         self.selection_block_size = selection_block_size
         self.num_selected_blocks = num_selected_blocks
@@ -222,12 +218,12 @@ class SparseAttention(Module):
 
         # 2. fine attention over selected based on compressed attention logits
 
-        importance_scores = csim[..., num_mem_compress_kv:]
+        importance_scores = cattn[..., num_mem_compress_kv:]
+
+        selected_importance_values, selected_block_indices = importance_scores.topk(self.num_selected_blocks, dim = -1)
 
         if self.use_diff_topk:
-            selected_importance_values, selected_block_indices, _, gates = differentiable_topk(importance_scores, self.num_selected_blocks, fused = True)
-        else:
-            selected_importance_values, selected_block_indices = importance_scores.topk(self.num_selected_blocks, dim = -1)
+            gates = selected_importance_values + (1. - selected_importance_values).detach()
 
         fmask = selected_importance_values > mask_value
 
@@ -246,6 +242,9 @@ class SparseAttention(Module):
             fmask = pad_at_dim(fmask, (0, remainder), value = False, dim = -2)
 
             selected_block_indices = pad_at_dim(selected_block_indices, (0, remainder), value = 0, dim = -2)
+
+            if self.use_diff_topk:
+                gates = pad_at_dim(gates, (0, remainder), value = 1., dim = -2)
 
         # handle block causal diagonal in the diagram, but run experiments without to see
 
@@ -272,7 +271,7 @@ class SparseAttention(Module):
         # handle maybe gating
 
         if self.use_diff_topk:
-            gates = F.pad(gates, (0, 1, 0, remainder), value = 1.)
+            gates = F.pad(gates, (0, 1), value = 1.)
 
             fk = einx.multiply('b h i w, b h i w j d -> b h i w j d', gates, fk)
             fv = einx.multiply('b h i w, b h i w j d -> b h i w j d', gates, fv)

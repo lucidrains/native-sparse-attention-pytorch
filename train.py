@@ -98,6 +98,7 @@ model = Transformer(
         compress_block_size = 32,
         selection_block_size = 32,
         num_selected_blocks = 2,
+        use_diff_topk = False
     )
 ).cuda()
 
