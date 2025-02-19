@@ -214,6 +214,7 @@ class SparseAttention(Module):
 
         fmask = selected_importance_values > mask_value
 
+        fq = q
         fk = k
         fv = v
 
@@ -221,6 +222,11 @@ class SparseAttention(Module):
             remainder = fine_divisible_seq_len - seq_len
             fk = pad_at_dim(fk, (0, remainder), value = 0., dim = -2)
             fv = pad_at_dim(fv, (0, remainder), value = 0., dim = -2)
+            fq = pad_at_dim(fq, (0, remainder), value = 0., dim = -2)
+
+            fmask = pad_at_dim(fmask, (0, remainder), value = False, dim = -2)
+
+            selected_block_indices = pad_at_dim(selected_block_indices, (0, remainder), value = 0, dim = -2)
 
         fk = rearrange(fk, 'b h (w n) d -> b h w n d', w = num_fine_blocks)
         fv = rearrange(fv, 'b h (w n) d -> b h w n d', w = num_fine_blocks)
@@ -229,13 +235,15 @@ class SparseAttention(Module):
         fk = einx.get_at('b h [w] j d, b h i selected -> b h i (selected j) d', fk, selected_block_indices)
         fv = einx.get_at('b h [w] j d, b h i selected -> b h i (selected j) d', fv, selected_block_indices)
 
-        fsim = einsum(q, fk, 'b h i d, b h i j d -> b h i j') * self.scale
+        fsim = einsum(fq, fk, 'b h i d, b h i j d -> b h i j') * self.scale
 
         fsim = fsim.masked_fill(fmask, mask_value)
 
         fattn = fsim.softmax(dim = -1)
 
         fine_out = einsum(fattn, fv, 'b h i j, b h i j d -> b h i d')
+
+        fine_out = fine_out[..., :seq_len, :]
 
         # 3. overlapping sliding window, this is unsurprising and expected
 
