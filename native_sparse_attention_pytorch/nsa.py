@@ -3,7 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
 
-from einops import einsum
+from einops import einsum, repeat
 from einops.layers.torch import Rearrange
 
 from local_attention import LocalAttention
@@ -27,6 +27,9 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def round_down_mult(n, mult):
+    return n // mult * mult
 
 # classes
 
@@ -59,6 +62,8 @@ class Attention(Module):
         )
 
         # compress strategy
+
+        self.compress_block_size = compress_block_size
 
         self.k_intrablock_positions = nn.Parameter(torch.zeros(heads, compress_block_size, dim_head))
         self.v_intrablock_positions = nn.Parameter(torch.zeros(heads, compress_block_size, dim_head))
@@ -95,6 +100,8 @@ class Attention(Module):
         self,
         inp
     ):
+        seq_len = inp.shape[-2]
+        block_divisible_seq_len = round_down_mult(seq_len, self.compress_block_size)
 
         inp = self.norm(inp)
 
@@ -102,7 +109,27 @@ class Attention(Module):
 
         q, k, v = map(self.split_heads, (q, k, v))
 
-        out = self.sliding_window(q, k, v)
+        # compressed key / values
+
+        k_pos = repeat(self.k_intrablock_positions, 'h n d -> h (r n) d', r = block_divisible_seq_len // self.compress_block_size)
+        v_pos = repeat(self.v_intrablock_positions, 'h n d -> h (r n) d', r = block_divisible_seq_len // self.compress_block_size)
+
+        ck = self.k_compress(k[..., :block_divisible_seq_len, :] + k_pos)
+        cv = self.v_compress(v[..., :block_divisible_seq_len, :] + v_pos)
+
+        # todo - coarse and fine attn strategies
+
+        # sliding window
+
+        local_attn_out = self.sliding_window(q, k, v)
+
+        # combine strategies
+
+        strategy_weighted_combine = self.to_strategy_combine(inp)
+
+        out = (strategy_weighted_combine * stack((compress_out, local_attn_out), dim = -1)).sum(dim = -1)
+
+        # merge heads and combine them
 
         out = self.merge_heads(out)
 
