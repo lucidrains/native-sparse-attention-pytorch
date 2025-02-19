@@ -28,6 +28,20 @@ try:
 except ImportError:
     pass
 
+# flex attn sliding attention mask
+
+def create_sliding_mask(seq_len, window_size):
+    def sliding_mask(_, __, q_idx, kv_idx):
+        causal_mask = q_idx >= kv_idx
+
+        sliding_mask = (q_idx - kv_idx) <= window_size
+        causal_mask = causal_mask & sliding_mask
+
+        return causal_mask
+
+    block_mask = create_block_mask(sliding_mask, B = None, H = None, Q_LEN = seq_len, KV_LEN = seq_len, _compile = True)
+    return block_mask
+
 # helpers
 
 def exists(v):
