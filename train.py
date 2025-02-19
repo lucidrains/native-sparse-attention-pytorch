@@ -29,7 +29,7 @@ USE_SPARSE_ATTN = True
 
 PROJECT_NAME = 'native-sparse-attention'
 RUN_NAME = 'baseline' if not USE_SPARSE_ATTN else 'sparse-attn'
-WANDB_ONLINE = False # turn this on to pipe experiment to cloud
+WANDB_ONLINE = True # turn this on to pipe experiment to cloud
 
 # helpers
 
@@ -153,6 +153,7 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
 
         (loss / GRAD_ACCUM_EVERY).backward()
 
+    wandb.log(dict(loss = loss.item()), step = i)
     print(f"training loss: {loss.item():.3f}")
 
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
@@ -166,6 +167,7 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
             valid_data = next(val_loader)
 
             loss = model(valid_data, return_loss = True)
+            wandb.log(dict(valid_loss = loss.item()), step = i)
             print(f"validation loss: {loss.item():.3f}")
 
     if i % GENERATE_EVERY == 0:

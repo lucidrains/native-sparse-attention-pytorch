@@ -47,6 +47,8 @@ Then
 $ python train.py
 ```
 
+To record some of your experiments, just invoke `wandb login` first before modifying the training script
+
 ## Citations
 
 ```bibtex
