@@ -60,6 +60,9 @@ class Attention(Module):
 
         # compress strategy
 
+        self.k_intrablock_positions = nn.Parameter(torch.zeros(heads, compress_block_size, dim_head))
+        self.v_intrablock_positions = nn.Parameter(torch.zeros(heads, compress_block_size, dim_head))
+
         self.k_compress = nn.Sequential(
             Rearrange('b h n d -> b (h d) n'),
             nn.Conv1d(dim_head * heads, dim_head * heads, compress_block_size, stride = compress_block_size, groups = heads),
