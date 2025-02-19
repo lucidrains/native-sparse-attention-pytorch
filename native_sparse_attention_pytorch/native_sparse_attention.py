@@ -266,19 +266,19 @@ class SparseAttention(Module):
 
         fattn = fsim.softmax(dim = -1)
 
-        fine_out = einsum(fattn, fv, 'b h i j, b h i j d -> b h i d')
+        fine_attn_out = einsum(fattn, fv, 'b h i j, b h i j d -> b h i d')
 
-        fine_out = fine_out[..., :seq_len, :]
+        fine_attn_out = fine_attn_out[..., :seq_len, :]
 
         # 3. overlapping sliding window, this is unsurprising and expected
 
-        local_attn_out = self.sliding_window(q, k, v)
+        sliding_window_attn_out = self.sliding_window(q, k, v)
 
         # combine strategies
 
         strategy_weighted_combine = self.to_strategy_combine(inp)
 
-        out = einsum(strategy_weighted_combine, stack([compressed_attn_out, fine_out, local_attn_out]), 'b h n s, s b h n d -> b h n d')
+        out = einsum(strategy_weighted_combine, stack([compressed_attn_out, fine_attn_out, sliding_window_attn_out]), 'b h n s, s b h n d -> b h n d')
 
         # merge heads and combine them
 
