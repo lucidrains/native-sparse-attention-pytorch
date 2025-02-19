@@ -7,6 +7,8 @@ from torch import nn, arange, stack, cat
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
 
+from colt5_attention import topk as differentiable_topk
+
 from local_attention import LocalAttention
 
 from rotary_embedding_torch import RotaryEmbedding
@@ -84,8 +86,11 @@ class SparseAttention(Module):
         num_selected_blocks,
         num_compressed_mem_kv = 4,
         norm = True,
+        use_diff_topk = False,
+        diff_topk_coor_descent_iters = 10.
     ):
         super().__init__()
+        self.heads = heads
         self.scale = dim_head ** -0.5
 
         assert compress_block_size == selection_block_size, 'start off with compressed being equal to selection block sizes'
@@ -136,6 +141,9 @@ class SparseAttention(Module):
 
         # selection related
 
+        self.use_diff_topk = use_diff_topk
+        self.diff_topk_coor_descent_iters = diff_topk_coor_descent_iters
+
         self.selection_block_size = selection_block_size
         self.num_selected_blocks = num_selected_blocks
 
@@ -160,7 +168,7 @@ class SparseAttention(Module):
         self,
         inp
     ):
-        batch, seq_len, scale, device = *inp.shape[:2], self.scale, inp.device
+        batch, seq_len, scale, heads, device = *inp.shape[:2], self.scale, self.heads, inp.device
 
         compress_divisible_seq_len = round_down_mult(seq_len, self.compress_block_size)
         num_compress_blocks = compress_divisible_seq_len // self.compress_block_size
@@ -216,7 +224,10 @@ class SparseAttention(Module):
 
         importance_scores = csim[..., num_mem_compress_kv:]
 
-        selected_importance_values, selected_block_indices = importance_scores.topk(self.num_selected_blocks, dim = -1)
+        if self.use_diff_topk:
+            selected_importance_values, selected_block_indices, _, gates = differentiable_topk(importance_scores, self.num_selected_blocks, fused = True)
+        else:
+            selected_importance_values, selected_block_indices = importance_scores.topk(self.num_selected_blocks, dim = -1)
 
         fmask = selected_importance_values > mask_value
 
@@ -239,13 +250,13 @@ class SparseAttention(Module):
         # handle block causal diagonal in the diagram, but run experiments without to see
 
         fine_window_seq = arange(fine_divisible_seq_len, device = device) // self.selection_block_size
-        fine_window_seq = rearrange(fine_window_seq, 'n -> n 1').expand_as(selected_block_indices)
+        fine_window_seq = repeat(fine_window_seq, 'n -> b h n 1', b = batch, h = heads)
         selected_block_indices = cat((selected_block_indices, fine_window_seq), dim = -1) # for the block causal diagonal in fig2
 
         fmask = repeat(fmask, 'b h i w -> b h i w j', j = self.selection_block_size)
 
         causal_mask = torch.ones((self.selection_block_size,) * 2, device = device, dtype = torch.bool).tril()
-        causal_mask = repeat(causal_mask, 'i j -> (w i) 1 j', w = num_fine_blocks).expand_as(fmask)
+        causal_mask = repeat(causal_mask, 'i j -> b h (w i) 1 j', w = num_fine_blocks, b = batch, h = heads)
 
         fmask = cat((fmask, causal_mask), dim = -2)
         fmask = rearrange(fmask, 'b h i w j -> b h i (w j)')
@@ -255,8 +266,19 @@ class SparseAttention(Module):
         fk = rearrange(fk, 'b h (w n) d -> b h w n d', w = num_fine_blocks)
         fv = rearrange(fv, 'b h (w n) d -> b h w n d', w = num_fine_blocks)
 
-        fk = einx.get_at('b h [w] j d, b h i selected -> b h i (selected j) d', fk, selected_block_indices)
-        fv = einx.get_at('b h [w] j d, b h i selected -> b h i (selected j) d', fv, selected_block_indices)
+        fk = einx.get_at('b h [w] j d, b h i selected -> b h i selected j d', fk, selected_block_indices)
+        fv = einx.get_at('b h [w] j d, b h i selected -> b h i selected j d', fv, selected_block_indices)
+
+        # handle maybe gating
+
+        if self.use_diff_topk:
+            gates = F.pad(gates, (0, 1, 0, remainder), value = 1.)
+
+            fk = einx.multiply('b h i w, b h i w j d -> b h i w j d', gates, fk)
+            fv = einx.multiply('b h i w, b h i w j d -> b h i w j d', gates, fv)
+
+        fk = rearrange(fk, 'b h i w j d -> b h i (w j) d')
+        fv = rearrange(fv, 'b h i w j d -> b h i (w j) d')
 
         # fine attention
 
