@@ -102,7 +102,8 @@ class SparseAttention(Module):
             dim = dim_head,
             window_size = sliding_window_size,
             causal = True,
-            exact_windowsize = True
+            exact_windowsize = True,
+            autopad = True
         )
 
         # compress strategy
@@ -220,7 +221,6 @@ class SparseAttention(Module):
             remainder = fine_divisible_seq_len - seq_len
             fk = pad_at_dim(fk, (0, remainder), value = 0., dim = -2)
             fv = pad_at_dim(fv, (0, remainder), value = 0., dim = -2)
-            fmask = F.pad(fmask, (0, remainder), value = False)
 
         fk = rearrange(fk, 'b h (w n) d -> b h w n d', w = num_fine_blocks)
         fv = rearrange(fv, 'b h (w n) d -> b h w n d', w = num_fine_blocks)
