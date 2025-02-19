@@ -36,6 +36,7 @@ class Attention(Module):
         dim_head,
         heads,
         sliding_window_size,
+        compress_block_size,
         norm = True,
     ):
         super().__init__()
@@ -54,6 +55,20 @@ class Attention(Module):
             window_size = sliding_window_size,
             causal = True,
             exact_window_size = True
+        )
+
+        # compress strategy
+
+        self.k_compress = nn.Sequential(
+            Rearrange('b h n d -> b (h d) n'),
+            nn.Conv1d(dim_head * heads, dim_head * heads, compress_block_size, stride = compress_block_size, groups = heads),
+            Rearrange('b (h d) nc -> b h nc d', h = heads)
+        )
+
+        self.v_compress = nn.Sequential(
+            Rearrange('b h n d -> b (h d) n'),
+            nn.Conv1d(dim_head * heads, dim_head * heads, compress_block_size, stride = compress_block_size, groups = heads),
+            Rearrange('b (h d) nc -> b h nc d', h = heads)
         )
 
         # they combine the three sparse branches through a learned combine with sigmoid activation
