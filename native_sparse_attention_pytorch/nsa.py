@@ -65,9 +65,11 @@ class SparseAttention(Module):
         compress_block_size,
         selection_block_size,
         num_selected_blocks,
+        num_compressed_mem_kv = 4,
         norm = True,
     ):
         super().__init__()
+        self.scale = dim_head ** -0.5
 
         assert compress_block_size == selection_block_size, 'start off with compressed being equal to selection block sizes'
 
@@ -92,7 +94,7 @@ class SparseAttention(Module):
 
         self.compress_block_size = compress_block_size
 
-        self.compress_mem_kv = nn.Parameter(torch.zeros(2, heads, dim_head))
+        self.compress_mem_kv = nn.Parameter(torch.zeros(2, heads, num_compressed_mem_kv, dim_head))
         self.k_intrablock_positions = nn.Parameter(torch.zeros(heads, compress_block_size, dim_head))
         self.v_intrablock_positions = nn.Parameter(torch.zeros(heads, compress_block_size, dim_head))
 
@@ -134,7 +136,7 @@ class SparseAttention(Module):
         self,
         inp
     ):
-        batch, seq_len = inp.shape[:2]
+        batch, seq_len, scale = *inp.shape[:2], self.scale
 
         block_divisible_seq_len = round_down_mult(seq_len, self.compress_block_size)
 
@@ -158,10 +160,18 @@ class SparseAttention(Module):
 
         # 1. coarse attention over compressed
 
-        mem_ck, mem_cv = repeat(self.compress_mem_kv, 'kv h d -> kv b h 1 d', b = batch)
+        mem_ck, mem_cv = repeat(self.compress_mem_kv, 'kv ... -> kv b ...', b = batch)
+
+        num_mem_compress_kv = mem_ck.shape[-2]
 
         ck = cat((mem_ck, ck), dim = -2)
         cv = cat((mem_cv, cv), dim = -2)
+
+        csim = einsum(q, ck, 'b h i d, b h j d -> b h i j') * self.scale
+
+        cattn = csim.softmax(dim = -1)
+
+        compressed_attn_out = einsum(cattn, cv, 'b h i j, b h j d -> b h i d')
 
         # 2. fine attention over selected based on compressed attention logits (todo)
 
@@ -173,7 +183,7 @@ class SparseAttention(Module):
 
         strategy_weighted_combine = self.to_strategy_combine(inp)
 
-        out = einsum(strategy_weighted_combine, stack([local_attn_out] * 3), 'b h n s, s b h n d -> b h n d')
+        out = einsum(strategy_weighted_combine, stack([local_attn_out, local_attn_out, compressed_attn_out]), 'b h n s, s b h n d -> b h n d')
 
         # merge heads and combine them
 
