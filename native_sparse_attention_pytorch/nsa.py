@@ -1,5 +1,9 @@
+from __future__ import annotations
+
+from math import ceil
+
 import torch
-from torch import nn, stack, cat
+from torch import nn, arange, stack, cat
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
 
@@ -8,14 +12,15 @@ from local_attention import LocalAttention
 # einstein notation
 
 import einx
-from einops import einsum, repeat, reduce
+from einops import einsum, repeat, rearrange
 from einops.layers.torch import Rearrange
 
 # b - batch
-# n - sequence (token level or compressed)
 # h - heads
-# d - feature dimension
+# n - sequence (token level or compressed)
 # w - windows, for fine or compressed
+# i, j - query / key sequence
+# d - feature dimension
 # s - strategies
 
 # flex attention
@@ -54,6 +59,9 @@ def default(v, d):
 
 def round_down_mult(n, mult):
     return n // mult * mult
+
+def round_up_mult(n, mult):
+    return ceil(n / mult) * mult
 
 # classes
 
@@ -142,8 +150,11 @@ class SparseAttention(Module):
     ):
         batch, seq_len, scale, device = *inp.shape[:2], self.scale, inp.device
 
-        block_divisible_seq_len = round_down_mult(seq_len, self.compress_block_size)
-        num_compress_blocks = block_divisible_seq_len // self.compress_block_size
+        compress_divisible_seq_len = round_down_mult(seq_len, self.compress_block_size)
+        num_compress_blocks = compress_divisible_seq_len // self.compress_block_size
+
+        fine_divisible_seq_len = round_up_mult(seq_len, self.selection_block_size)
+        num_fine_blocks = fine_divisible_seq_len // self.selection_block_size
 
         # maybe prenorm
 
@@ -160,8 +171,8 @@ class SparseAttention(Module):
         k_pos = repeat(self.k_intrablock_positions, 'h n d -> h (r n) d', r = num_compress_blocks)
         v_pos = repeat(self.v_intrablock_positions, 'h n d -> h (r n) d', r = num_compress_blocks)
 
-        ck = self.k_compress(k[..., :block_divisible_seq_len, :] + k_pos)
-        cv = self.v_compress(v[..., :block_divisible_seq_len, :] + v_pos)
+        ck = self.k_compress(k[..., :compress_divisible_seq_len, :] + k_pos)
+        cv = self.v_compress(v[..., :compress_divisible_seq_len, :] + v_pos)
 
         # 1. coarse attention over compressed
 
@@ -174,20 +185,52 @@ class SparseAttention(Module):
 
         csim = einsum(q, ck, 'b h i d, b h j d -> b h i j') * self.scale
 
-        cq_seq = torch.arange(seq_len, device = device)
+        cq_seq = arange(seq_len, device = device)
 
-        ck_seq = ((torch.arange(num_compress_blocks) + 1) * self.compress_block_size) - 1
+        ck_seq = ((arange(num_compress_blocks) + 1) * self.compress_block_size) - 1
         ck_seq = F.pad(ck_seq, (num_mem_compress_kv, 0), value = -1)
 
         cmask = einx.less('j, i -> i j', ck_seq, cq_seq)
 
-        csim = csim.masked_fill(cmask, -torch.finfo(csim.dtype).max)
+        mask_value = -torch.finfo(csim.dtype).max
+
+        csim = csim.masked_fill(cmask, mask_value)
 
         cattn = csim.softmax(dim = -1)
 
         compressed_attn_out = einsum(cattn, cv, 'b h i j, b h j d -> b h i d')
 
-        # 2. fine attention over selected based on compressed attention logits (todo)
+        # 2. fine attention over selected based on compressed attention logits
+
+        importance_scores = csim[..., num_mem_compress_kv:]
+
+        selected_importance_values, selected_block_indices = importance_scores.topk(self.num_selected_blocks, dim = -1)
+
+        fmask = selected_importance_values > mask_value
+
+        fk = k
+        fv = v
+
+        if seq_len < fine_divisible_seq_len:
+            remainder = fine_divisible_seq_len - seq_len
+            fk = F.pad(fk, (0, 0, 0, remainder), value = 0.)
+            fv = F.pad(fv, (0, 0, 0, remainder), value = 0.)
+            fmask = F.pad(fmask, (0, remainder), value = False)
+
+        fk = rearrange(fk, 'b h (w n) d -> b h w n d', w = num_fine_blocks)
+        fv = rearrange(fv, 'b h (w n) d -> b h w n d', w = num_fine_blocks)
+        fmask = repeat(fmask, 'b h i w -> b h i (w j)', j = self.selection_block_size)
+
+        fk = einx.get_at('b h [w] j d, b h i selected -> b h i (selected j) d', fk, selected_block_indices)
+        fv = einx.get_at('b h [w] j d, b h i selected -> b h i (selected j) d', fv, selected_block_indices)
+
+        fsim = einsum(q, fk, 'b h i d, b h i j d -> b h i j') * self.scale
+
+        fsim = fsim.masked_fill(fmask, -torch.finfo(fsim.dtype).max)
+
+        fattn = fsim.softmax(dim = -1)
+
+        fine_out = einsum(fattn, fv, 'b h i j, b h i j d -> b h i d')
 
         # 3. overlapping sliding window, this is unsurprising and expected
 
@@ -197,7 +240,7 @@ class SparseAttention(Module):
 
         strategy_weighted_combine = self.to_strategy_combine(inp)
 
-        out = einsum(strategy_weighted_combine, stack([local_attn_out, local_attn_out, compressed_attn_out]), 'b h n s, s b h n d -> b h n d')
+        out = einsum(strategy_weighted_combine, stack([compressed_attn_out, fine_out, local_attn_out]), 'b h n s, s b h n d -> b h n d')
 
         # merge heads and combine them
 
