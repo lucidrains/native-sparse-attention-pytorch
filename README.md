@@ -1,6 +1,6 @@
 ## Native Sparse Attention (wip)
 
-Implementation of the sparse attention pattern proposed by the Deepseek team in their "Native Sparse Attention" paper
+Implementation of the sparse attention pattern proposed by the Deepseek team in their [Native Sparse Attention](https://arxiv.org/abs/2502.11089) paper
 
 ## Citations
 
