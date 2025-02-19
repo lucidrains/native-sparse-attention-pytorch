@@ -5,6 +5,8 @@ from torch.nn import Module, ModuleList
 
 from einops.layers.torch import Rearrange
 
+from local_attention import LocalAttention
+
 # flex attention
 # https://pytorch.org/blog/flexattention/
 
@@ -33,7 +35,8 @@ class Attention(Module):
         dim,
         dim_head,
         heads,
-        norm = True
+        sliding_window_size,
+        norm = True,
     ):
         super().__init__()
         dim_inner = dim_head * heads
@@ -43,6 +46,15 @@ class Attention(Module):
         # qkv
 
         self.to_qkv = nn.Linear(dim, dim_inner * 3, bias = False)
+
+        # sliding window strategy
+
+        self.sliding_window = LocalAttention(
+            dim = dim_head,
+            window_size = sliding_window_size,
+            causal = True,
+            exact_window_size = True
+        )
 
         # they combine the three sparse branches through a learned combine with sigmoid activation
 

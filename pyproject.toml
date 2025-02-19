@@ -24,6 +24,7 @@ classifiers=[
 
 dependencies = [
     "einops>=0.8.0",
+    "local-attention>=1.11.1",
     "torch>=2.2",
 ]
 
