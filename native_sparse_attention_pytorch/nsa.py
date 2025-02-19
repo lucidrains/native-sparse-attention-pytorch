@@ -64,6 +64,7 @@ class SparseAttention(Module):
         sliding_window_size,
         compress_block_size,
         selection_block_size,
+        num_selected_blocks,
         norm = True,
     ):
         super().__init__()
@@ -91,6 +92,7 @@ class SparseAttention(Module):
 
         self.compress_block_size = compress_block_size
 
+        self.compress_mem_kv = nn.Parameter(torch.zeros(2, heads, dim_head))
         self.k_intrablock_positions = nn.Parameter(torch.zeros(heads, compress_block_size, dim_head))
         self.v_intrablock_positions = nn.Parameter(torch.zeros(heads, compress_block_size, dim_head))
 
@@ -109,6 +111,7 @@ class SparseAttention(Module):
         # selection related
 
         self.selection_block_size = selection_block_size
+        self.num_selected_blocks = num_selected_blocks
 
         # they combine the three sparse branches through a learned combine with sigmoid activation
 
@@ -131,10 +134,15 @@ class SparseAttention(Module):
         self,
         inp
     ):
-        seq_len = inp.shape[-2]
+        batch, seq_len = inp.shape[:2]
+
         block_divisible_seq_len = round_down_mult(seq_len, self.compress_block_size)
 
+        # maybe prenorm
+
         inp = self.norm(inp)
+
+        # queries, keys, values
 
         q, k, v = self.to_qkv(inp).chunk(3, dim = -1)
 
@@ -148,9 +156,16 @@ class SparseAttention(Module):
         ck = self.k_compress(k[..., :block_divisible_seq_len, :] + k_pos)
         cv = self.v_compress(v[..., :block_divisible_seq_len, :] + v_pos)
 
-        # todo - coarse and fine attn strategies
+        # 1. coarse attention over compressed
 
-        # sliding window
+        mem_ck, mem_cv = repeat(self.compress_mem_kv, 'kv h d -> kv b h 1 d', b = batch)
+
+        ck = cat((mem_ck, ck), dim = -2)
+        cv = cat((mem_cv, cv), dim = -2)
+
+        # 2. fine attention over selected based on compressed attention logits (todo)
+
+        # 3. overlapping sliding window, this is unsurprising and expected
 
         local_attn_out = self.sliding_window(q, k, v)
 
