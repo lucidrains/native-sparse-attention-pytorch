@@ -218,6 +218,7 @@ class SparseAttention(Module):
         fk = k
         fv = v
 
+
         if seq_len < fine_divisible_seq_len:
             remainder = fine_divisible_seq_len - seq_len
             fk = pad_at_dim(fk, (0, remainder), value = 0., dim = -2)
@@ -228,12 +229,29 @@ class SparseAttention(Module):
 
             selected_block_indices = pad_at_dim(selected_block_indices, (0, remainder), value = 0, dim = -2)
 
+        # handle block causal diagonal in the diagram, but run experiments without to see
+
+        fine_window_seq = arange(fine_divisible_seq_len, device = device) // self.selection_block_size
+        fine_window_seq = rearrange(fine_window_seq, 'n -> n 1').expand_as(selected_block_indices)
+        selected_block_indices = cat((selected_block_indices, fine_window_seq), dim = -1) # for the block causal diagonal in fig2
+
+        fmask = repeat(fmask, 'b h i w -> b h i w j', j = self.selection_block_size)
+
+        causal_mask = torch.ones((self.selection_block_size,) * 2, device = device, dtype = torch.bool).tril()
+        causal_mask = repeat(causal_mask, 'i j -> (w i) 1 j', w = num_fine_blocks).expand_as(fmask)
+
+        fmask = cat((fmask, causal_mask), dim = -2)
+        fmask = rearrange(fmask, 'b h i w j -> b h i (w j)')
+
+        # select out the spatial crops of keys / values for fine attention
+
         fk = rearrange(fk, 'b h (w n) d -> b h w n d', w = num_fine_blocks)
         fv = rearrange(fv, 'b h (w n) d -> b h w n d', w = num_fine_blocks)
-        fmask = repeat(fmask, 'b h i w -> b h i (w j)', j = self.selection_block_size)
 
         fk = einx.get_at('b h [w] j d, b h i selected -> b h i (selected j) d', fk, selected_block_indices)
         fv = einx.get_at('b h [w] j d, b h i selected -> b h i (selected j) d', fv, selected_block_indices)
+
+        # fine attention
 
         fsim = einsum(fq, fk, 'b h i d, b h i j d -> b h i j') * self.scale
 
