@@ -33,6 +33,20 @@ attended = attn(tokens)
 assert tokens.shape == attended.shape
 ```
 
+## Example
+
+Enwik8 language modeling
+
+```bash
+$ pip install .[examples]
+```
+
+Then
+
+```bash
+$ python train.py
+```
+
 ## Citations
 
 ```bibtex

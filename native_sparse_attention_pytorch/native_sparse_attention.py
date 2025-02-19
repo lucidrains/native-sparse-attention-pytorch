@@ -9,6 +9,8 @@ from torch.nn import Module, ModuleList
 
 from local_attention import LocalAttention
 
+from rotary_embedding_torch import RotaryEmbedding
+
 # einstein notation
 
 import einx
@@ -91,6 +93,10 @@ class SparseAttention(Module):
         dim_inner = dim_head * heads
 
         self.norm = nn.RMSNorm(dim) if norm else nn.Identity()
+
+        # rotary
+
+        self.rotary_emb = RotaryEmbedding(dim_head)
 
         # qkv
 
@@ -193,14 +199,14 @@ class SparseAttention(Module):
 
         cq_seq = arange(seq_len, device = device)
 
-        ck_seq = ((arange(num_compress_blocks) + 1) * self.compress_block_size) - 1
+        ck_seq = ((arange(num_compress_blocks, device = device) + 1) * self.compress_block_size) - 1
         ck_seq = F.pad(ck_seq, (num_mem_compress_kv, 0), value = -1)
 
         cmask = einx.less('j, i -> i j', ck_seq, cq_seq)
 
         mask_value = -torch.finfo(csim.dtype).max
 
-        csim = csim.masked_fill(cmask, mask_value)
+        csim = csim.masked_fill(~cmask, mask_value)
 
         cattn = csim.softmax(dim = -1)
 
@@ -218,6 +224,7 @@ class SparseAttention(Module):
         fk = k
         fv = v
 
+        fq, fk = self.rotary_emb.rotate_queries_with_cached_keys(fq, fk)
 
         if seq_len < fine_divisible_seq_len:
             remainder = fine_divisible_seq_len - seq_len
@@ -255,7 +262,7 @@ class SparseAttention(Module):
 
         fsim = einsum(fq, fk, 'b h i d, b h i j d -> b h i j') * self.scale
 
-        fsim = fsim.masked_fill(fmask, mask_value)
+        fsim = fsim.masked_fill(~fmask, mask_value)
 
         fattn = fsim.softmax(dim = -1)
 

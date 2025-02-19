@@ -1,6 +1,6 @@
 [project]
 name = "native-sparse-attention-pytorch"
-version = "0.0.2"
+version = "0.0.3"
 description = "Native Sparse Attention"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -26,6 +26,7 @@ dependencies = [
     "einx>=0.3.0",
     "einops>=0.8.0",
     "local-attention>=1.11.1",
+    "rotary-embedding-torch",
     "torch>=2.2",
 ]
 
@@ -34,7 +35,11 @@ Homepage = "https://pypi.org/project/native-sparse-attention-pytorch/"
 Repository = "https://github.com/lucidrains/native-sparse-attention-pytorch"
 
 [project.optional-dependencies]
-examples = []
+
+examples = [
+    "tqdm",
+    "wandb"
+]
 test = [
     "pytest"
 ]
