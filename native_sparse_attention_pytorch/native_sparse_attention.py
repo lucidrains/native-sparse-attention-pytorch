@@ -225,7 +225,7 @@ class SparseAttention(Module):
         if self.use_diff_topk:
             gates = selected_importance_values + (1. - selected_importance_values).detach()
 
-        fmask = selected_importance_values > mask_value
+        fmask = selected_importance_values > 1e-10
 
         fq = q
         fk = k
