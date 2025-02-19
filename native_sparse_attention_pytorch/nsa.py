@@ -7,7 +7,8 @@ from local_attention import LocalAttention
 
 # einstein notation
 
-from einops import einsum, repeat
+import einx
+from einops import einsum, repeat, reduce
 from einops.layers.torch import Rearrange
 
 # b - batch
@@ -94,6 +95,8 @@ class SparseAttention(Module):
 
         self.compress_block_size = compress_block_size
 
+        assert num_compressed_mem_kv > 0
+
         self.compress_mem_kv = nn.Parameter(torch.zeros(2, heads, num_compressed_mem_kv, dim_head))
         self.k_intrablock_positions = nn.Parameter(torch.zeros(heads, compress_block_size, dim_head))
         self.v_intrablock_positions = nn.Parameter(torch.zeros(heads, compress_block_size, dim_head))
@@ -136,9 +139,10 @@ class SparseAttention(Module):
         self,
         inp
     ):
-        batch, seq_len, scale = *inp.shape[:2], self.scale
+        batch, seq_len, scale, device = *inp.shape[:2], self.scale, inp.device
 
         block_divisible_seq_len = round_down_mult(seq_len, self.compress_block_size)
+        num_compress_blocks = block_divisible_seq_len // self.compress_block_size
 
         # maybe prenorm
 
@@ -152,8 +156,8 @@ class SparseAttention(Module):
 
         # compressed key / values
 
-        k_pos = repeat(self.k_intrablock_positions, 'h n d -> h (r n) d', r = block_divisible_seq_len // self.compress_block_size)
-        v_pos = repeat(self.v_intrablock_positions, 'h n d -> h (r n) d', r = block_divisible_seq_len // self.compress_block_size)
+        k_pos = repeat(self.k_intrablock_positions, 'h n d -> h (r n) d', r = num_compress_blocks)
+        v_pos = repeat(self.v_intrablock_positions, 'h n d -> h (r n) d', r = num_compress_blocks)
 
         ck = self.k_compress(k[..., :block_divisible_seq_len, :] + k_pos)
         cv = self.v_compress(v[..., :block_divisible_seq_len, :] + v_pos)
@@ -168,6 +172,15 @@ class SparseAttention(Module):
         cv = cat((mem_cv, cv), dim = -2)
 
         csim = einsum(q, ck, 'b h i d, b h j d -> b h i j') * self.scale
+
+        cq_seq = torch.arange(seq_len, device = device)
+
+        ck_seq = ((torch.arange(num_compress_blocks) + 1) * self.compress_block_size) - 1
+        ck_seq = F.pad(ck_seq, (num_mem_compress_kv, 0), value = -1)
+
+        cmask = einx.less('j, i -> i j', ck_seq, cq_seq)
+
+        csim = csim.masked_fill(cmask, -torch.finfo(csim.dtype).max)
 
         cattn = csim.softmax(dim = -1)
 
