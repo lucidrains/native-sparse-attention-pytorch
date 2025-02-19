@@ -12,9 +12,10 @@ from einops import einsum, repeat, reduce
 from einops.layers.torch import Rearrange
 
 # b - batch
-# n - sequence
+# n - sequence (token level or compressed)
 # h - heads
 # d - feature dimension
+# w - windows, for fine or compressed
 # s - strategies
 
 # flex attention
