@@ -1,3 +1,3 @@
-from native_sparse_attention.nsa import (
-    Attention
+from native_sparse_attention_pytorch.nsa import (
+    SparseAttention
 )

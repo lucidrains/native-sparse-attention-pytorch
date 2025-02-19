@@ -1,12 +1,20 @@
 import torch
-from torch import nn
+from torch import nn, stack, cat
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
+
+from local_attention import LocalAttention
+
+# einstein notation
 
 from einops import einsum, repeat
 from einops.layers.torch import Rearrange
 
-from local_attention import LocalAttention
+# b - batch
+# n - sequence
+# h - heads
+# d - feature dimension
+# s - strategies
 
 # flex attention
 # https://pytorch.org/blog/flexattention/
@@ -33,7 +41,7 @@ def round_down_mult(n, mult):
 
 # classes
 
-class Attention(Module):
+class SparseAttention(Module):
     def __init__(
         self,
         dim,
@@ -41,9 +49,13 @@ class Attention(Module):
         heads,
         sliding_window_size,
         compress_block_size,
+        selection_block_size,
         norm = True,
     ):
         super().__init__()
+
+        assert compress_block_size == selection_block_size, 'start off with compressed being equal to selection block sizes'
+
         dim_inner = dim_head * heads
 
         self.norm = nn.RMSNorm(dim) if norm else nn.Identity()
@@ -58,7 +70,7 @@ class Attention(Module):
             dim = dim_head,
             window_size = sliding_window_size,
             causal = True,
-            exact_window_size = True
+            exact_windowsize = True
         )
 
         # compress strategy
@@ -80,11 +92,16 @@ class Attention(Module):
             Rearrange('b (h d) nc -> b h nc d', h = heads)
         )
 
+        # selection related
+
+        self.selection_block_size = selection_block_size
+
         # they combine the three sparse branches through a learned combine with sigmoid activation
 
         self.to_strategy_combine = nn.Sequential(
-            nn.Linear(dim, 3),
-            nn.Sigmoid()
+            nn.Linear(dim, 3 * heads),
+            nn.Sigmoid(),
+            Rearrange('b n (h s) -> b h n s', h = heads)
         )
 
         # split and merging heads
@@ -127,7 +144,7 @@ class Attention(Module):
 
         strategy_weighted_combine = self.to_strategy_combine(inp)
 
-        out = (strategy_weighted_combine * stack((compress_out, local_attn_out), dim = -1)).sum(dim = -1)
+        out = einsum(strategy_weighted_combine, stack([local_attn_out] * 3), 'b h n s, s b h n d -> b h n d')
 
         # merge heads and combine them
 
