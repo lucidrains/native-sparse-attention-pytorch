@@ -3,6 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
 
+from einops import einsum
 from einops.layers.torch import Rearrange
 
 from local_attention import LocalAttention
@@ -91,4 +92,15 @@ class Attention(Module):
         self,
         inp
     ):
-        return inp
+
+        inp = self.norm(inp)
+
+        q, k, v = self.to_qkv(inp).chunk(3, dim = -1)
+
+        q, k, v = map(self.split_heads, (q, k, v))
+
+        out = self.sliding_window(q, k, v)
+
+        out = self.merge_heads(out)
+
+        return self.combine_heads(out)
