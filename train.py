@@ -18,7 +18,7 @@ BATCH_SIZE = 4
 GRAD_ACCUM_EVERY = 4
 LEARNING_RATE = 1e-4
 VALIDATE_EVERY = 100
-PRIME_LENGTH = 128
+PRIME_LENGTH = 64
 GENERATE_EVERY = 500
 GENERATE_LENGTH = 256
 SEQ_LEN = 256
@@ -95,9 +95,9 @@ model = Transformer(
     use_sparse_attn = USE_SPARSE_ATTN,
     sparse_attn_kwargs = dict(
         sliding_window_size = 32,
-        compress_block_size = 4,
-        selection_block_size = 4,
-        num_selected_blocks = 1,
+        compress_block_size = 32,
+        selection_block_size = 32,
+        num_selected_blocks = 2,
     )
 ).cuda()
 
