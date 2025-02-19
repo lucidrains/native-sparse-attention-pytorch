@@ -29,7 +29,7 @@ USE_SPARSE_ATTN = True
 
 PROJECT_NAME = 'native-sparse-attention'
 RUN_NAME = 'baseline' if not USE_SPARSE_ATTN else 'sparse-attn'
-WANDB_ONLINE = True # turn this on to pipe experiment to cloud
+WANDB_ONLINE = False # turn this on to pipe experiment to cloud
 
 # helpers
 
