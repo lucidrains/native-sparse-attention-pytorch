@@ -1,6 +1,6 @@
 [project]
 name = "native-sparse-attention-pytorch"
-version = "0.0.12"
+version = "0.0.14"
 description = "Native Sparse Attention"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -27,7 +27,7 @@ dependencies = [
     "einops>=0.8.0",
     "local-attention>=1.11.1",
     "rotary-embedding-torch",
-    "torch>=2.2",
+    "torch>=2.5",
 ]
 
 [project.urls]

@@ -8,7 +8,19 @@ from einops.layers.torch import Rearrange
 
 from rotary_embedding_torch import RotaryEmbedding
 
-from native_sparse_attention_pytorch.native_sparse_attention import SparseAttention
+from native_sparse_attention_pytorch.native_sparse_attention import SparseAttention, create_sliding_mask
+
+# flex attention
+# https://pytorch.org/blog/flexattention/
+
+flex_attention = None
+
+try:
+    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+    if torch.cuda.is_available():
+        flex_attention = torch.compile(flex_attention)
+except ImportError:
+    pass
 
 # functions
 
@@ -96,6 +108,7 @@ class Transformer(Module):
         heads = 8,
         ff_expansion_factor = 4.,
         use_sparse_attn = False,
+        use_flex_sliding_window = False,
         sparse_attn_kwargs: dict = dict(
             sliding_window_size = 32,
             compress_block_size = 4,
@@ -105,6 +118,12 @@ class Transformer(Module):
     ):
         super().__init__()
         self.token_emb = nn.Embedding(num_tokens, dim)
+
+        if use_flex_sliding_window:
+            assert exists(flex_attention), 'flex attention is not available on your current version of pytorch'
+
+        self.use_sparse_attn = use_sparse_attn
+        self.use_flex_sliding_window = use_flex_sliding_window
 
         layers = []
         for _ in range(depth):
@@ -123,6 +142,8 @@ class Transformer(Module):
 
             layers.append(ModuleList([attn, ff]))
 
+        self.attn_sliding_window_size = attn.sliding_window_size
+
         self.layers = ModuleList(layers)
 
         self.norm = RMSNorm(dim)
@@ -131,15 +152,37 @@ class Transformer(Module):
     def forward(
         self,
         ids,
-        return_loss = False
+        return_loss = False,
+        disable_flex = False
     ):
         if return_loss:
             ids, labels = ids[:, :-1], ids[:, 1:]
 
+        seq_len = ids.shape[-1]
+
+        # token embedding
+
         tokens = self.token_emb(ids)
 
+        # prepare maybe flex attention masks
+
+        attn_kwargs = dict()
+
+        if not disable_flex and self.use_sparse_attn and self.use_flex_sliding_window:
+
+            attn_kwargs.update(
+                sliding_window_flex_mask = create_sliding_mask(seq_len, self.attn_sliding_window_size)
+            )
+
+        # layers
+
         for attn, ff in self.layers:
-            tokens = attn(tokens) + tokens
+            attn_out = attn(
+                tokens,
+                **attn_kwargs
+            )
+
+            tokens = attn_out + tokens
             tokens = ff(tokens) + tokens
 
         embed = self.norm(tokens)

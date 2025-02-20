@@ -118,6 +118,8 @@ class SparseAttention(Module):
             autopad = True
         )
 
+        self.sliding_window_size = sliding_window_size
+
         # compress strategy
 
         self.compress_block_size = compress_block_size
@@ -174,7 +176,8 @@ class SparseAttention(Module):
 
     def forward(
         self,
-        inp
+        inp,
+        sliding_window_flex_mask = None
     ):
         batch, seq_len, scale, heads, device = *inp.shape[:2], self.scale, self.heads, inp.device
 
@@ -315,7 +318,10 @@ class SparseAttention(Module):
 
         # 3. overlapping sliding window, this is unsurprising and expected
 
-        sliding_window_attn_out = self.sliding_window(q, k, v)
+        if exists(sliding_window_flex_mask):
+            sliding_window_attn_out = flex_attention(q, k, v, block_mask = sliding_window_flex_mask)
+        else:
+            sliding_window_attn_out = self.sliding_window(q, k, v)
 
         # combine strategies
 

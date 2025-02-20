@@ -1,7 +1,7 @@
 import math
 import gzip
 import random
-import tqdm
+from tqdm import tqdm
 import numpy as np
 
 import torch
@@ -76,8 +76,9 @@ def base_decoding(
     prompt_seq_len, out = prompt.shape[-1], prompt.clone()
     sample_num_times = max(0, seq_len - prompt_seq_len)
 
-    for _ in range(sample_num_times):
-        logits = net(out)
+    for _ in tqdm(range(sample_num_times)):
+        logits = net(out, disable_flex = True)
+
         logits = logits[:, -1]
         logits = top_k(logits, thres = filter_thres)
         sample = gumbel_sample(logits, temperature = temperature, dim = -1)
@@ -93,6 +94,7 @@ model = Transformer(
     dim = 512,
     depth = 6,
     use_sparse_attn = USE_SPARSE_ATTN,
+    use_flex_sliding_window = True,
     sparse_attn_kwargs = dict(
         sliding_window_size = 32,
         compress_block_size = 32,
@@ -144,7 +146,7 @@ wandb.run.save()
 
 # training
 
-for i in tqdm.tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
+for i in tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
     model.train()
 
     for _ in range(GRAD_ACCUM_EVERY):
