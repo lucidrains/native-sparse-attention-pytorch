@@ -15,7 +15,7 @@ from rotary_embedding_torch import RotaryEmbedding
 # einstein notation
 
 import einx
-from einops import einsum, repeat, rearrange
+from einops import einsum, repeat, rearrange, reduce
 from einops.layers.torch import Rearrange
 
 # b - batch
@@ -66,6 +66,9 @@ def round_down_mult(n, mult):
 def round_up_mult(n, mult):
     return ceil(n / mult) * mult
 
+def divisible_by(num, den):
+    return (num % den) == 0
+
 def pad_at_dim(t, pad, dim = -1, value = 0.):
     dims_from_right = (- dim - 1) if dim < 0 else (t.ndim - dim - 1)
     zeros = ((0, 0) * dims_from_right)
@@ -83,6 +86,7 @@ class SparseAttention(Module):
         compress_block_size,
         selection_block_size,
         num_selected_blocks,
+        num_kv_heads = None,
         num_compressed_mem_kv = 4,
         norm = True,
         use_diff_topk = False,
@@ -91,12 +95,25 @@ class SparseAttention(Module):
         strategy_combine_mlp: Module | None = None
     ):
         super().__init__()
+
+        # attention heads
+        # handling gqa if `num_kv_heads` is set
+
+        num_kv_heads = default(num_kv_heads, heads)
+        assert num_kv_heads <= heads and divisible_by(heads, num_kv_heads)
+
         self.heads = heads
+        self.num_kv_heads = num_kv_heads
+        self.num_grouped_queries = heads // num_kv_heads
+
+        # scale
+
         self.scale = dim_head ** -0.5
 
         assert compress_block_size == selection_block_size, 'start off with compressed being equal to selection block sizes'
 
         dim_inner = dim_head * heads
+        dim_kv_inner = dim_head * num_kv_heads
 
         self.norm = nn.RMSNorm(dim) if norm else nn.Identity()
 
@@ -106,7 +123,11 @@ class SparseAttention(Module):
 
         # qkv
 
-        self.to_qkv = nn.Linear(dim, dim_inner * 3, bias = False)
+        qkv_split = (dim_inner, dim_kv_inner, dim_kv_inner)
+
+        self.to_qkv = nn.Linear(dim, sum(qkv_split), bias = False)
+
+        self.qkv_split = qkv_split
 
         # sliding window strategy
 
@@ -129,10 +150,10 @@ class SparseAttention(Module):
 
         self.split_compress_window = Rearrange('b h (w n) d -> b h w n d', n = compress_block_size)
 
-        self.compress_mem_kv = nn.Parameter(torch.zeros(2, heads, num_compressed_mem_kv, dim_head))
+        self.compress_mem_kv = nn.Parameter(torch.zeros(2, num_kv_heads, num_compressed_mem_kv, dim_head))
         
-        self.k_intrablock_positions = nn.Parameter(torch.zeros(heads, compress_block_size, dim_head))
-        self.v_intrablock_positions = nn.Parameter(torch.zeros(heads, compress_block_size, dim_head))
+        self.k_intrablock_positions = nn.Parameter(torch.zeros(num_kv_heads, compress_block_size, dim_head))
+        self.v_intrablock_positions = nn.Parameter(torch.zeros(num_kv_heads, compress_block_size, dim_head))
 
         if not exists(compress_mlp):
             compress_dim = compress_block_size * dim_head
@@ -168,7 +189,7 @@ class SparseAttention(Module):
 
         # split and merging heads
 
-        self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
+        self.split_heads = Rearrange('b n (h d) -> b h n d', d = dim_head)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
 
         # combining heads
@@ -194,7 +215,7 @@ class SparseAttention(Module):
 
         # queries, keys, values
 
-        q, k, v = self.to_qkv(inp).chunk(3, dim = -1)
+        q, k, v = self.to_qkv(inp).split(self.qkv_split, dim = -1)
 
         q, k, v = map(self.split_heads, (q, k, v))
 
@@ -217,6 +238,8 @@ class SparseAttention(Module):
 
         ck = cat((mem_ck, ck), dim = -2)
         cv = cat((mem_cv, cv), dim = -2)
+
+        ck, cv = tuple(repeat(t, 'b h ... -> b (num_grouped_queries h) ...', num_grouped_queries = self.num_grouped_queries) for t in (ck, cv))
 
         csim = einsum(q, ck, 'b h i d, b h j d -> b h i j') * self.scale
 
@@ -241,7 +264,12 @@ class SparseAttention(Module):
 
         # 2. fine attention over selected based on compressed attention logits
 
+
         importance_scores = cattn[..., num_mem_compress_kv:]
+
+        # for gqa, we will average the compressed attention across each grouped queries (per key / values)
+
+        importance_scores = reduce(importance_scores, 'b (grouped_queries h) ... -> b h ...', 'mean', grouped_queries = self.num_grouped_queries)
 
         num_selected = min(self.num_selected_blocks, importance_scores.shape[-1])
 
@@ -273,13 +301,13 @@ class SparseAttention(Module):
             # handle block causal diagonal in the diagram, but run experiments without to see
 
             fine_window_seq = arange(fine_divisible_seq_len, device = device) // self.selection_block_size
-            fine_window_seq = repeat(fine_window_seq, 'n -> b h n 1', b = batch, h = heads)
+            fine_window_seq = repeat(fine_window_seq, 'n -> b h n 1', b = batch, h = self.num_kv_heads)
             selected_block_indices = cat((selected_block_indices, fine_window_seq), dim = -1) # for the block causal diagonal in fig2
 
             fmask = repeat(fmask, 'b h i w -> b h i w j', j = self.selection_block_size)
 
             causal_mask = torch.ones((self.selection_block_size,) * 2, device = device, dtype = torch.bool).tril()
-            causal_mask = repeat(causal_mask, 'i j -> b h (w i) 1 j', w = num_fine_blocks, b = batch, h = heads)
+            causal_mask = repeat(causal_mask, 'i j -> b h (w i) 1 j', w = num_fine_blocks, b = batch, h = self.num_kv_heads)
 
             fmask = cat((fmask, causal_mask), dim = -2)
             fmask = rearrange(fmask, 'b h i w j -> b h i (w j)')
@@ -312,6 +340,8 @@ class SparseAttention(Module):
 
             # fine attention
 
+            fk, fv, fmask = tuple(repeat(t, 'b h ... -> b (num_grouped_queries h) ...', num_grouped_queries = self.num_grouped_queries) for t in (fk, fv, fmask))
+
             fsim = einsum(fq, fk, 'b h i d, b h i j d -> b h i j') * self.scale
 
             fsim = fsim.masked_fill(~fmask, mask_value)
@@ -327,6 +357,8 @@ class SparseAttention(Module):
             seq_len = fk.shape[-2]
             fmask = causal_mask = torch.ones((seq_len, seq_len), device = device, dtype = torch.bool).tril()
 
+            fk, fv = tuple(repeat(t, 'b h ... -> b (num_grouped_queries h) ...', num_grouped_queries = self.num_grouped_queries) for t in (fk, fv))
+
             fsim = einsum(fq, fk, 'b h i d, b h j d -> b h i j') * self.scale
 
             fsim = fsim.masked_fill(~fmask, mask_value)
@@ -337,10 +369,16 @@ class SparseAttention(Module):
 
         # 3. overlapping sliding window, this is unsurprising and expected
 
+        sq = rotated_q
+        sk = rotated_k
+        sv = v
+
+        sk, sv = tuple(repeat(t, 'b h ... -> b (num_grouped_queries h) ...', num_grouped_queries = self.num_grouped_queries) for t in (sk, sv))
+
         if exists(sliding_window_flex_mask):
-            sliding_window_attn_out = flex_attention(rotated_q, rotated_k, v, block_mask = sliding_window_flex_mask)
+            sliding_window_attn_out = flex_attention(sq, sk, sv, block_mask = sliding_window_flex_mask)
         else:
-            sliding_window_attn_out = self.sliding_window(rotated_q, rotated_k, v)
+            sliding_window_attn_out = self.sliding_window(sq, sk, sv)
 
         # combine strategies
 

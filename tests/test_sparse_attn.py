@@ -8,14 +8,17 @@ from native_sparse_attention_pytorch import SparseAttention
 
 @pytest.mark.parametrize('use_diff_topk', (False, True))
 @pytest.mark.parametrize('seq_len', (1, 4, 31, 32, 120))
+@pytest.mark.parametrize('num_kv_heads', (8, 4))
 def test_sparse_attn(
     use_diff_topk,
-    seq_len
+    seq_len,
+    num_kv_heads
 ):
     attn = SparseAttention(
         dim = 512,
         dim_head = 64,
         heads = 8,
+        num_kv_heads = num_kv_heads,
         sliding_window_size = 2,
         compress_block_size = 4,
         selection_block_size = 4,
