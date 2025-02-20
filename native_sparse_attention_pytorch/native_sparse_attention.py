@@ -135,15 +135,15 @@ class SparseAttention(Module):
             compress_dim = compress_block_size * dim_head
             compress_mlp_dim_hidden = int(compress_mlp_expand_factor * compress_dim)
 
-            mlp = nn.Sequential(
+            compress_mlp = nn.Sequential(
                 Rearrange('b h w n d -> b h w (n d)'),
                 nn.Linear(compress_dim, compress_mlp_dim_hidden),
                 nn.SiLU(),
                 nn.Linear(compress_mlp_dim_hidden, dim_head),
             )
 
-        self.k_compress = deepcopy(mlp)
-        self.v_compress = deepcopy(mlp)
+        self.k_compress = deepcopy(compress_mlp)
+        self.v_compress = deepcopy(compress_mlp)
 
         # selection related
 
