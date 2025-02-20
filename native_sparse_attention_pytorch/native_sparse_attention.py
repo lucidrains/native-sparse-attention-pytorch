@@ -243,83 +243,97 @@ class SparseAttention(Module):
 
         importance_scores = cattn[..., num_mem_compress_kv:]
 
-        topk = min(self.num_selected_blocks, importance_scores.shape[-1])
-
-        selected_importance_values, selected_block_indices = importance_scores.topk(topk, dim = -1)
-
-        if self.use_diff_topk:
-            gates = selected_importance_values + (1. - selected_importance_values).detach()
-
-        fmask = selected_importance_values > 1e-10
+        num_selected = min(self.num_selected_blocks, importance_scores.shape[-1])
 
         fq = rotated_q
         fk = rotated_k
         fv = v
 
-        if seq_len < fine_divisible_seq_len:
-            remainder = fine_divisible_seq_len - seq_len
-            fk = pad_at_dim(fk, (0, remainder), value = 0., dim = -2)
-            fv = pad_at_dim(fv, (0, remainder), value = 0., dim = -2)
-            fq = pad_at_dim(fq, (0, remainder), value = 0., dim = -2)
-
-            fmask = pad_at_dim(fmask, (0, remainder), value = False, dim = -2)
-
-            selected_block_indices = pad_at_dim(selected_block_indices, (0, remainder), value = 0, dim = -2)
+        if num_selected > 0:
+            selected_importance_values, selected_block_indices = importance_scores.topk(num_selected, dim = -1)
 
             if self.use_diff_topk:
-                gates = pad_at_dim(gates, (0, remainder), value = 1., dim = -2)
+                gates = selected_importance_values + (1. - selected_importance_values).detach()
 
-        # handle block causal diagonal in the diagram, but run experiments without to see
+            fmask = selected_importance_values > 1e-10
 
-        fine_window_seq = arange(fine_divisible_seq_len, device = device) // self.selection_block_size
-        fine_window_seq = repeat(fine_window_seq, 'n -> b h n 1', b = batch, h = heads)
-        selected_block_indices = cat((selected_block_indices, fine_window_seq), dim = -1) # for the block causal diagonal in fig2
+            if seq_len < fine_divisible_seq_len:
+                remainder = fine_divisible_seq_len - seq_len
+                fk = pad_at_dim(fk, (0, remainder), value = 0., dim = -2)
+                fv = pad_at_dim(fv, (0, remainder), value = 0., dim = -2)
+                fq = pad_at_dim(fq, (0, remainder), value = 0., dim = -2)
 
-        fmask = repeat(fmask, 'b h i w -> b h i w j', j = self.selection_block_size)
+                fmask = pad_at_dim(fmask, (0, remainder), value = False, dim = -2)
 
-        causal_mask = torch.ones((self.selection_block_size,) * 2, device = device, dtype = torch.bool).tril()
-        causal_mask = repeat(causal_mask, 'i j -> b h (w i) 1 j', w = num_fine_blocks, b = batch, h = heads)
+                selected_block_indices = pad_at_dim(selected_block_indices, (0, remainder), value = 0, dim = -2)
 
-        fmask = cat((fmask, causal_mask), dim = -2)
-        fmask = rearrange(fmask, 'b h i w j -> b h i (w j)')
+                if self.use_diff_topk:
+                    gates = pad_at_dim(gates, (0, remainder), value = 1., dim = -2)
 
-        # select out the spatial crops of keys / values for fine attention
+            # handle block causal diagonal in the diagram, but run experiments without to see
 
-        fk = rearrange(fk, 'b h (w n) d -> b h w n d', w = num_fine_blocks)
-        fv = rearrange(fv, 'b h (w n) d -> b h w n d', w = num_fine_blocks)
+            fine_window_seq = arange(fine_divisible_seq_len, device = device) // self.selection_block_size
+            fine_window_seq = repeat(fine_window_seq, 'n -> b h n 1', b = batch, h = heads)
+            selected_block_indices = cat((selected_block_indices, fine_window_seq), dim = -1) # for the block causal diagonal in fig2
 
-        # get_at("b h [w] j d, b h i selected -> b h i selected j d", fkv, selected_block_indices)
+            fmask = repeat(fmask, 'b h i w -> b h i w j', j = self.selection_block_size)
 
-        fk = repeat(fk, 'b h w j d -> b h i w j d', i = selected_block_indices.shape[2])
-        fv = repeat(fv, 'b h w j d -> b h i w j d', i = selected_block_indices.shape[2])
+            causal_mask = torch.ones((self.selection_block_size,) * 2, device = device, dtype = torch.bool).tril()
+            causal_mask = repeat(causal_mask, 'i j -> b h (w i) 1 j', w = num_fine_blocks, b = batch, h = heads)
 
-        selected_block_indices = repeat(selected_block_indices, 'b h i sel -> b h i sel j d', j = fk.shape[-2], d = fk.shape[-1])
+            fmask = cat((fmask, causal_mask), dim = -2)
+            fmask = rearrange(fmask, 'b h i w j -> b h i (w j)')
 
-        fk = fk.gather(3, selected_block_indices)
-        fv = fv.gather(3, selected_block_indices)
+            # select out the spatial crops of keys / values for fine attention
 
-        # handle maybe gating
+            fk = rearrange(fk, 'b h (w n) d -> b h w n d', w = num_fine_blocks)
+            fv = rearrange(fv, 'b h (w n) d -> b h w n d', w = num_fine_blocks)
 
-        if self.use_diff_topk:
-            gates = F.pad(gates, (0, 1), value = 1.)
+            # get_at("b h [w] j d, b h i selected -> b h i selected j d", fkv, selected_block_indices)
 
-            fk = einx.multiply('b h i w, b h i w j d -> b h i w j d', gates, fk)
-            fv = einx.multiply('b h i w, b h i w j d -> b h i w j d', gates, fv)
+            fk = repeat(fk, 'b h w j d -> b h i w j d', i = selected_block_indices.shape[2])
+            fv = repeat(fv, 'b h w j d -> b h i w j d', i = selected_block_indices.shape[2])
 
-        fk = rearrange(fk, 'b h i w j d -> b h i (w j) d')
-        fv = rearrange(fv, 'b h i w j d -> b h i (w j) d')
+            selected_block_indices = repeat(selected_block_indices, 'b h i sel -> b h i sel j d', j = fk.shape[-2], d = fk.shape[-1])
 
-        # fine attention
+            fk = fk.gather(3, selected_block_indices)
+            fv = fv.gather(3, selected_block_indices)
 
-        fsim = einsum(fq, fk, 'b h i d, b h i j d -> b h i j') * self.scale
+            # handle maybe gating
 
-        fsim = fsim.masked_fill(~fmask, mask_value)
+            if self.use_diff_topk:
+                gates = F.pad(gates, (0, 1), value = 1.)
 
-        fattn = fsim.softmax(dim = -1)
+                fk = einx.multiply('b h i w, b h i w j d -> b h i w j d', gates, fk)
+                fv = einx.multiply('b h i w, b h i w j d -> b h i w j d', gates, fv)
 
-        fine_attn_out = einsum(fattn, fv, 'b h i j, b h i j d -> b h i d')
+            fk = rearrange(fk, 'b h i w j d -> b h i (w j) d')
+            fv = rearrange(fv, 'b h i w j d -> b h i (w j) d')
 
-        fine_attn_out = fine_attn_out[..., :seq_len, :]
+            # fine attention
+
+            fsim = einsum(fq, fk, 'b h i d, b h i j d -> b h i j') * self.scale
+
+            fsim = fsim.masked_fill(~fmask, mask_value)
+
+            fattn = fsim.softmax(dim = -1)
+
+            fine_attn_out = einsum(fattn, fv, 'b h i j, b h i j d -> b h i d')
+
+            fine_attn_out = fine_attn_out[..., :seq_len, :]
+        else:
+            # if only first block, just do a simple block causal
+
+            seq_len = fk.shape[-2]
+            fmask = causal_mask = torch.ones((seq_len, seq_len), device = device, dtype = torch.bool).tril()
+
+            fsim = einsum(fq, fk, 'b h i d, b h j d -> b h i j') * self.scale
+
+            fsim = fsim.masked_fill(~fmask, mask_value)
+
+            fattn = fsim.softmax(dim = -1)
+
+            fine_attn_out = einsum(fattn, fv, 'b h i j, b h j d -> b h i d')
 
         # 3. overlapping sliding window, this is unsurprising and expected
 

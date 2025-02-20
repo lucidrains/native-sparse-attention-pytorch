@@ -7,7 +7,7 @@ from einops.layers.torch import Rearrange
 from native_sparse_attention_pytorch import SparseAttention
 
 @pytest.mark.parametrize('use_diff_topk', (False, True))
-@pytest.mark.parametrize('seq_len', (4, 31, 32, 120))
+@pytest.mark.parametrize('seq_len', (1, 4, 31, 32, 120))
 def test_sparse_attn(
     use_diff_topk,
     seq_len

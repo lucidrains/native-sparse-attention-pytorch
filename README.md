@@ -59,3 +59,13 @@ To record some of your experiments, just invoke `wandb login` first before modif
     url     = {https://api.semanticscholar.org/CorpusID:276408911}
 }
 ```
+
+```bibtex
+@inproceedings{Keles2022OnTC,
+    title   = {On The Computational Complexity of Self-Attention},
+    author  = {Feyza Duman Keles and Pruthuvi Maheshakya Wijewardena and Chinmay Hegde},
+    booktitle = {International Conference on Algorithmic Learning Theory},
+    year    = {2022},
+    url     = {https://api.semanticscholar.org/CorpusID:252198880}
+}
+```
