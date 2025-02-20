@@ -59,7 +59,7 @@ def create_compress_mask(seq_len, kv_seq_len, compress_block_size):
     def compress_mask(_, __, q_idx, kv_idx):
         compress_kv_idx = (kv_idx * compress_block_size) + (compress_block_size - 1)
 
-        causal_mask = q_idx >= compress_kv_idx
+        causal_mask = q_idx > compress_kv_idx
         return causal_mask
 
     block_mask = create_block_mask(compress_mask, B = None, H = None, Q_LEN = seq_len, KV_LEN = kv_seq_len, _compile = True)
@@ -266,7 +266,7 @@ class SparseAttention(Module):
         ck_seq = ((arange(num_compress_blocks, device = device) + 1) * self.compress_block_size) - 1
         ck_seq = F.pad(ck_seq, (num_mem_compress_kv, 0), value = -1)
 
-        cmask = einx.less_equal('j, i -> i j', ck_seq, cq_seq)
+        cmask = einx.less('j, i -> i j', ck_seq, cq_seq)
 
         mask_value = -torch.finfo(csim.dtype).max
 
