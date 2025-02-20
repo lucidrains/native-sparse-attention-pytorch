@@ -110,8 +110,6 @@ class SparseAttention(Module):
 
         self.scale = dim_head ** -0.5
 
-        assert compress_block_size == selection_block_size, 'start off with compressed being equal to selection block sizes'
-
         dim_inner = dim_head * heads
         dim_kv_inner = dim_head * kv_heads
 
@@ -174,6 +172,8 @@ class SparseAttention(Module):
         self.use_diff_topk = use_diff_topk
 
         self.selection_block_size = selection_block_size
+
+        assert num_selected_blocks > 0
         self.num_selected_blocks = num_selected_blocks
 
         # they combine the three sparse branches through a learned combine with sigmoid activation
@@ -219,7 +219,7 @@ class SparseAttention(Module):
 
         q, k, v = map(self.split_heads, (q, k, v))
 
-        # compressed key / values
+        # compressed key / values - variables prepended with `c` stands for compressed
 
         k_pos = repeat(self.k_intrablock_positions, 'h n d -> h (r n) d', r = num_compress_blocks)
         v_pos = repeat(self.v_intrablock_positions, 'h n d -> h (r n) d', r = num_compress_blocks)
@@ -262,14 +262,26 @@ class SparseAttention(Module):
 
         rotated_q, rotated_k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
 
-        # 2. fine attention over selected based on compressed attention logits
-
+        # 2. fine attention over selected based on compressed attention logits - variables prepended with `f` stands for the fine attention pathway
 
         importance_scores = cattn[..., num_mem_compress_kv:]
 
         # for gqa, we will average the compressed attention across each grouped queries (per key / values)
 
         importance_scores = reduce(importance_scores, 'b (grouped_queries h) ... -> b h ...', 'mean', grouped_queries = self.num_grouped_queries)
+
+        # handle if compress block size not equal to the fine block size
+        # cannot parse their equation, so will just improvise
+        # first we expand all the compressed scores to the full sequence length, then average within each fine / selection block size - pad on the right to 0s, which should be fine as sliding window convers the local anyways
+
+        if self.compress_block_size != self.selection_block_size:
+            importance_scores = repeat(importance_scores, '... j -> ... (j block_size)', block_size = self.compress_block_size)
+            padding = fine_divisible_seq_len - importance_scores.shape[-1]
+
+            importance_scores = F.pad(importance_scores, (0, padding))
+            importance_scores = reduce(importance_scores, '... (j block_size) -> ... j', 'mean', block_size = self.selection_block_size)
+
+        # handle if number of total blocks is less than number to select for fine attention
 
         num_selected = min(self.num_selected_blocks, importance_scores.shape[-1])
 
@@ -367,7 +379,7 @@ class SparseAttention(Module):
 
             fine_attn_out = einsum(fattn, fv, 'b h i j, b h j d -> b h i d')
 
-        # 3. overlapping sliding window, this is unsurprising and expected
+        # 3. overlapping sliding window, this is unsurprising and expected - `s` for sliding
 
         sq = rotated_q
         sk = rotated_k
