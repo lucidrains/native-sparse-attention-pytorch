@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from math import ceil
 
 import torch
@@ -85,6 +86,9 @@ class SparseAttention(Module):
         num_compressed_mem_kv = 4,
         norm = True,
         use_diff_topk = False,
+        compress_mlp: Module | None = None,
+        compress_mlp_expand_factor = 1.,
+
     ):
         super().__init__()
         self.heads = heads
@@ -120,21 +124,26 @@ class SparseAttention(Module):
 
         assert num_compressed_mem_kv > 0
 
+        self.split_compress_window = Rearrange('b h (w n) d -> b h w n d', n = compress_block_size)
+
         self.compress_mem_kv = nn.Parameter(torch.zeros(2, heads, num_compressed_mem_kv, dim_head))
+        
         self.k_intrablock_positions = nn.Parameter(torch.zeros(heads, compress_block_size, dim_head))
         self.v_intrablock_positions = nn.Parameter(torch.zeros(heads, compress_block_size, dim_head))
 
-        self.k_compress = nn.Sequential(
-            Rearrange('b h n d -> b (h d) n'),
-            nn.Conv1d(dim_head * heads, dim_head * heads, compress_block_size, stride = compress_block_size, groups = heads),
-            Rearrange('b (h d) nc -> b h nc d', h = heads)
-        )
+        if not exists(compress_mlp):
+            compress_dim = compress_block_size * dim_head
+            compress_mlp_dim_hidden = int(compress_mlp_expand_factor * compress_dim)
 
-        self.v_compress = nn.Sequential(
-            Rearrange('b h n d -> b (h d) n'),
-            nn.Conv1d(dim_head * heads, dim_head * heads, compress_block_size, stride = compress_block_size, groups = heads),
-            Rearrange('b (h d) nc -> b h nc d', h = heads)
-        )
+            mlp = nn.Sequential(
+                Rearrange('b h w n d -> b h w (n d)'),
+                nn.Linear(compress_dim, compress_mlp_dim_hidden),
+                nn.SiLU(),
+                nn.Linear(compress_mlp_dim_hidden, dim_head),
+            )
+
+        self.k_compress = deepcopy(mlp)
+        self.v_compress = deepcopy(mlp)
 
         # selection related
 
@@ -187,8 +196,11 @@ class SparseAttention(Module):
         k_pos = repeat(self.k_intrablock_positions, 'h n d -> h (r n) d', r = num_compress_blocks)
         v_pos = repeat(self.v_intrablock_positions, 'h n d -> h (r n) d', r = num_compress_blocks)
 
-        ck = self.k_compress(k[..., :compress_divisible_seq_len, :] + k_pos)
-        cv = self.v_compress(v[..., :compress_divisible_seq_len, :] + v_pos)
+        k_compress_input = self.split_compress_window(k[..., :compress_divisible_seq_len, :] + k_pos)
+        v_compress_input = self.split_compress_window(v[..., :compress_divisible_seq_len, :] + v_pos)
+
+        ck = self.k_compress(k_compress_input)
+        cv = self.v_compress(v_compress_input)
 
         # 1. coarse attention over compressed
 
