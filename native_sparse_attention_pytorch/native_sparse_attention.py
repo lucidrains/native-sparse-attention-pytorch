@@ -65,29 +65,32 @@ def create_compress_mask(seq_len, kv_seq_len, compress_block_size):
     block_mask = create_block_mask(compress_mask, B = None, H = None, Q_LEN = seq_len, KV_LEN = kv_seq_len, _compile = True)
     return block_mask
 
+def create_fine_mask(seq_len, fine_block_size):
 
-def create_fine_mask(selected_block_indices: Tensor, seq_len, fine_block_size):
-    device = selected_block_indices.device
-    batch, heads = selected_block_indices.shape[:2]
+    def inner(selected_block_indices: Tensor):
+        device = selected_block_indices.device
+        batch, heads = selected_block_indices.shape[:2]
 
-    one_hot_selected_block_indices = torch.zeros((*selected_block_indices.shape[:-1], seq_len // fine_block_size), device = device, dtype = torch.bool)
-    one_hot_selected_block_indices.scatter_(-1, selected_block_indices, True)
+        one_hot_selected_block_indices = torch.zeros((*selected_block_indices.shape[:-1], seq_len // fine_block_size), device = device, dtype = torch.bool)
+        one_hot_selected_block_indices.scatter_(-1, selected_block_indices, True)
 
-    def fine_mask(b_idx, h_idx, q_idx, kv_idx):
+        def fine_mask(b_idx, h_idx, q_idx, kv_idx):
 
-        compressed_q_idx = q_idx // fine_block_size
-        compressed_kv_idx = kv_idx // fine_block_size
+            compressed_q_idx = q_idx // fine_block_size
+            compressed_kv_idx = kv_idx // fine_block_size
 
-        block_causal_mask = compressed_q_idx > compressed_kv_idx
-        is_selected = one_hot_selected_block_indices[b_idx, h_idx, q_idx, compressed_kv_idx]
+            block_causal_mask = compressed_q_idx > compressed_kv_idx
+            is_selected = one_hot_selected_block_indices[b_idx, h_idx, q_idx, compressed_kv_idx]
 
-        causal_mask = q_idx >= kv_idx
-        block_diagonal = compressed_q_idx == compressed_kv_idx
+            causal_mask = q_idx >= kv_idx
+            block_diagonal = compressed_q_idx == compressed_kv_idx
 
-        return (causal_mask & block_diagonal) | (block_causal_mask & is_selected)
+            return (causal_mask & block_diagonal) | (block_causal_mask & is_selected)
 
-    block_mask = create_block_mask(fine_mask, B = batch, H = heads, Q_LEN = seq_len, KV_LEN = seq_len, _compile = True)
-    return block_mask
+        block_mask = create_block_mask(fine_mask, B = batch, H = heads, Q_LEN = seq_len, KV_LEN = seq_len, _compile = True)
+        return block_mask
+
+    return inner
 
 # helpers
 
@@ -241,7 +244,8 @@ class SparseAttention(Module):
     def forward(
         self,
         inp,
-        sliding_window_flex_mask = None
+        sliding_window_flex_mask = None,
+        fine_selection_flex_mask = None
     ):
         batch, seq_len, scale, heads, device = *inp.shape[:2], self.scale, self.heads, inp.device
 

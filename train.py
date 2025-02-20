@@ -24,6 +24,7 @@ GENERATE_LENGTH = 256
 SEQ_LEN = 256
 
 USE_SPARSE_ATTN = True
+USE_FLEX_FOR_FINE_SELECTION = False # will push flex a bit, won't be efficient as each layer needs sparsity dynmically generated, but may be enough just to compare to full attention before going all-in on triton kernels
 
 # experiment related
 
@@ -97,6 +98,7 @@ model = Transformer(
     kv_heads = 4,
     use_sparse_attn = USE_SPARSE_ATTN,
     use_flex_sliding_window = True,
+    use_flex_fine_selection = USE_FLEX_FOR_FINE_SELECTION,
     sparse_attn_kwargs = dict(
         sliding_window_size = 32,
         compress_block_size = 32,

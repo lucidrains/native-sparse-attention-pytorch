@@ -1,6 +1,6 @@
 [project]
 name = "native-sparse-attention-pytorch"
-version = "0.0.24"
+version = "0.0.25"
 description = "Native Sparse Attention"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
