@@ -3,7 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList, Linear, RMSNorm
 
-from einops import rearrange
+from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 
 from rotary_embedding_torch import RotaryEmbedding
@@ -37,21 +37,24 @@ class Attention(Module):
         self,
         dim,
         dim_head = 64,
-        heads = 8
+        heads = 8,
+        kv_heads = None
     ):
         super().__init__()
         self.norm = RMSNorm(dim)
 
         self.heads = heads
+        self.kv_heads = default(kv_heads, heads)
         dim_inner = heads * dim_head
+        dim_kv_inner = kv_heads * dim_head
 
         self.rotary_embed = RotaryEmbedding(dim_head)
 
         self.to_q = nn.Linear(dim, dim_inner, bias = False)
-        self.to_k = nn.Linear(dim, dim_inner, bias = False)
-        self.to_v = nn.Linear(dim, dim_inner, bias = False)
+        self.to_k = nn.Linear(dim, dim_kv_inner, bias = False)
+        self.to_v = nn.Linear(dim, dim_kv_inner, bias = False)
 
-        self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
+        self.split_heads = Rearrange('b n (h d) -> b h n d', d = dim_head)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
 
         self.to_out = nn.Linear(dim_inner, dim, bias = False)
@@ -72,6 +75,10 @@ class Attention(Module):
         # relative positions
 
         q, k = self.rotary_embed.rotate_queries_with_cached_keys(q, k)
+
+        # naive gqa
+
+        k, v = tuple(repeat(t, 'b h ... -> b (g h) ...', g = self.heads // self.kv_heads) for t in (k, v))
 
         # attention branch
 
@@ -106,6 +113,7 @@ class Transformer(Module):
         depth,
         dim_head = 64,
         heads = 8,
+        kv_heads = None,
         ff_expansion_factor = 4.,
         use_sparse_attn = False,
         use_flex_sliding_window = False,
@@ -133,16 +141,22 @@ class Transformer(Module):
                     dim = dim,
                     dim_head = dim_head,
                     heads = heads,
+                    kv_heads = kv_heads,
                     **sparse_attn_kwargs
                 )
             else:
-                attn = Attention(dim = dim, dim_head = dim_head, heads = heads)
+                attn = Attention(
+                    dim = dim,
+                    dim_head = dim_head,
+                    heads = heads,
+                    kv_heads = kv_heads
+                )
 
             ff = FeedForward(dim = dim, expansion_factor = ff_expansion_factor)
 
             layers.append(ModuleList([attn, ff]))
 
-        self.attn_sliding_window_size = attn.sliding_window_size
+        self.attn_sliding_window_size = getattr(attn, 'sliding_window_size', None)
 
         self.layers = ModuleList(layers)
 
@@ -169,7 +183,6 @@ class Transformer(Module):
         attn_kwargs = dict()
 
         if not disable_flex and self.use_sparse_attn and self.use_flex_sliding_window:
-
             attn_kwargs.update(
                 sliding_window_flex_mask = create_sliding_mask(seq_len, self.attn_sliding_window_size)
             )

@@ -86,7 +86,7 @@ class SparseAttention(Module):
         compress_block_size,
         selection_block_size,
         num_selected_blocks,
-        num_kv_heads = None,
+        kv_heads = None,
         num_compressed_mem_kv = 4,
         norm = True,
         use_diff_topk = False,
@@ -97,14 +97,14 @@ class SparseAttention(Module):
         super().__init__()
 
         # attention heads
-        # handling gqa if `num_kv_heads` is set
+        # handling gqa if `kv_heads` is set
 
-        num_kv_heads = default(num_kv_heads, heads)
-        assert num_kv_heads <= heads and divisible_by(heads, num_kv_heads)
+        kv_heads = default(kv_heads, heads)
+        assert kv_heads <= heads and divisible_by(heads, kv_heads)
 
         self.heads = heads
-        self.num_kv_heads = num_kv_heads
-        self.num_grouped_queries = heads // num_kv_heads
+        self.kv_heads = kv_heads
+        self.num_grouped_queries = heads // kv_heads
 
         # scale
 
@@ -113,7 +113,7 @@ class SparseAttention(Module):
         assert compress_block_size == selection_block_size, 'start off with compressed being equal to selection block sizes'
 
         dim_inner = dim_head * heads
-        dim_kv_inner = dim_head * num_kv_heads
+        dim_kv_inner = dim_head * kv_heads
 
         self.norm = nn.RMSNorm(dim) if norm else nn.Identity()
 
@@ -150,10 +150,10 @@ class SparseAttention(Module):
 
         self.split_compress_window = Rearrange('b h (w n) d -> b h w n d', n = compress_block_size)
 
-        self.compress_mem_kv = nn.Parameter(torch.zeros(2, num_kv_heads, num_compressed_mem_kv, dim_head))
+        self.compress_mem_kv = nn.Parameter(torch.zeros(2, kv_heads, num_compressed_mem_kv, dim_head))
         
-        self.k_intrablock_positions = nn.Parameter(torch.zeros(num_kv_heads, compress_block_size, dim_head))
-        self.v_intrablock_positions = nn.Parameter(torch.zeros(num_kv_heads, compress_block_size, dim_head))
+        self.k_intrablock_positions = nn.Parameter(torch.zeros(kv_heads, compress_block_size, dim_head))
+        self.v_intrablock_positions = nn.Parameter(torch.zeros(kv_heads, compress_block_size, dim_head))
 
         if not exists(compress_mlp):
             compress_dim = compress_block_size * dim_head
@@ -301,13 +301,13 @@ class SparseAttention(Module):
             # handle block causal diagonal in the diagram, but run experiments without to see
 
             fine_window_seq = arange(fine_divisible_seq_len, device = device) // self.selection_block_size
-            fine_window_seq = repeat(fine_window_seq, 'n -> b h n 1', b = batch, h = self.num_kv_heads)
+            fine_window_seq = repeat(fine_window_seq, 'n -> b h n 1', b = batch, h = self.kv_heads)
             selected_block_indices = cat((selected_block_indices, fine_window_seq), dim = -1) # for the block causal diagonal in fig2
 
             fmask = repeat(fmask, 'b h i w -> b h i w j', j = self.selection_block_size)
 
             causal_mask = torch.ones((self.selection_block_size,) * 2, device = device, dtype = torch.bool).tril()
-            causal_mask = repeat(causal_mask, 'i j -> b h (w i) 1 j', w = num_fine_blocks, b = batch, h = self.num_kv_heads)
+            causal_mask = repeat(causal_mask, 'i j -> b h (w i) 1 j', w = num_fine_blocks, b = batch, h = self.kv_heads)
 
             fmask = cat((fmask, causal_mask), dim = -2)
             fmask = rearrange(fmask, 'b h i w j -> b h i (w j)')
