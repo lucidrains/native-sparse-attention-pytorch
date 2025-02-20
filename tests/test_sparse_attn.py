@@ -7,8 +7,10 @@ from einops.layers.torch import Rearrange
 from native_sparse_attention_pytorch import SparseAttention
 
 @pytest.mark.parametrize('use_diff_topk', (False, True))
+@pytest.mark.parametrize('seq_len', (4, 31, 32, 120))
 def test_sparse_attn(
-    use_diff_topk
+    use_diff_topk,
+    seq_len
 ):
     attn = SparseAttention(
         dim = 512,
@@ -21,7 +23,7 @@ def test_sparse_attn(
         use_diff_topk = use_diff_topk
     )
 
-    tokens = torch.randn(2, 31, 512)
+    tokens = torch.randn(2, seq_len, 512)
 
     attended = attn(tokens)
 

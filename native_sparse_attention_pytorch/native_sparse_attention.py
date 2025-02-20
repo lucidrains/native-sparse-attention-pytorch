@@ -243,7 +243,9 @@ class SparseAttention(Module):
 
         importance_scores = cattn[..., num_mem_compress_kv:]
 
-        selected_importance_values, selected_block_indices = importance_scores.topk(self.num_selected_blocks, dim = -1)
+        topk = min(self.num_selected_blocks, importance_scores.shape[-1])
+
+        selected_importance_values, selected_block_indices = importance_scores.topk(topk, dim = -1)
 
         if self.use_diff_topk:
             gates = selected_importance_values + (1. - selected_importance_values).detach()
