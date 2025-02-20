@@ -8,7 +8,11 @@ from einops.layers.torch import Rearrange
 
 from rotary_embedding_torch import RotaryEmbedding
 
-from native_sparse_attention_pytorch.native_sparse_attention import SparseAttention, create_sliding_mask
+from native_sparse_attention_pytorch.native_sparse_attention import (
+    SparseAttention,
+    create_sliding_mask,
+    create_compress_mask,
+)
 
 # flex attention
 # https://pytorch.org/blog/flexattention/

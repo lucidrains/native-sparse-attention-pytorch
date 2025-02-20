@@ -52,6 +52,19 @@ def create_sliding_mask(seq_len, window_size):
     block_mask = create_block_mask(sliding_mask, B = None, H = None, Q_LEN = seq_len, KV_LEN = seq_len, _compile = True)
     return block_mask
 
+def create_compress_mask(seq_len, kv_seq_len, compress_block_size):
+    # cannot be used as using attention logits for importance score
+    # but just to show the immense potential of flex attention
+
+    def compress_mask(_, __, q_idx, kv_idx):
+        compress_kv_idx = (kv_idx * compress_block_size) + (compress_block_size - 1)
+
+        causal_mask = q_idx >= compress_kv_idx
+        return causal_mask
+
+    block_mask = create_block_mask(compress_mask, B = None, H = None, Q_LEN = seq_len, KV_LEN = kv_seq_len, _compile = True)
+    return block_mask
+
 # helpers
 
 def exists(v):
