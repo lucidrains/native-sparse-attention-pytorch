@@ -4,8 +4,8 @@ from copy import deepcopy
 from math import ceil
 
 import torch
-from torch import nn, arange, stack, cat, Tensor
 import torch.nn.functional as F
+from torch import nn, arange, stack, cat, tensor, Tensor
 from torch.nn import Module, ModuleList
 
 from local_attention import LocalAttention
@@ -225,6 +225,11 @@ class SparseAttention(Module):
 
         if not exists(strategy_combine_mlp):
             strategy_combine_mlp = nn.Linear(dim, 3 * heads)
+
+            # init to sliding windows first, as network tends to pick up on local patterns first before distant ones
+
+            nn.init.zeros_(strategy_combine_mlp.weight)
+            strategy_combine_mlp.bias.data.copy_(tensor([-2., -2., 2.] * heads))
 
         self.to_strategy_combine = nn.Sequential(
             strategy_combine_mlp,
