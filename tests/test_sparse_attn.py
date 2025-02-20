@@ -18,7 +18,7 @@ def test_sparse_attn(
         dim = 512,
         dim_head = 64,
         heads = 8,
-        num_kv_heads = kv_heads,
+        kv_heads = kv_heads,
         sliding_window_size = 2,
         compress_block_size = 4,
         selection_block_size = 4,
