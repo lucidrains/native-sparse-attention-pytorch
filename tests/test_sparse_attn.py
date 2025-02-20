@@ -64,3 +64,24 @@ def test_alternative_compress_mlp():
     attended = attn(tokens)
 
     assert tokens.shape == attended.shape
+
+
+def test_compress_networks():
+    from native_sparse_attention_pytorch.compress_networks import AttentionPool
+
+    attn = SparseAttention(
+        dim = 512,
+        dim_head = 64,
+        heads = 8,
+        sliding_window_size = 2,
+        compress_block_size = 4,
+        selection_block_size = 4,
+        num_selected_blocks = 2,
+        compress_mlp = AttentionPool(64, 4)
+    )
+
+    tokens = torch.randn(2, 31, 512)
+
+    attended = attn(tokens)
+
+    assert tokens.shape == attended.shape
