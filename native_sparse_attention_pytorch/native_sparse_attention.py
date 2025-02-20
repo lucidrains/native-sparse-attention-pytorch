@@ -115,7 +115,8 @@ class SparseAttention(Module):
             window_size = sliding_window_size,
             causal = True,
             exact_windowsize = True,
-            autopad = True
+            autopad = True,
+            use_rotary_pos_emb = False
         )
 
         self.sliding_window_size = sliding_window_size
@@ -234,6 +235,10 @@ class SparseAttention(Module):
 
         compressed_attn_out = einsum(cattn, cv, 'b h i j, b h j d -> b h i d')
 
+        # for 2. and 3., will give them relative positions with rotary - compressed needs to be handled separately (even if they already have intra block absolute positions)
+
+        rotated_q, rotated_k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
+
         # 2. fine attention over selected based on compressed attention logits
 
         importance_scores = cattn[..., num_mem_compress_kv:]
@@ -245,11 +250,9 @@ class SparseAttention(Module):
 
         fmask = selected_importance_values > 1e-10
 
-        fq = q
-        fk = k
+        fq = rotated_q
+        fk = rotated_k
         fv = v
-
-        fq, fk = self.rotary_emb.rotate_queries_with_cached_keys(fq, fk)
 
         if seq_len < fine_divisible_seq_len:
             remainder = fine_divisible_seq_len - seq_len
@@ -319,9 +322,9 @@ class SparseAttention(Module):
         # 3. overlapping sliding window, this is unsurprising and expected
 
         if exists(sliding_window_flex_mask):
-            sliding_window_attn_out = flex_attention(q, k, v, block_mask = sliding_window_flex_mask)
+            sliding_window_attn_out = flex_attention(rotated_q, rotated_k, v, block_mask = sliding_window_flex_mask)
         else:
-            sliding_window_attn_out = self.sliding_window(q, k, v)
+            sliding_window_attn_out = self.sliding_window(rotated_q, rotated_k, v)
 
         # combine strategies
 
