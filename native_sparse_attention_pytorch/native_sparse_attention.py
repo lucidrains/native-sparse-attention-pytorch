@@ -82,10 +82,15 @@ def round_up_mult(n, mult):
 def divisible_by(num, den):
     return (num % den) == 0
 
+# tensor helpers
+
 def pad_at_dim(t, pad, dim = -1, value = 0.):
     dims_from_right = (- dim - 1) if dim < 0 else (t.ndim - dim - 1)
     zeros = ((0, 0) * dims_from_right)
     return F.pad(t, (*zeros, *pad), value = value)
+
+def straight_through(t, target):
+    return t + (target - t).detach()
 
 # classes
 
@@ -306,7 +311,7 @@ class SparseAttention(Module):
             selected_importance_values, selected_block_indices = importance_scores.topk(num_selected, dim = -1)
 
             if self.use_diff_topk:
-                gates = selected_importance_values + (1. - selected_importance_values).detach()
+                gates = straight_through(selected_importance_values, 1.)
 
             fmask = selected_importance_values > 1e-10
 
