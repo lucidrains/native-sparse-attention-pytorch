@@ -164,6 +164,7 @@ class Transformer(Module):
             layers.append(ModuleList([attn, ff]))
 
         self.attn_sliding_window_size = getattr(attn, 'sliding_window_size', None)
+        self.attn_fine_block_size = getattr(attn, 'selection_block_size', None)
 
         self.layers = ModuleList(layers)
 
