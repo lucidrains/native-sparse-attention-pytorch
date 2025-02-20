@@ -88,7 +88,7 @@ class SparseAttention(Module):
         use_diff_topk = False,
         compress_mlp: Module | None = None,
         compress_mlp_expand_factor = 1.,
-
+        strategy_combine_mlp: Module | None = None
     ):
         super().__init__()
         self.heads = heads
@@ -138,7 +138,7 @@ class SparseAttention(Module):
             compress_mlp = nn.Sequential(
                 Rearrange('b h w n d -> b h w (n d)'),
                 nn.Linear(compress_dim, compress_mlp_dim_hidden),
-                nn.SiLU(),
+                nn.ReLU(),
                 nn.Linear(compress_mlp_dim_hidden, dim_head),
             )
 
@@ -154,8 +154,11 @@ class SparseAttention(Module):
 
         # they combine the three sparse branches through a learned combine with sigmoid activation
 
+        if not exists(strategy_combine_mlp):
+            strategy_combine_mlp = nn.Linear(dim, 3 * heads)
+
         self.to_strategy_combine = nn.Sequential(
-            nn.Linear(dim, 3 * heads),
+            strategy_combine_mlp,
             nn.Sigmoid(),
             Rearrange('b n (h s) -> b h n s', h = heads)
         )
