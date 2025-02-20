@@ -65,6 +65,23 @@ def create_compress_mask(seq_len, kv_seq_len, compress_block_size):
     block_mask = create_block_mask(compress_mask, B = None, H = None, Q_LEN = seq_len, KV_LEN = kv_seq_len, _compile = True)
     return block_mask
 
+
+def create_fine_mask(selected_block_indices: Tensor, seq_len, fine_block_size):
+    batch, heads = selected_block_indices.shape[:2]
+
+    def fine_mask(b_idx, h_idx, q_idx, kv_idx):
+        selected_indices = selected_block_indices[b_idx, h_idx]
+
+        # todo - fill in logic for creating the selected kv ranges per query
+
+        causal_mask = q_idx >= kv_idx
+        block_diagonal = (q_idx // fine_block_size) == (kv_idx // fine_block_size)
+
+        return (block_diagonal & causal_mask)
+
+    block_mask = create_block_mask(fine_mask, B = batch, H = heads, Q_LEN = seq_len, KV_LEN = seq_len, _compile = True)
+    return block_mask
+
 # helpers
 
 def exists(v):
