@@ -10,8 +10,9 @@ from rotary_embedding_torch import RotaryEmbedding
 
 from native_sparse_attention_pytorch.native_sparse_attention import (
     SparseAttention,
-    create_sliding_mask,
     create_compress_mask,
+    create_fine_mask,
+    create_sliding_mask,
 )
 
 # flex attention
@@ -121,6 +122,7 @@ class Transformer(Module):
         ff_expansion_factor = 4.,
         use_sparse_attn = False,
         use_flex_sliding_window = False,
+        use_flex_fine_selection = False,
         sparse_attn_kwargs: dict = dict(
             sliding_window_size = 32,
             compress_block_size = 4,
@@ -131,11 +133,12 @@ class Transformer(Module):
         super().__init__()
         self.token_emb = nn.Embedding(num_tokens, dim)
 
-        if use_flex_sliding_window:
+        if use_flex_sliding_window or use_flex_fine_selection:
             assert exists(flex_attention), 'flex attention is not available on your current version of pytorch'
 
         self.use_sparse_attn = use_sparse_attn
-        self.use_flex_sliding_window = use_flex_sliding_window
+        self.use_flex_sliding_window = use_sparse_attn & use_flex_sliding_window
+        self.use_flex_fine_selection = use_sparse_attn & use_flex_fine_selection
 
         layers = []
         for _ in range(depth):
@@ -186,9 +189,14 @@ class Transformer(Module):
 
         attn_kwargs = dict()
 
-        if not disable_flex and self.use_sparse_attn and self.use_flex_sliding_window:
+        if not disable_flex and self.use_flex_sliding_window:
             attn_kwargs.update(
                 sliding_window_flex_mask = create_sliding_mask(seq_len, self.attn_sliding_window_size)
+            )
+
+        if not disable_flex and self.use_flex_fine_selection:
+            attn_kwargs.udpate(
+                fine_selection_flex_mask = create_fine_mask(seq_len, self.attn_fine_block_size)
             )
 
         # layers
