@@ -392,15 +392,24 @@ class SparseAttention(Module):
             compress_seq_len = score_len * self.compress_block_size
 
             if self.interpolated_importance_score:
-                mask = importance_scores > 1e-10
-                mask = repeat(mask, '... j -> ... (j block_size)', block_size = self.compress_block_size)
                 importance_scores = interpolate_1d(importance_scores, compress_seq_len)
-                importance_scores = importance_scores.masked_fill(~mask, 0.)
             else:
                 importance_scores = repeat(importance_scores, '... j -> ... (j block_size)', block_size = self.compress_block_size)
 
             padding = fine_divisible_seq_len - compress_seq_len
+
+            fine_query_seq_len = importance_scores.shape[-2]
+            fine_query_padding = fine_divisible_seq_len - importance_scores.shape[-2]
+
             importance_scores = F.pad(importance_scores, (0, padding))
+
+            # mask out the diagonal since block causal is included by default for fine attending
+
+            block_causal_mask = torch.ones((num_fine_blocks,) * 2, device = device, dtype = torch.bool).tril(-1)
+            block_causal_mask = repeat(block_causal_mask, 'i j -> (i n1) (j n2)', n1 = self.selection_block_size, n2 = self.selection_block_size)
+            block_causal_mask = block_causal_mask[:fine_query_seq_len]
+
+            importance_scores = importance_scores.masked_fill(~block_causal_mask, 0.)
 
             importance_scores = reduce(importance_scores, '... (j block_size) -> ... j', 'mean', block_size = self.selection_block_size)
 
@@ -411,6 +420,9 @@ class SparseAttention(Module):
         fv = v
 
         if has_selected_kv_for_fine_attn:
+
+            # get the top-n kv segments for fine attention
+
             selected_importance_values, selected_block_indices = importance_scores.topk(num_selected, dim = -1)
 
             if self.use_diff_topk:
