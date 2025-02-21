@@ -26,18 +26,31 @@ LEARNING_RATE = 1e-4
 VALIDATE_EVERY = 100
 PRIME_LENGTH = 64
 GENERATE_EVERY = 500
-GENERATE_LENGTH = 256
-SEQ_LEN = 256
+GENERATE_LENGTH = 512
+SEQ_LEN = 512
+HEAD = 8
+KV_HEADS = 4
 
-USE_SPARSE_ATTN = True
+USE_SPARSE_ATTN = False
 USE_FLEX_FOR_FINE_SELECTION = True   # will push flex a bit, won't be efficient as each layer needs sparsity dynmically generated, but may be enough just to compare to full attention before going all-in on triton kernels
 QUERY_HEADS_SHARE_SELECTION = False  # if set to False, each query head can look at a different segment of their corresponding key / value head in GQA
+
+# sparse attention related
+
+SLIDING_WINDOW_SIZE = 64
+COMPRESS_BLOCK_SIZE = 64
+
+FINE_BLOCK_SIZE = 32
+NUM_FINE_SELECTED = 0
+
+INTERPOLATED_IMPORTANCE_SCORE = True
+USE_DIFF_TOPK = True
 
 # experiment related
 
 PROJECT_NAME = 'native-sparse-attention'
-RUN_NAME = 'baseline' if not USE_SPARSE_ATTN else 'sparse-attn'
-WANDB_ONLINE = False # turn this on to pipe experiment to cloud
+RUN_NAME = 'baseline' if not USE_SPARSE_ATTN else f'sparse-attn: compress size {COMPRESS_BLOCK_SIZE} | fine size {FINE_BLOCK_SIZE} | {NUM_FINE_SELECTED} selected'
+WANDB_ONLINE = True # turn this on to pipe experiment to cloud
 
 # helpers
 
@@ -101,24 +114,24 @@ model = Transformer(
     num_tokens = 256,
     dim = 512,
     depth = 6,
-    heads = 8,
+    heads = HEADS,
     dim_head = 64,
-    kv_heads = 4,
+    kv_heads = KV_HEADS,
     use_sparse_attn = USE_SPARSE_ATTN,
     use_flex_sliding_window = True,
     use_flex_fine_selection = USE_FLEX_FOR_FINE_SELECTION,
     sparse_attn_kwargs = dict(
-        sliding_window_size = 32,
-        compress_block_size = 32,
+        sliding_window_size = SLIDING_WINDOW_SIZE,
+        compress_block_size = COMPRESS_BLOCK_SIZE,
         compress_mlp = GroupedMLP(
             dim_head = 64,
-            compress_block_size = 32,
-            heads= 4,
+            compress_block_size = COMPRESS_BLOCK_SIZE,
+            heads = KV_HEADS,
         ),
-        selection_block_size = 32,
-        num_selected_blocks = 2,
-        use_diff_topk = True,
-        interpolated_importance_score = True,
+        selection_block_size = FINE_BLOCK_SIZE,
+        num_selected_blocks = NUM_FINE_SELECTED,
+        use_diff_topk = USE_DIFF_TOPK,
+        interpolated_importance_score = INTERPOLATED_IMPORTANCE_SCORE,
         query_heads_share_selected_kv = QUERY_HEADS_SHARE_SELECTION
     )
 ).cuda()
