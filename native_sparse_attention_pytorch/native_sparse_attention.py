@@ -15,7 +15,7 @@ from rotary_embedding_torch import RotaryEmbedding
 # einstein notation
 
 import einx
-from einops import einsum, repeat, rearrange, reduce
+from einops import einsum, repeat, rearrange, reduce, pack, unpack
 from einops.layers.torch import Rearrange
 
 # b - batch
@@ -109,12 +109,26 @@ def round_up_mult(n, mult):
 def divisible_by(num, den):
     return (num % den) == 0
 
+def pack_one_with_inverse(t, pattern):
+    packed, ps = pack([t], pattern)
+    def inverse(out):
+        return unpack(out, ps, pattern)[0]
+
+    return packed, inverse
+
 # tensor helpers
 
 def pad_at_dim(t, pad, dim = -1, value = 0.):
     dims_from_right = (- dim - 1) if dim < 0 else (t.ndim - dim - 1)
     zeros = ((0, 0) * dims_from_right)
     return F.pad(t, (*zeros, *pad), value = value)
+
+def interpolate_1d(x, length, mode = 'bilinear'):
+    x, inverse_pack = pack_one_with_inverse(x, '* n')
+    x = rearrange(x, 'b n -> b 1 n 1')
+    x = F.interpolate(x, (length, 1), mode = mode)
+    x = rearrange(x, 'b 1 n 1 -> b n')
+    return inverse_pack(x)
 
 def straight_through(t, target):
     return t + (target - t).detach()
@@ -135,6 +149,7 @@ class SparseAttention(Module):
         num_compressed_mem_kv = 4,
         norm = True,
         use_diff_topk = False,
+        interpolated_importance_score = False,
         compress_mlp: Module | None = None,
         compress_mlp_expand_factor = 1.,
         strategy_combine_mlp: Module | None = None
@@ -215,6 +230,8 @@ class SparseAttention(Module):
         # selection related
 
         self.use_diff_topk = use_diff_topk
+
+        self.interpolated_importance_score = interpolated_importance_score # in the case fine block size < compressed block size, will weigh space better when selecting
 
         self.selection_block_size = selection_block_size
 
@@ -326,10 +343,18 @@ class SparseAttention(Module):
         # first we expand all the compressed scores to the full sequence length, then average within each fine / selection block size - pad on the right to 0s, which should be fine as sliding window convers the local anyways
 
         if self.compress_block_size != self.selection_block_size:
-            importance_scores = repeat(importance_scores, '... j -> ... (j block_size)', block_size = self.compress_block_size)
-            padding = fine_divisible_seq_len - importance_scores.shape[-1]
 
+            score_len = importance_scores.shape[-1]
+            compress_seq_len = score_len * self.compress_block_size
+
+            if self.interpolated_importance_score:
+                importance_scores = interpolate_1d(importance_scores, compress_seq_len)
+            else:
+                importance_scores = repeat(importance_scores, '... j -> ... (j block_size)', block_size = self.compress_block_size)
+
+            padding = fine_divisible_seq_len - compress_seq_len
             importance_scores = F.pad(importance_scores, (0, padding))
+
             importance_scores = reduce(importance_scores, '... (j block_size) -> ... j', 'mean', block_size = self.selection_block_size)
 
         # handle if number of total blocks is less than number to select for fine attention
