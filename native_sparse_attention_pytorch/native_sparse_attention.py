@@ -277,7 +277,11 @@ class SparseAttention(Module):
 
         self.selection_block_size = selection_block_size
 
-        assert num_selected_blocks > 0
+        assert num_selected_blocks >= 0
+
+        if num_selected_blocks == 0:
+            print(f'`num_selected_blocks` should be set greater than 0, unless if you are ablating it for experimental purposes')
+
         self.num_selected_blocks = num_selected_blocks
 
         # they combine the three sparse branches through a learned combine with sigmoid activation
