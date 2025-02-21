@@ -290,7 +290,7 @@ class SparseAttention(Module):
         ck = cat((mem_ck, ck), dim = -2)
         cv = cat((mem_cv, cv), dim = -2)
 
-        ck, cv = tuple(repeat(t, 'b h ... -> b (num_grouped_queries h) ...', num_grouped_queries = self.num_grouped_queries) for t in (ck, cv))
+        ck, cv = tuple(repeat(t, 'b h ... -> b (h num_grouped_queries) ...', num_grouped_queries = self.num_grouped_queries) for t in (ck, cv))
 
         csim = einsum(q, ck, 'b h i d, b h j d -> b h i j') * self.scale
 
