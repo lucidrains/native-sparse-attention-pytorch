@@ -30,7 +30,8 @@ GENERATE_LENGTH = 256
 SEQ_LEN = 256
 
 USE_SPARSE_ATTN = True
-USE_FLEX_FOR_FINE_SELECTION = True # will push flex a bit, won't be efficient as each layer needs sparsity dynmically generated, but may be enough just to compare to full attention before going all-in on triton kernels
+USE_FLEX_FOR_FINE_SELECTION = True   # will push flex a bit, won't be efficient as each layer needs sparsity dynmically generated, but may be enough just to compare to full attention before going all-in on triton kernels
+QUERY_HEADS_SHARE_SELECTION = False  # if set to False, each query head can look at a different segment of their corresponding key / value head in GQA
 
 # experiment related
 
@@ -117,7 +118,8 @@ model = Transformer(
         selection_block_size = 32,
         num_selected_blocks = 2,
         use_diff_topk = True,
-        interpolated_importance_score = True
+        interpolated_importance_score = True,
+        query_heads_share_selected_kv = QUERY_HEADS_SHARE_SELECTION
     )
 ).cuda()
 

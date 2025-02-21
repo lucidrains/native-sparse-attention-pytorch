@@ -189,6 +189,7 @@ class SparseAttention(Module):
         norm = True,
         use_diff_topk = False,
         interpolated_importance_score = False,
+        query_heads_share_selected_kv = True, # if set to True, importance score is averaged across query heads to select top-n buckets of kv per kv head - but can be set to False for each query head within a group to look at different sets of kv buckets. will be more memory and compute of course
         compress_mlp: Module | None = None,
         compress_mlp_expand_factor = 1.,
         strategy_combine_mlp: Module | None = None
@@ -271,6 +272,8 @@ class SparseAttention(Module):
         self.use_diff_topk = use_diff_topk
 
         self.interpolated_importance_score = interpolated_importance_score # in the case fine block size < compressed block size, will weigh space better when selecting
+
+        self.query_heads_share_selected_kv = query_heads_share_selected_kv
 
         self.selection_block_size = selection_block_size
 
@@ -363,9 +366,14 @@ class SparseAttention(Module):
 
         importance_scores = cattn[..., num_mem_compress_kv:]
 
-        # for gqa, we will average the compressed attention across each grouped queries (per key / values)
+        # maybe average the compressed attention across each grouped queries (per key / values)
 
-        importance_scores = reduce(importance_scores, 'b (h grouped_queries) ... -> b h ...', 'mean', grouped_queries = self.num_grouped_queries)
+        if self.query_heads_share_selected_kv:
+            importance_scores = reduce(importance_scores, 'b (h grouped_queries) ... -> b h ...', 'mean', grouped_queries = self.num_grouped_queries)
+
+            fine_num_grouped_queries = self.num_grouped_queries
+        else:
+            fine_num_grouped_queries = 1
 
         # handle if compress block size does not equal to the fine block size
         # cannot parse their equation, so will just improvise
@@ -400,12 +408,12 @@ class SparseAttention(Module):
             if self.use_diff_topk:
                 gates = straight_through(selected_importance_values, 1.)
                 gates = gates.cumprod(dim = -1)[..., -1]
-                gates = repeat(gates, 'b h ... -> b (h qh) ...', qh = self.num_grouped_queries)
+                gates = repeat(gates, 'b h ... -> b (h qh) ...', qh = fine_num_grouped_queries)
 
             if exists(fine_selection_flex_mask):
                 # flex attention for the selection for fine attention
 
-                fine_block_mask = fine_selection_flex_mask(selected_block_indices, num_grouped_queries = self.num_grouped_queries)
+                fine_block_mask = fine_selection_flex_mask(selected_block_indices, num_grouped_queries = fine_num_grouped_queries)
 
                 fine_attn_out = flex_attention(fq, fk, fv, block_mask = fine_block_mask, enable_gqa = True)
 
@@ -428,13 +436,13 @@ class SparseAttention(Module):
                 # handle block causal diagonal in the diagram, but run experiments without to see
 
                 fine_window_seq = arange(fine_divisible_seq_len, device = device) // self.selection_block_size
-                fine_window_seq = repeat(fine_window_seq, 'n -> b h n 1', b = batch, h = self.kv_heads)
+                fine_window_seq = repeat(fine_window_seq, 'n -> b h n 1', b = batch, h = selected_block_indices.shape[1])
                 selected_block_indices = cat((selected_block_indices, fine_window_seq), dim = -1) # for the block causal diagonal in fig2
 
                 fmask = repeat(fmask, 'b h i w -> b h i w j', j = self.selection_block_size)
 
                 causal_mask = torch.ones((self.selection_block_size,) * 2, device = device, dtype = torch.bool).tril()
-                causal_mask = repeat(causal_mask, 'i j -> b h (w i) 1 j', w = num_fine_blocks, b = batch, h = self.kv_heads)
+                causal_mask = repeat(causal_mask, 'i j -> b h (w i) 1 j', w = num_fine_blocks, b = batch, h = fmask.shape[1])
 
                 fmask = cat((fmask, causal_mask), dim = -2)
                 fmask = rearrange(fmask, 'b h i w j -> b h i (w j)')
@@ -446,8 +454,12 @@ class SparseAttention(Module):
 
                 # get_at("b h [w] j d, b h i selected -> b h i selected j d", fkv, selected_block_indices)
 
-                fk = repeat(fk, 'b h w j d -> b h i w j d', i = selected_block_indices.shape[2])
-                fv = repeat(fv, 'b h w j d -> b h i w j d', i = selected_block_indices.shape[2])
+                if self.query_heads_share_selected_kv:
+                    fk = repeat(fk, 'b h w j d -> b h i w j d', i = selected_block_indices.shape[2])
+                    fv = repeat(fv, 'b h w j d -> b h i w j d', i = selected_block_indices.shape[2])
+                else:
+                    fk = repeat(fk, 'b h w j d -> b (h qh) i w j d', i = selected_block_indices.shape[2], qh = self.num_grouped_queries)
+                    fv = repeat(fv, 'b h w j d -> b (h qh) i w j d', i = selected_block_indices.shape[2], qh = self.num_grouped_queries)
 
                 selected_block_indices = repeat(selected_block_indices, 'b h i sel -> b h i sel j d', j = fk.shape[-2], d = fk.shape[-1])
 
@@ -460,7 +472,7 @@ class SparseAttention(Module):
 
                 fmask = rearrange(fmask, 'b h ... -> b h 1 ...')
 
-                fq = rearrange(fq, 'b (h qh) ... -> b h qh ...', qh = self.num_grouped_queries)
+                fq = rearrange(fq, 'b (h qh) ... -> b h qh ...', qh = fine_num_grouped_queries)
 
                 fsim = einsum(fq, fk, 'b h qh i d, b h i j d -> b h qh i j') * self.scale
 
