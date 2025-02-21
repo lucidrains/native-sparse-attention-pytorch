@@ -185,7 +185,7 @@ class SparseAttention(Module):
         selection_block_size,
         num_selected_blocks,
         kv_heads = None,
-        num_compressed_mem_kv = 4,
+        num_compressed_mem_kv = 1,
         norm = True,
         use_diff_topk = False,
         interpolated_importance_score = False,
