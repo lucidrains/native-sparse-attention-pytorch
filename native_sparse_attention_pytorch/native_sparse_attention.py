@@ -318,7 +318,7 @@ class SparseAttention(Module):
 
         # for gqa, we will average the compressed attention across each grouped queries (per key / values)
 
-        importance_scores = reduce(importance_scores, 'b (grouped_queries h) ... -> b h ...', 'mean', grouped_queries = self.num_grouped_queries)
+        importance_scores = reduce(importance_scores, 'b (h grouped_queries) ... -> b h ...', 'mean', grouped_queries = self.num_grouped_queries)
 
         # handle if compress block size does not equal to the fine block size
         # cannot parse their equation, so will just improvise
@@ -349,7 +349,7 @@ class SparseAttention(Module):
             if exists(fine_selection_flex_mask):
                 # flex attention for the selection for fine attention
 
-                fk, fv, selected_block_indices = tuple(repeat(t, 'b h ... -> b (num_grouped_queries h) ...', num_grouped_queries = self.num_grouped_queries) for t in (fk, fv, selected_block_indices))
+                fk, fv, selected_block_indices = tuple(repeat(t, 'b h ... -> b (h num_grouped_queries) ...', num_grouped_queries = self.num_grouped_queries) for t in (fk, fv, selected_block_indices))
 
                 fine_block_mask = fine_selection_flex_mask(selected_block_indices)
 
@@ -413,7 +413,7 @@ class SparseAttention(Module):
 
                 # fine attention
 
-                fk, fv, fmask = tuple(repeat(t, 'b h ... -> b (num_grouped_queries h) ...', num_grouped_queries = self.num_grouped_queries) for t in (fk, fv, fmask))
+                fk, fv, fmask = tuple(repeat(t, 'b h ... -> b (h num_grouped_queries) ...', num_grouped_queries = self.num_grouped_queries) for t in (fk, fv, fmask))
 
                 fsim = einsum(fq, fk, 'b h i d, b h i j d -> b h i j') * self.scale
 
@@ -430,7 +430,7 @@ class SparseAttention(Module):
             seq_len = fk.shape[-2]
             fmask = causal_mask = torch.ones((seq_len, seq_len), device = device, dtype = torch.bool).tril()
 
-            fk, fv = tuple(repeat(t, 'b h ... -> b (num_grouped_queries h) ...', num_grouped_queries = self.num_grouped_queries) for t in (fk, fv))
+            fk, fv = tuple(repeat(t, 'b h ... -> b (h num_grouped_queries) ...', num_grouped_queries = self.num_grouped_queries) for t in (fk, fv))
 
             fsim = einsum(fq, fk, 'b h i d, b h j d -> b h i j') * self.scale
 
@@ -449,7 +449,7 @@ class SparseAttention(Module):
         if exists(sliding_window_flex_mask):
             sliding_window_attn_out = flex_attention(sq, sk, sv, block_mask = sliding_window_flex_mask, enable_gqa = True)
         else:
-            sk, sv = tuple(repeat(t, 'b h ... -> b (num_grouped_queries h) ...', num_grouped_queries = self.num_grouped_queries) for t in (sk, sv))
+            sk, sv = tuple(repeat(t, 'b h ... -> b (h num_grouped_queries) ...', num_grouped_queries = self.num_grouped_queries) for t in (sk, sv))
 
             sliding_window_attn_out = self.sliding_window(sq, sk, sv)
 
