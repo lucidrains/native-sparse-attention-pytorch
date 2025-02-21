@@ -12,13 +12,15 @@ from native_sparse_attention_pytorch import SparseAttention
 @pytest.mark.parametrize('selection_block_size', (8, 4, 2))
 @pytest.mark.parametrize('num_selected_block', (0, 2))
 @pytest.mark.parametrize('query_heads_share_selected_kv', (False, True))
+@pytest.mark.parametrize('interpolated_importance_score', (False, True))
 def test_sparse_attn(
     use_diff_topk,
     seq_len,
     kv_heads,
     selection_block_size,
     num_selected_block,
-    query_heads_share_selected_kv
+    query_heads_share_selected_kv,
+    interpolated_importance_score
 ):
     attn = SparseAttention(
         dim = 512,
@@ -30,7 +32,8 @@ def test_sparse_attn(
         selection_block_size = selection_block_size,
         num_selected_blocks = num_selected_block,
         use_diff_topk = use_diff_topk,
-        query_heads_share_selected_kv = query_heads_share_selected_kv
+        query_heads_share_selected_kv = query_heads_share_selected_kv,
+        interpolated_importance_score = interpolated_importance_score
     )
 
     tokens = torch.randn(2, seq_len, 512)

@@ -370,6 +370,9 @@ class SparseAttention(Module):
 
         importance_scores = cattn[..., num_mem_compress_kv:]
 
+        num_selected = min(self.num_selected_blocks, importance_scores.shape[-1])
+        has_selected_kv_for_fine_attn = num_selected > 0
+
         # maybe average the compressed attention across each grouped queries (per key / values)
 
         if self.query_heads_share_selected_kv:
@@ -383,13 +386,16 @@ class SparseAttention(Module):
         # cannot parse their equation, so will just improvise
         # first we expand all the compressed scores to the full sequence length, then average within each fine / selection block size - pad on the right to 0s, which should be fine as sliding window convers the local anyways
 
-        if self.compress_block_size != self.selection_block_size:
+        if has_selected_kv_for_fine_attn and self.compress_block_size != self.selection_block_size:
 
             score_len = importance_scores.shape[-1]
             compress_seq_len = score_len * self.compress_block_size
 
             if self.interpolated_importance_score:
+                mask = importance_scores > 1e-10
+                mask = repeat(mask, '... j -> ... (j block_size)', block_size = self.compress_block_size)
                 importance_scores = interpolate_1d(importance_scores, compress_seq_len)
+                importance_scores = importance_scores.masked_fill(~mask, 0.)
             else:
                 importance_scores = repeat(importance_scores, '... j -> ... (j block_size)', block_size = self.compress_block_size)
 
@@ -400,13 +406,11 @@ class SparseAttention(Module):
 
         # handle if number of total blocks is less than number to select for fine attention
 
-        num_selected = min(self.num_selected_blocks, importance_scores.shape[-1])
-
         fq = rotated_q
         fk = rotated_k
         fv = v
 
-        if num_selected > 0:
+        if has_selected_kv_for_fine_attn:
             selected_importance_values, selected_block_indices = importance_scores.topk(num_selected, dim = -1)
 
             if self.use_diff_topk:
