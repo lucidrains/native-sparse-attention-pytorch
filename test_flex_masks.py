@@ -7,7 +7,7 @@ from native_sparse_attention_pytorch.native_sparse_attention import (
 
 # compress
 
-print('compress mask:', create_compress_mask(1024, 256, 4))
+print('compress mask:', create_compress_mask(512, 128, 4, mem_kv_len = 16))
 
 # fine
 

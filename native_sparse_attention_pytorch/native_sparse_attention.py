@@ -53,17 +53,20 @@ def create_sliding_mask(seq_len, window_size):
     block_mask = create_block_mask(sliding_mask, B = None, H = None, Q_LEN = seq_len, KV_LEN = seq_len, _compile = True)
     return block_mask
 
-def create_compress_mask(seq_len, kv_seq_len, compress_block_size):
+def create_compress_mask(seq_len, kv_seq_len, compress_block_size, mem_kv_len = 0):
     # cannot be used as using attention logits for importance score
     # but just to show the immense potential of flex attention
 
     def compress_mask(_, __, q_idx, kv_idx):
-        compress_kv_idx = (kv_idx * compress_block_size) + (compress_block_size - 1)
+        is_mem_kv = kv_idx < mem_kv_len
+
+        kv_without_mem = kv_idx - mem_kv_len
+        compress_kv_idx = (kv_without_mem * compress_block_size) + (compress_block_size - 1)
 
         causal_mask = q_idx > compress_kv_idx
-        return causal_mask
+        return causal_mask | is_mem_kv
 
-    block_mask = create_block_mask(compress_mask, B = None, H = None, Q_LEN = seq_len, KV_LEN = kv_seq_len, _compile = True)
+    block_mask = create_block_mask(compress_mask, B = None, H = None, Q_LEN = seq_len, KV_LEN = kv_seq_len + mem_kv_len, _compile = True)
     return block_mask
 
 def create_fine_mask(seq_len, fine_block_size):
@@ -133,6 +136,41 @@ def interpolate_1d(x, length, mode = 'bilinear'):
 
 def straight_through(t, target):
     return t + (target - t).detach()
+
+# attend function
+
+def attend(
+    q, k, v,
+    mask = None,
+    return_attn = False,
+    scale = None
+):
+    scale = default(scale, q.shape[-1] ** -0.5)
+
+    q_heads, k_heads = q.shape[1], k.shape[1]
+    num_grouped_queries = q_heads // k_heads
+
+    q = rearrange(q, 'b (h qh) ... -> b h qh ...', qh = num_grouped_queries)
+
+    sim = einsum(q, k, 'b h qh i d, b h j d -> b h qh i j') * scale
+
+    mask_value = -torch.finfo(sim.dtype).max
+
+    if exists(mask):
+        sim = sim.masked_fill(~mask, mask_value)
+
+    attn = sim.softmax(dim = -1)
+
+    attn_out = einsum(attn, v, 'b h qh i j, b h j d -> b h qh i d')
+
+    attn_out = rearrange(attn_out, 'b h qh ... -> b (h qh) ...')
+
+    if not return_attn:
+        return attn_out
+
+    attn = rearrange(attn, 'b h qh ... -> b (h qh) ...')
+
+    return attn_out, attn
 
 # classes
 
@@ -309,26 +347,13 @@ class SparseAttention(Module):
         ck = cat((mem_ck, ck), dim = -2)
         cv = cat((mem_cv, cv), dim = -2)
 
-        cq = rearrange(cq, 'b (h qh) ... -> b h qh ...', qh = self.num_grouped_queries)
-
-        csim = einsum(cq, ck, 'b h qh i d, b h j d -> b h qh i j') * self.scale
-
         cq_seq = arange(seq_len, device = device)
-
         ck_seq = ((arange(num_compress_blocks, device = device) + 1) * self.compress_block_size) - 1
         ck_seq = F.pad(ck_seq, (num_mem_compress_kv, 0), value = -1)
 
         cmask = einx.less('j, i -> i j', ck_seq, cq_seq)
 
-        mask_value = -torch.finfo(csim.dtype).max
-
-        csim = csim.masked_fill(~cmask, mask_value)
-
-        cattn = csim.softmax(dim = -1)
-
-        compressed_attn_out = einsum(cattn, cv, 'b h qh i j, b h j d -> b h qh i d')
-
-        compressed_attn_out, cattn = tuple(rearrange(t, 'b h qh ... -> b (h qh) ...') for t in (compressed_attn_out, cattn))
+        compressed_attn_out, cattn = attend(cq, ck, cv, mask = cmask, return_attn = True)
 
         # for 2. and 3., will give them relative positions with rotary - compressed needs to be handled separately (even if they already have intra block absolute positions)
 
@@ -441,15 +466,21 @@ class SparseAttention(Module):
 
                 # fine attention
 
-                fk, fv, fmask = tuple(repeat(t, 'b h ... -> b (h num_grouped_queries) ...', num_grouped_queries = self.num_grouped_queries) for t in (fk, fv, fmask))
+                fmask = rearrange(fmask, 'b h ... -> b h 1 ...')
 
-                fsim = einsum(fq, fk, 'b h i d, b h i j d -> b h i j') * self.scale
+                fq = rearrange(fq, 'b (h qh) ... -> b h qh ...', qh = self.num_grouped_queries)
+
+                fsim = einsum(fq, fk, 'b h qh i d, b h i j d -> b h qh i j') * self.scale
+
+                mask_value = -torch.finfo(fsim.dtype).max
 
                 fsim = fsim.masked_fill(~fmask, mask_value)
 
                 fattn = fsim.softmax(dim = -1)
 
-                fine_attn_out = einsum(fattn, fv, 'b h i j, b h i j d -> b h i d')
+                fine_attn_out = einsum(fattn, fv, 'b h qh i j, b h i j d -> b h qh i d')
+
+                fine_attn_out = rearrange(fine_attn_out, 'b h qh ... -> b (h qh) ...')
 
                 fine_attn_out = fine_attn_out[..., :seq_len, :]
         else:
@@ -458,15 +489,7 @@ class SparseAttention(Module):
             seq_len = fk.shape[-2]
             fmask = causal_mask = torch.ones((seq_len, seq_len), device = device, dtype = torch.bool).tril()
 
-            fk, fv = tuple(repeat(t, 'b h ... -> b (h num_grouped_queries) ...', num_grouped_queries = self.num_grouped_queries) for t in (fk, fv))
-
-            fsim = einsum(fq, fk, 'b h i d, b h j d -> b h i j') * self.scale
-
-            fsim = fsim.masked_fill(~fmask, mask_value)
-
-            fattn = fsim.softmax(dim = -1)
-
-            fine_attn_out = einsum(fattn, fv, 'b h i j, b h j d -> b h i d')
+            fine_attn_out = attend(fq, fk, fv, mask = fmask)
 
         # 3. overlapping sliding window, this is unsurprising and expected - `s` for sliding
 
