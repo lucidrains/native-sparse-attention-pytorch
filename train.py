@@ -24,7 +24,7 @@ GENERATE_LENGTH = 256
 SEQ_LEN = 256
 
 USE_SPARSE_ATTN = True
-USE_FLEX_FOR_FINE_SELECTION = False # will push flex a bit, won't be efficient as each layer needs sparsity dynmically generated, but may be enough just to compare to full attention before going all-in on triton kernels
+USE_FLEX_FOR_FINE_SELECTION = True # will push flex a bit, won't be efficient as each layer needs sparsity dynmically generated, but may be enough just to compare to full attention before going all-in on triton kernels
 
 # experiment related
 

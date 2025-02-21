@@ -196,7 +196,7 @@ class Transformer(Module):
             )
 
         if not disable_flex and self.use_flex_fine_selection:
-            attn_kwargs.udpate(
+            attn_kwargs.update(
                 fine_selection_flex_mask = create_fine_mask(seq_len, self.attn_fine_block_size)
             )
 

@@ -79,13 +79,12 @@ def create_fine_mask(seq_len, fine_block_size):
             compressed_q_idx = q_idx // fine_block_size
             compressed_kv_idx = kv_idx // fine_block_size
 
-            block_causal_mask = compressed_q_idx > compressed_kv_idx
             is_selected = one_hot_selected_block_indices[b_idx, h_idx, q_idx, compressed_kv_idx]
 
             causal_mask = q_idx >= kv_idx
             block_diagonal = compressed_q_idx == compressed_kv_idx
 
-            return (causal_mask & block_diagonal) | (block_causal_mask & is_selected)
+            return (causal_mask & (block_diagonal | is_selected))
 
         block_mask = create_block_mask(fine_mask, B = batch, H = heads, Q_LEN = seq_len, KV_LEN = seq_len, _compile = True)
         return block_mask
@@ -344,76 +343,87 @@ class SparseAttention(Module):
             selected_importance_values, selected_block_indices = importance_scores.topk(num_selected, dim = -1)
 
             if self.use_diff_topk:
+                assert not exists(fine_selection_flex_mask)
                 gates = straight_through(selected_importance_values, 1.)
 
-            fmask = selected_importance_values > 1e-10
+            if exists(fine_selection_flex_mask):
+                # flex attention for the selection for fine attention
 
-            if seq_len < fine_divisible_seq_len:
-                remainder = fine_divisible_seq_len - seq_len
-                fk = pad_at_dim(fk, (0, remainder), value = 0., dim = -2)
-                fv = pad_at_dim(fv, (0, remainder), value = 0., dim = -2)
-                fq = pad_at_dim(fq, (0, remainder), value = 0., dim = -2)
+                fk, fv, selected_block_indices = tuple(repeat(t, 'b h ... -> b (num_grouped_queries h) ...', num_grouped_queries = self.num_grouped_queries) for t in (fk, fv, selected_block_indices))
 
-                fmask = pad_at_dim(fmask, (0, remainder), value = False, dim = -2)
+                fine_block_mask = fine_selection_flex_mask(selected_block_indices)
 
-                selected_block_indices = pad_at_dim(selected_block_indices, (0, remainder), value = 0, dim = -2)
+                fine_attn_out = flex_attention(fq, fk, fv, block_mask = fine_block_mask)
+
+            else:
+                fmask = selected_importance_values > 1e-10
+
+                if seq_len < fine_divisible_seq_len:
+                    remainder = fine_divisible_seq_len - seq_len
+                    fk = pad_at_dim(fk, (0, remainder), value = 0., dim = -2)
+                    fv = pad_at_dim(fv, (0, remainder), value = 0., dim = -2)
+                    fq = pad_at_dim(fq, (0, remainder), value = 0., dim = -2)
+
+                    fmask = pad_at_dim(fmask, (0, remainder), value = False, dim = -2)
+
+                    selected_block_indices = pad_at_dim(selected_block_indices, (0, remainder), value = 0, dim = -2)
+
+                    if self.use_diff_topk:
+                        gates = pad_at_dim(gates, (0, remainder), value = 1., dim = -2)
+
+                # handle block causal diagonal in the diagram, but run experiments without to see
+
+                fine_window_seq = arange(fine_divisible_seq_len, device = device) // self.selection_block_size
+                fine_window_seq = repeat(fine_window_seq, 'n -> b h n 1', b = batch, h = self.kv_heads)
+                selected_block_indices = cat((selected_block_indices, fine_window_seq), dim = -1) # for the block causal diagonal in fig2
+
+                fmask = repeat(fmask, 'b h i w -> b h i w j', j = self.selection_block_size)
+
+                causal_mask = torch.ones((self.selection_block_size,) * 2, device = device, dtype = torch.bool).tril()
+                causal_mask = repeat(causal_mask, 'i j -> b h (w i) 1 j', w = num_fine_blocks, b = batch, h = self.kv_heads)
+
+                fmask = cat((fmask, causal_mask), dim = -2)
+                fmask = rearrange(fmask, 'b h i w j -> b h i (w j)')
+
+                # select out the spatial crops of keys / values for fine attention
+
+                fk = rearrange(fk, 'b h (w n) d -> b h w n d', w = num_fine_blocks)
+                fv = rearrange(fv, 'b h (w n) d -> b h w n d', w = num_fine_blocks)
+
+                # get_at("b h [w] j d, b h i selected -> b h i selected j d", fkv, selected_block_indices)
+
+                fk = repeat(fk, 'b h w j d -> b h i w j d', i = selected_block_indices.shape[2])
+                fv = repeat(fv, 'b h w j d -> b h i w j d', i = selected_block_indices.shape[2])
+
+                selected_block_indices = repeat(selected_block_indices, 'b h i sel -> b h i sel j d', j = fk.shape[-2], d = fk.shape[-1])
+
+                fk = fk.gather(3, selected_block_indices)
+                fv = fv.gather(3, selected_block_indices)
+
+                # handle maybe gating
 
                 if self.use_diff_topk:
-                    gates = pad_at_dim(gates, (0, remainder), value = 1., dim = -2)
+                    gates = F.pad(gates, (0, 1), value = 1.)
 
-            # handle block causal diagonal in the diagram, but run experiments without to see
+                    fk = einx.multiply('b h i w, b h i w j d -> b h i w j d', gates, fk)
+                    fv = einx.multiply('b h i w, b h i w j d -> b h i w j d', gates, fv)
 
-            fine_window_seq = arange(fine_divisible_seq_len, device = device) // self.selection_block_size
-            fine_window_seq = repeat(fine_window_seq, 'n -> b h n 1', b = batch, h = self.kv_heads)
-            selected_block_indices = cat((selected_block_indices, fine_window_seq), dim = -1) # for the block causal diagonal in fig2
+                fk = rearrange(fk, 'b h i w j d -> b h i (w j) d')
+                fv = rearrange(fv, 'b h i w j d -> b h i (w j) d')
 
-            fmask = repeat(fmask, 'b h i w -> b h i w j', j = self.selection_block_size)
+                # fine attention
 
-            causal_mask = torch.ones((self.selection_block_size,) * 2, device = device, dtype = torch.bool).tril()
-            causal_mask = repeat(causal_mask, 'i j -> b h (w i) 1 j', w = num_fine_blocks, b = batch, h = self.kv_heads)
+                fk, fv, fmask = tuple(repeat(t, 'b h ... -> b (num_grouped_queries h) ...', num_grouped_queries = self.num_grouped_queries) for t in (fk, fv, fmask))
 
-            fmask = cat((fmask, causal_mask), dim = -2)
-            fmask = rearrange(fmask, 'b h i w j -> b h i (w j)')
+                fsim = einsum(fq, fk, 'b h i d, b h i j d -> b h i j') * self.scale
 
-            # select out the spatial crops of keys / values for fine attention
+                fsim = fsim.masked_fill(~fmask, mask_value)
 
-            fk = rearrange(fk, 'b h (w n) d -> b h w n d', w = num_fine_blocks)
-            fv = rearrange(fv, 'b h (w n) d -> b h w n d', w = num_fine_blocks)
+                fattn = fsim.softmax(dim = -1)
 
-            # get_at("b h [w] j d, b h i selected -> b h i selected j d", fkv, selected_block_indices)
+                fine_attn_out = einsum(fattn, fv, 'b h i j, b h i j d -> b h i d')
 
-            fk = repeat(fk, 'b h w j d -> b h i w j d', i = selected_block_indices.shape[2])
-            fv = repeat(fv, 'b h w j d -> b h i w j d', i = selected_block_indices.shape[2])
-
-            selected_block_indices = repeat(selected_block_indices, 'b h i sel -> b h i sel j d', j = fk.shape[-2], d = fk.shape[-1])
-
-            fk = fk.gather(3, selected_block_indices)
-            fv = fv.gather(3, selected_block_indices)
-
-            # handle maybe gating
-
-            if self.use_diff_topk:
-                gates = F.pad(gates, (0, 1), value = 1.)
-
-                fk = einx.multiply('b h i w, b h i w j d -> b h i w j d', gates, fk)
-                fv = einx.multiply('b h i w, b h i w j d -> b h i w j d', gates, fv)
-
-            fk = rearrange(fk, 'b h i w j d -> b h i (w j) d')
-            fv = rearrange(fv, 'b h i w j d -> b h i (w j) d')
-
-            # fine attention
-
-            fk, fv, fmask = tuple(repeat(t, 'b h ... -> b (num_grouped_queries h) ...', num_grouped_queries = self.num_grouped_queries) for t in (fk, fv, fmask))
-
-            fsim = einsum(fq, fk, 'b h i d, b h i j d -> b h i j') * self.scale
-
-            fsim = fsim.masked_fill(~fmask, mask_value)
-
-            fattn = fsim.softmax(dim = -1)
-
-            fine_attn_out = einsum(fattn, fv, 'b h i j, b h i j d -> b h i d')
-
-            fine_attn_out = fine_attn_out[..., :seq_len, :]
+                fine_attn_out = fine_attn_out[..., :seq_len, :]
         else:
             # if only first block, just do a simple block causal
 
