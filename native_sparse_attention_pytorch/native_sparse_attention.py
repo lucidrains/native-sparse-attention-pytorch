@@ -399,7 +399,7 @@ class SparseAttention(Module):
 
             if self.use_diff_topk:
                 gates = straight_through(selected_importance_values, 1.)
-                gates = gates.cumsum(dim = -1)[..., -1]
+                gates = gates.cumprod(dim = -1)[..., -1]
                 gates = repeat(gates, 'b h ... -> b (h qh) ...', qh = self.num_grouped_queries)
 
             if exists(fine_selection_flex_mask):

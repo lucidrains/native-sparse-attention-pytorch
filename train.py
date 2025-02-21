@@ -116,7 +116,7 @@ model = Transformer(
         ),
         selection_block_size = 32,
         num_selected_blocks = 2,
-        use_diff_topk = False,
+        use_diff_topk = True,
         interpolated_importance_score = True
     )
 ).cuda()
