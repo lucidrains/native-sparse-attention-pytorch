@@ -67,9 +67,9 @@ def create_compress_mask(seq_len, kv_seq_len, compress_block_size):
 
 def create_fine_mask(seq_len, fine_block_size):
 
-    def inner(selected_block_indices: Tensor):
+    def inner(selected_block_indices: Tensor, num_grouped_queries = 1):
         device = selected_block_indices.device
-        batch, heads = selected_block_indices.shape[:2]
+        batch, kv_heads = selected_block_indices.shape[:2]
 
         one_hot_selected_block_indices = torch.zeros((*selected_block_indices.shape[:-1], seq_len // fine_block_size), device = device, dtype = torch.bool)
         one_hot_selected_block_indices.scatter_(-1, selected_block_indices, True)
@@ -78,15 +78,16 @@ def create_fine_mask(seq_len, fine_block_size):
 
             compressed_q_idx = q_idx // fine_block_size
             compressed_kv_idx = kv_idx // fine_block_size
+            kv_head_idx = h_idx // num_grouped_queries
 
-            is_selected = one_hot_selected_block_indices[b_idx, h_idx, q_idx, compressed_kv_idx]
+            is_selected = one_hot_selected_block_indices[b_idx, kv_head_idx, q_idx, compressed_kv_idx]
 
             causal_mask = q_idx >= kv_idx
             block_diagonal = compressed_q_idx == compressed_kv_idx
 
             return (causal_mask & (block_diagonal | is_selected))
 
-        block_mask = create_block_mask(fine_mask, B = batch, H = heads, Q_LEN = seq_len, KV_LEN = seq_len, _compile = True)
+        block_mask = create_block_mask(fine_mask, B = batch, H = kv_heads * num_grouped_queries, Q_LEN = seq_len, KV_LEN = seq_len, _compile = True)
         return block_mask
 
     return inner
@@ -349,11 +350,9 @@ class SparseAttention(Module):
             if exists(fine_selection_flex_mask):
                 # flex attention for the selection for fine attention
 
-                fk, fv, selected_block_indices = tuple(repeat(t, 'b h ... -> b (h num_grouped_queries) ...', num_grouped_queries = self.num_grouped_queries) for t in (fk, fv, selected_block_indices))
+                fine_block_mask = fine_selection_flex_mask(selected_block_indices, num_grouped_queries = self.num_grouped_queries)
 
-                fine_block_mask = fine_selection_flex_mask(selected_block_indices)
-
-                fine_attn_out = flex_attention(fq, fk, fv, block_mask = fine_block_mask)
+                fine_attn_out = flex_attention(fq, fk, fv, block_mask = fine_block_mask, enable_gqa = True)
 
             else:
                 fmask = selected_importance_values > 1e-10
