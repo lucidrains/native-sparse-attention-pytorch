@@ -20,6 +20,7 @@ from einops.layers.torch import Rearrange
 
 # b - batch
 # h - heads
+# qh - grouped query heads
 # n - sequence (token level or compressed)
 # w - windows, for fine or compressed
 # i, j - query / key sequence
@@ -295,6 +296,7 @@ class SparseAttention(Module):
         k_compress_input = self.split_compress_window(k[..., :compress_divisible_seq_len, :] + k_pos)
         v_compress_input = self.split_compress_window(v[..., :compress_divisible_seq_len, :] + v_pos)
 
+        cq = q
         ck = self.k_compress(k_compress_input)   # Equation (7) of the Native Sparse Attention paper
         cv = self.v_compress(v_compress_input)
 
@@ -307,9 +309,9 @@ class SparseAttention(Module):
         ck = cat((mem_ck, ck), dim = -2)
         cv = cat((mem_cv, cv), dim = -2)
 
-        ck, cv = tuple(repeat(t, 'b h ... -> b (h num_grouped_queries) ...', num_grouped_queries = self.num_grouped_queries) for t in (ck, cv))
+        cq = rearrange(cq, 'b (h qh) ... -> b h qh ...', qh = self.num_grouped_queries)
 
-        csim = einsum(q, ck, 'b h i d, b h j d -> b h i j') * self.scale
+        csim = einsum(cq, ck, 'b h qh i d, b h j d -> b h qh i j') * self.scale
 
         cq_seq = arange(seq_len, device = device)
 
@@ -324,7 +326,9 @@ class SparseAttention(Module):
 
         cattn = csim.softmax(dim = -1)
 
-        compressed_attn_out = einsum(cattn, cv, 'b h i j, b h j d -> b h i d')
+        compressed_attn_out = einsum(cattn, cv, 'b h qh i j, b h j d -> b h qh i d')
+
+        compressed_attn_out, cattn = tuple(rearrange(t, 'b h qh ... -> b (h qh) ...') for t in (compressed_attn_out, cattn))
 
         # for 2. and 3., will give them relative positions with rotary - compressed needs to be handled separately (even if they already have intra block absolute positions)
 
