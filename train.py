@@ -11,6 +11,12 @@ from torch.utils.data import DataLoader, Dataset
 
 from native_sparse_attention_pytorch.transformer import Transformer
 
+from native_sparse_attention_pytorch.compress_networks import (
+    ConvLinearCompress,
+    AttentionPool,
+    GroupedMLP
+)
+
 # constants
 
 NUM_BATCHES = int(1e5)
@@ -95,6 +101,7 @@ model = Transformer(
     dim = 512,
     depth = 6,
     heads = 8,
+    dim_head = 64,
     kv_heads = 4,
     use_sparse_attn = USE_SPARSE_ATTN,
     use_flex_sliding_window = True,
@@ -102,6 +109,11 @@ model = Transformer(
     sparse_attn_kwargs = dict(
         sliding_window_size = 32,
         compress_block_size = 32,
+        compress_mlp = GroupedMLP(
+            dim_head = 64,
+            compress_block_size = 32,
+            heads= 4,
+        ),
         selection_block_size = 32,
         num_selected_blocks = 2,
         use_diff_topk = False,
