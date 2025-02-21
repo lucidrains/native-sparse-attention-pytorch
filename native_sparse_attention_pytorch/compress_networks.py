@@ -3,6 +3,7 @@ from torch import nn
 from torch.nn import Module, ModuleList
 
 from einops import einsum, rearrange
+from einops.layers.torch import EinMix as Mix
 
 # helpers
 
@@ -66,3 +67,34 @@ class AttentionPool(Module):
 
         return compressed
 
+# mlp per head
+
+class GroupedMLP(Module):
+    def __init__(
+        self,
+        dim_head,
+        compress_block_size,
+        heads,
+        expand_factor = 1.,
+    ):
+        super().__init__()
+
+        dim = dim_head * compress_block_size
+        dim_hidden = int(dim * expand_factor)
+        dim_out = dim_head
+
+        self.net = nn.Sequential(
+            Mix('b h w i -> b h w o', weight_shape = 'h i o', bias_shape = 'h o', h = heads, i = dim, o = dim_hidden),
+            nn.ReLU(),
+            Mix('b h w i -> b h w o', weight_shape = 'h i o', bias_shape = 'h o', h = heads, i = dim_hidden, o = dim_out),
+        )
+
+    def forward(
+        self,
+        kv
+    ):
+        kv = rearrange(kv, 'b h w n d -> b h w (n d)')
+
+        compressed = self.net(kv)
+
+        return compressed
