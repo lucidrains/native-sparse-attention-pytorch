@@ -446,11 +446,11 @@ class SparseAttention(Module):
         sk = rotated_k
         sv = v
 
-        sk, sv = tuple(repeat(t, 'b h ... -> b (num_grouped_queries h) ...', num_grouped_queries = self.num_grouped_queries) for t in (sk, sv))
-
         if exists(sliding_window_flex_mask):
-            sliding_window_attn_out = flex_attention(sq, sk, sv, block_mask = sliding_window_flex_mask)
+            sliding_window_attn_out = flex_attention(sq, sk, sv, block_mask = sliding_window_flex_mask, enable_gqa = True)
         else:
+            sk, sv = tuple(repeat(t, 'b h ... -> b (num_grouped_queries h) ...', num_grouped_queries = self.num_grouped_queries) for t in (sk, sv))
+
             sliding_window_attn_out = self.sliding_window(sq, sk, sv)
 
         # combine strategies
