@@ -277,7 +277,7 @@ class SparseAttention(Module):
         k_compress_input = self.split_compress_window(k[..., :compress_divisible_seq_len, :] + k_pos)
         v_compress_input = self.split_compress_window(v[..., :compress_divisible_seq_len, :] + v_pos)
 
-        ck = self.k_compress(k_compress_input)
+        ck = self.k_compress(k_compress_input)   # Equation (7) of the Native Sparse Attention paper
         cv = self.v_compress(v_compress_input)
 
         # 1. coarse attention over compressed
@@ -320,7 +320,7 @@ class SparseAttention(Module):
 
         importance_scores = reduce(importance_scores, 'b (grouped_queries h) ... -> b h ...', 'mean', grouped_queries = self.num_grouped_queries)
 
-        # handle if compress block size not equal to the fine block size
+        # handle if compress block size does not equal to the fine block size
         # cannot parse their equation, so will just improvise
         # first we expand all the compressed scores to the full sequence length, then average within each fine / selection block size - pad on the right to 0s, which should be fine as sliding window convers the local anyways
 
