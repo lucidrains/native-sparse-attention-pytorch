@@ -3,6 +3,8 @@
 # forward is modified to return unnormalized accumulation, row maxes, row lse - reduced over passed rings
 # both forwards and backwards is modified to allow for masking out the diagonal for striped ring attention
 
+from functools import partial
+import math
 from math import ceil
 
 import torch
@@ -82,12 +84,6 @@ def _fwd_kernel(
     CACHE_KEY_SEQLEN_Q,
     CACHE_KEY_SEQLEN_K,
     HAS_BIAS: tl.constexpr,
-    IS_CAUSAL: tl.constexpr,
-    CAUSAL_MASK_DIAGONAL: tl.constexpr,
-    LOAD_ACCUMULATED: tl.constexpr,
-    RETURN_NORMALIZED_OUTPUT: tl.constexpr,
-    SOFTCLAMP_QK_SIM: tl.constexpr,
-    SOFTCLAMP_VALUE: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
     EVEN_M: tl.constexpr,
     EVEN_N: tl.constexpr,
@@ -121,19 +117,13 @@ def _fwd_kernel(
 
     m_ptrs = M + off_hb * seqlen_q_rounded + offs_m
 
-    if LOAD_ACCUMULATED:
-        m_i = tl.load(m_ptrs)
-    else:
-        m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
     # load lse
 
     lse_ptrs = Lse + off_hb * seqlen_q_rounded + offs_m
 
-    if LOAD_ACCUMULATED:
-        lse_i = tl.load(lse_ptrs)
-    else:
-        lse_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    lse_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
     # load accumualted output
 
@@ -146,23 +136,7 @@ def _fwd_kernel(
         + (offs_m[:, None] * stride_om + offs_d[None, :])
     )
 
-    if LOAD_ACCUMULATED:
-        if EVEN_M:
-            if EVEN_HEADDIM:
-                acc_o = tl.load(out_ptrs)
-            else:
-                acc_o = tl.load(out_ptrs, mask=offs_d[None, :] < headdim)
-        else:
-            if EVEN_HEADDIM:
-                acc_o = tl.load(out_ptrs, mask=offs_m[:, None] < seqlen_q)
-            else:
-                acc_o = tl.load(
-                    out_ptrs, mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim)
-                )
-
-        acc_o = acc_o.to(tl.float32)
-    else:
-        acc_o = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
+    acc_o = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
 
     # load queries, keys, values
 
@@ -179,7 +153,7 @@ def _fwd_kernel(
                 q_ptrs, mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim), other=0.0
             )
 
-    end_n = seqlen_k if not IS_CAUSAL else tl.minimum((start_m + 1) * BLOCK_M, seqlen_k)
+    end_n = tl.minimum((start_m + 1) * BLOCK_M, seqlen_k)
     for start_n in range(0, end_n, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
 
@@ -204,21 +178,10 @@ def _fwd_kernel(
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, tl.trans(k))
 
-        if SOFTCLAMP_QK_SIM:
-            effective_softclamp_value = SOFTCLAMP_VALUE / softmax_scale
-            qk /= effective_softclamp_value
-            qk = libdevice.tanh(qk)
-            qk *= effective_softclamp_value
-
         if not EVEN_N:
             qk += tl.where((start_n + offs_n)[None, :] < seqlen_k, 0, float("-inf"))
 
-        if IS_CAUSAL:
-            if CAUSAL_MASK_DIAGONAL:
-                # needed for stripe attention
-                qk += tl.where(offs_m[:, None] > (start_n + offs_n)[None, :], 0, float("-inf"))
-            else:
-                qk += tl.where(offs_m[:, None] >= (start_n + offs_n)[None, :], 0, float("-inf"))
+        qk += tl.where(offs_m[:, None] >= (start_n + offs_n)[None, :], 0, float("-inf"))
 
         if HAS_BIAS:
             if EVEN_N:
@@ -270,9 +233,8 @@ def _fwd_kernel(
         l_i_new = tl.exp(lse_i - m_ij) + l_ij
         lse_i = m_ij + tl.log(l_i_new)
 
-    if RETURN_NORMALIZED_OUTPUT:
-        acc_o_scale = tl.exp(m_i - lse_i)
-        acc_o = acc_o * acc_o_scale[:, None]
+    acc_o_scale = tl.exp(m_i - lse_i)
+    acc_o = acc_o * acc_o_scale[:, None]
 
     # offsets for m and lse
 
@@ -282,9 +244,6 @@ def _fwd_kernel(
     # write back lse and m
 
     tl.store(lse_ptrs, lse_i)
-
-    if not RETURN_NORMALIZED_OUTPUT:
-        tl.store(m_ptrs, m_i)
 
     # write to output
 
@@ -306,26 +265,13 @@ def flash_attn_forward(
     k,
     v,
     bias = None,
-    causal = False,
     o = None,
     m = None,
     lse = None,
     softmax_scale = None,
-    causal_mask_diagonal = False,
-    return_normalized_output = False,
-    load_accumulated = True,
-    softclamp_qk_sim = False,
-    softclamp_value = 50.,
-    head_first_dim = False,
     remove_padding = False
 ):
     q, k, v = [x if is_contiguous(x) else x.contiguous() for x in (q, k, v)]
-
-    if head_first_dim:
-        q, k, v = tuple(rearrange(t, 'b h n d -> b n h d') for t in (q, k, v))
-
-        if exists(o):
-            o = rearrange(o, 'b h n d -> b n h d')
 
     batch, seqlen_q, nheads, d = q.shape
     _, seqlen_k, _, _ = k.shape
@@ -360,17 +306,14 @@ def flash_attn_forward(
 
     if not exists(lse):
         max_neg_value = -torch.finfo(torch.float32).max
-        init_fn = partial(torch.full, fill_value = max_neg_value) if load_accumulated else torch.empty
-        lse = init_fn((batch, nheads, seqlen_q_rounded), device=q.device, dtype=torch.float32)
+        lse = torch.empty((batch, nheads, seqlen_q_rounded), device=q.device, dtype=torch.float32)
 
     if not exists(m):
         max_neg_value = -torch.finfo(torch.float32).max
-        init_fn = partial(torch.full, fill_value = max_neg_value) if load_accumulated else torch.empty
-        m = init_fn((batch, nheads, seqlen_q_rounded), device=q.device, dtype=torch.float32)
+        m = torch.empty((batch, nheads, seqlen_q_rounded), device=q.device, dtype=torch.float32)
 
     if not exists(o):
-        init_fn = torch.zeros_like if load_accumulated else torch.empty_like
-        o = init_fn(q)
+        o = torch.empty_like(q)
 
     BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
     BLOCK = 128
@@ -407,12 +350,6 @@ def flash_attn_forward(
         seqlen_q // 32,
         seqlen_k // 32,
         has_bias,
-        causal,
-        causal_mask_diagonal,
-        load_accumulated,
-        return_normalized_output,
-        softclamp_qk_sim,
-        softclamp_value,
         BLOCK_HEADDIM,
         BLOCK_M = BLOCK,
         BLOCK_N = BLOCK,
@@ -420,14 +357,10 @@ def flash_attn_forward(
         num_stages = 1,
     )
 
-    if head_first_dim:
-        o = rearrange(o, 'b n h d -> b h n d')
-
     if remove_padding:
-        m = m[..., :seqlen_q]
         lse = lse[..., :seqlen_q]
 
-    return o, m, lse
+    return o, lse
 
 @triton.jit
 def _bwd_preprocess_do_o_dot(
@@ -533,10 +466,6 @@ def _bwd_kernel_one_col_block(
     headdim,
     ATOMIC_ADD: tl.constexpr,
     BIAS_TYPE: tl.constexpr,
-    IS_CAUSAL: tl.constexpr,
-    CAUSAL_MASK_DIAGONAL: tl.constexpr,
-    SOFTCLAMP_QK_SIM: tl.constexpr,
-    SOFTCLAMP_VALUE: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
     EVEN_M: tl.constexpr,
     EVEN_N: tl.constexpr,
@@ -545,7 +474,7 @@ def _bwd_kernel_one_col_block(
     BLOCK_N: tl.constexpr,
 ):
     # We need to make sure begin_m is a multiple of BLOCK_M (not BLOCK_N)
-    begin_m = 0 if not IS_CAUSAL else ((start_n * BLOCK_N) // BLOCK_M) * BLOCK_M
+    begin_m = ((start_n * BLOCK_N) // BLOCK_M) * BLOCK_M
     # initialize row/col offsets
     offs_qm = begin_m + tl.arange(0, BLOCK_M)
     offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -627,22 +556,11 @@ def _bwd_kernel_one_col_block(
         # recompute p = softmax(qk, dim=-1).T
         qk = tl.dot(q, tl.trans(k))
 
-        if SOFTCLAMP_QK_SIM:
-            effective_softclamp_value = SOFTCLAMP_VALUE / softmax_scale
-            qk /= effective_softclamp_value
-            qk = libdevice.tanh(qk)
-            dtanh = 1. - qk * qk
-            qk *= effective_softclamp_value
-
         # Trying to combine the two masks seem to make the result wrong
         if not EVEN_N:  # Need to mask out otherwise the softmax is wrong
             qk = tl.where(offs_n[None, :] < seqlen_k, qk, float("-inf"))
-        if IS_CAUSAL:
-            if CAUSAL_MASK_DIAGONAL:
-                # needed for stripe attention
-                qk = tl.where(offs_m_curr[:, None] > (offs_n[None, :]), qk, float("-inf"))
-            else:
-                qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), qk, float("-inf"))
+
+        qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), qk, float("-inf"))
 
         if BIAS_TYPE != "none":
             tl.debug_barrier()  # Race condition otherwise
@@ -713,9 +631,6 @@ def _bwd_kernel_one_col_block(
         # Converting ds to q.dtype here reduces register pressure and makes it much faster
         # for BLOCK_HEADDIM=128
         ds = (p * (dp - Di[:, None]) * softmax_scale)
-
-        if SOFTCLAMP_QK_SIM:
-            ds *= dtanh
 
         ds = ds.to(q.dtype)
 
@@ -823,7 +738,7 @@ def init_to_zero(name):
         # triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "SEQUENCE_PARALLEL": False}, num_warps=4, num_stages=1, pre_hook=init_to_zero('DQ')),
         # triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "SEQUENCE_PARALLEL": True}, num_warps=4, num_stages=1, pre_hook=init_to_zero('DQ')),
     ],
-    key=["CACHE_KEY_SEQLEN_Q", "CACHE_KEY_SEQLEN_K", "BIAS_TYPE", "IS_CAUSAL", "BLOCK_HEADDIM"],
+    key=["CACHE_KEY_SEQLEN_Q", "CACHE_KEY_SEQLEN_K", "BIAS_TYPE", "BLOCK_HEADDIM"],
 )
 @triton.heuristics(
     {
@@ -877,10 +792,6 @@ def _bwd_kernel(
     CACHE_KEY_SEQLEN_Q,
     CACHE_KEY_SEQLEN_K,
     BIAS_TYPE: tl.constexpr,
-    IS_CAUSAL: tl.constexpr,
-    CAUSAL_MASK_DIAGONAL: tl.constexpr,
-    SOFTCLAMP_QK_SIM: tl.constexpr,
-    SOFTCLAMP_VALUE: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
     SEQUENCE_PARALLEL: tl.constexpr,
     EVEN_M: tl.constexpr,
@@ -934,10 +845,6 @@ def _bwd_kernel(
                 headdim,
                 ATOMIC_ADD=False,
                 BIAS_TYPE=BIAS_TYPE,
-                IS_CAUSAL=IS_CAUSAL,
-                CAUSAL_MASK_DIAGONAL = CAUSAL_MASK_DIAGONAL,
-                SOFTCLAMP_QK_SIM = SOFTCLAMP_QK_SIM,
-                SOFTCLAMP_VALUE = SOFTCLAMP_VALUE,
                 BLOCK_HEADDIM=BLOCK_HEADDIM,
                 EVEN_M=EVEN_M,
                 EVEN_N=EVEN_N,
@@ -973,10 +880,6 @@ def _bwd_kernel(
             headdim,
             ATOMIC_ADD=True,
             BIAS_TYPE=BIAS_TYPE,
-            IS_CAUSAL=IS_CAUSAL,
-            CAUSAL_MASK_DIAGONAL = CAUSAL_MASK_DIAGONAL,
-            SOFTCLAMP_QK_SIM = SOFTCLAMP_QK_SIM,
-            SOFTCLAMP_VALUE = SOFTCLAMP_VALUE,
             BLOCK_HEADDIM=BLOCK_HEADDIM,
             EVEN_M=EVEN_M,
             EVEN_N=EVEN_N,
@@ -997,15 +900,12 @@ def flash_attn_backward(
     dv,
     delta = None,
     bias = None,
-    causal = False,
-    causal_mask_diagonal = False,
     softmax_scale = None,
-    softclamp_qk_sim = False,
-    softclamp_value = 50.
 ):
     # Make sure that the last dimension is contiguous
     if do.stride(-1) != 1:
         do = do.contiguous()
+
     batch, seqlen_q, nheads, d = q.shape
     _, seqlen_k, _, _ = k.shape
     # assert d in {16, 32, 64, 128}
@@ -1113,10 +1013,6 @@ def flash_attn_backward(
         # Can't use kwargs here because triton autotune expects key to be args, not kwargs
         # IS_CAUSAL=causal, BLOCK_HEADDIM=d,
         bias_type,
-        causal,
-        causal_mask_diagonal,
-        softclamp_qk_sim,
-        softclamp_value,
         BLOCK_HEADDIM,
         # SEQUENCE_PARALLEL=False,
         # BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
@@ -1142,10 +1038,33 @@ class NSA(Function):
         selected_block_indices,
         num_grouped_queries
     ):
-        raise NotImplementedError
+        fq, fk, fv = tuple(rearrange(t, 'b h n d -> b n h d') for t in (fq, fk, fv))
+
+        dtype = fq.dtype
+
+        fq, fk, fv = tuple(t.half() for t in (fq, fk, fv))
+
+        out, lse = flash_attn_forward(fq, fk, fv)
+
+        ctx.save_for_backward(fq, fk, fv, out, lse)
+
+        out = rearrange(out, 'b n h d -> b h n d')
+        return out.type(dtype)
 
     @classmethod
     def backward(self, ctx, do):
-        raise NotImplementedError
+        do = rearrange(do, 'b h n d -> b n h d')
+
+        q, k, v, out, lse = ctx.saved_tensors
+
+        do = do.half()
+        dq = torch.zeros_like(q)
+        dk = torch.zeros_like(k)
+        dv = torch.zeros_like(v)
+
+        flash_attn_backward(do, q, k, v, out, lse, dq, dk, dv)
+
+        dq, dk, dv = tuple(rearrange(t, 'b n h d -> b h n d') for t in (dq, dk, dv))
+        return dq, dk, dv, None, None, None
 
 native_sparse_attend = NSA.apply
