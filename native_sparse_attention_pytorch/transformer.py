@@ -35,6 +35,9 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def at_most_one_of(*bools):
+    return sum([*map(int, bools)]) <= 1
+
 # attention
 
 class Attention(Module):
@@ -123,6 +126,7 @@ class Transformer(Module):
         use_sparse_attn = False,
         use_flex_sliding_window = False,
         use_flex_fine_selection = False,
+        use_triton_fine_selection = False,
         sparse_attn_kwargs: dict = dict(
             sliding_window_size = 32,
             compress_block_size = 4,
@@ -131,6 +135,8 @@ class Transformer(Module):
         )
     ):
         super().__init__()
+        assert at_most_one_of(use_flex_fine_selection, use_triton_fine_selection), 'either using flex or custom triton kernel for fine attn, but not both'
+
         self.token_emb = nn.Embedding(num_tokens, dim)
 
         if use_flex_sliding_window or use_flex_fine_selection:
@@ -149,6 +155,7 @@ class Transformer(Module):
                     dim_head = dim_head,
                     heads = heads,
                     kv_heads = kv_heads,
+                    use_triton_kernel = use_triton_fine_selection,
                     **sparse_attn_kwargs
                 )
             else:

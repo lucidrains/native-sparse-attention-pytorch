@@ -191,6 +191,7 @@ class SparseAttention(Module):
         num_compressed_mem_kv = 1,
         norm = True,
         use_diff_topk = False,
+        use_triton_kernel = False,
         interpolated_importance_score = False,
         query_heads_share_selected_kv = True, # if set to True, importance score is averaged across query heads to select top-n buckets of kv per kv head - but can be set to False for each query head within a group to look at different sets of kv buckets. will be more memory and compute of course
         compress_mlp: Module | None = None,
@@ -286,6 +287,8 @@ class SparseAttention(Module):
             print(f'`num_selected_blocks` should be set greater than 0, unless if you are ablating it for experimental purposes')
 
         self.num_selected_blocks = num_selected_blocks
+
+        self.use_triton_kernel = use_triton_kernel
 
         # they combine the three sparse branches through a learned combine with sigmoid activation
 
@@ -438,7 +441,17 @@ class SparseAttention(Module):
                 gates = gates.cumprod(dim = -1)[..., -1]
                 gates = repeat(gates, 'b h ... -> b (h qh) ...', qh = fine_num_grouped_queries)
 
-            if exists(fine_selection_flex_mask):
+            if self.use_triton_kernel:
+                from native_sparse_attention_pytorch.triton_native_sparse_attention import native_sparse_attend
+
+                fine_attn_out = native_sparse_attend(
+                    fq, fk, fv,
+                    self.selection_block_size,
+                    selected_block_indices,
+                    fine_num_grouped_queries
+                )
+
+            elif exists(fine_selection_flex_mask):
                 # flex attention for the selection for fine attention
 
                 fine_block_mask = fine_selection_flex_mask(selected_block_indices, num_grouped_queries = fine_num_grouped_queries)
