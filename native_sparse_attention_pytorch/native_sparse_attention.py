@@ -113,6 +113,9 @@ def round_up_mult(n, mult):
 def divisible_by(num, den):
     return (num % den) == 0
 
+def max_neg_value(t):
+    return -torch.finfo(t.dtype).max
+
 def pack_one_with_inverse(t, pattern):
     packed, ps = pack([t], pattern)
     def inverse(out):
@@ -142,7 +145,7 @@ def straight_through(t, target):
 def attend(
     q, k, v,
     mask = None,
-    return_attn = False,
+    return_sim = False,
     scale = None
 ):
     scale = default(scale, q.shape[-1] ** -0.5)
@@ -154,7 +157,7 @@ def attend(
 
     sim = einsum(q, k, 'b h qh i d, b h j d -> b h qh i j') * scale
 
-    mask_value = -torch.finfo(sim.dtype).max
+    mask_value = max_neg_value(sim)
 
     if exists(mask):
         sim = sim.masked_fill(~mask, mask_value)
@@ -165,12 +168,12 @@ def attend(
 
     attn_out = rearrange(attn_out, 'b h qh ... -> b (h qh) ...')
 
-    if not return_attn:
+    if not return_sim:
         return attn_out
 
-    attn = rearrange(attn, 'b h qh ... -> b (h qh) ...')
+    sim = rearrange(sim, 'b h qh ... -> b (h qh) ...')
 
-    return attn_out, attn
+    return attn_out, sim
 
 # classes
 
@@ -360,7 +363,7 @@ class SparseAttention(Module):
 
         cmask = einx.less('j, i -> i j', ck_seq, cq_seq)
 
-        compressed_attn_out, cattn = attend(cq, ck, cv, mask = cmask, return_attn = True)
+        compressed_attn_out, csim = attend(cq, ck, cv, mask = cmask, return_sim = True)
 
         # for 2. and 3., will give them relative positions with rotary - compressed needs to be handled separately (even if they already have intra block absolute positions)
 
@@ -368,9 +371,9 @@ class SparseAttention(Module):
 
         # 2. fine attention over selected based on compressed attention logits - variables prepended with `f` stands for the fine attention pathway
 
-        importance_scores = cattn[..., num_mem_compress_kv:]
+        importance_scores = csim[..., num_mem_compress_kv:]
 
-        num_selected = min(self.num_selected_blocks, importance_scores.shape[-1])
+        num_selected = min(self.num_selected_blocks, num_compress_blocks)
         has_selected_kv_for_fine_attn = num_selected > 0
 
         # maybe average the compressed attention across each grouped queries (per key / values)
@@ -386,32 +389,37 @@ class SparseAttention(Module):
         # cannot parse their equation, so will just improvise
         # first we expand all the compressed scores to the full sequence length, then average within each fine / selection block size - pad on the right to 0s, which should be fine as sliding window convers the local anyways
 
-        if has_selected_kv_for_fine_attn and self.compress_block_size != self.selection_block_size:
+        if has_selected_kv_for_fine_attn:
 
-            score_len = importance_scores.shape[-1]
-            compress_seq_len = score_len * self.compress_block_size
+            if self.compress_block_size != self.selection_block_size:
 
-            if self.interpolated_importance_score:
-                importance_scores = interpolate_1d(importance_scores, compress_seq_len)
-            else:
-                importance_scores = repeat(importance_scores, '... j -> ... (j block_size)', block_size = self.compress_block_size)
+                compress_seq_len = num_compress_blocks * self.compress_block_size
 
-            padding = fine_divisible_seq_len - compress_seq_len
+                if self.interpolated_importance_score:
+                    importance_scores = interpolate_1d(importance_scores, compress_seq_len)
+                else:
+                    importance_scores = repeat(importance_scores, '... j -> ... (j block_size)', block_size = self.compress_block_size)
 
-            fine_query_seq_len = importance_scores.shape[-2]
-            fine_query_padding = fine_divisible_seq_len - importance_scores.shape[-2]
+                padding = fine_divisible_seq_len - compress_seq_len
 
-            importance_scores = F.pad(importance_scores, (0, padding))
+                fine_query_seq_len = importance_scores.shape[-2]
+                fine_query_padding = fine_divisible_seq_len - importance_scores.shape[-2]
 
-            # mask out the diagonal since block causal is included by default for fine attending
+                importance_scores = F.pad(importance_scores, (0, padding))
 
-            block_causal_mask = torch.ones((num_fine_blocks,) * 2, device = device, dtype = torch.bool).tril(-1)
-            block_causal_mask = repeat(block_causal_mask, 'i j -> (i n1) (j n2)', n1 = self.selection_block_size, n2 = self.selection_block_size)
-            block_causal_mask = block_causal_mask[:fine_query_seq_len]
+                # mask out the diagonal since block causal is included by default for fine attending
 
-            importance_scores = importance_scores.masked_fill(~block_causal_mask, 0.)
+                block_causal_mask = torch.ones((num_fine_blocks,) * 2, device = device, dtype = torch.bool).tril(-1)
+                block_causal_mask = repeat(block_causal_mask, 'i j -> (i n1) (j n2)', n1 = self.selection_block_size, n2 = self.selection_block_size)
+                block_causal_mask = block_causal_mask[:fine_query_seq_len]
 
-            importance_scores = reduce(importance_scores, '... (j block_size) -> ... j', 'mean', block_size = self.selection_block_size)
+                importance_scores = importance_scores.masked_fill(~block_causal_mask, max_neg_value(csim))
+
+                importance_scores = reduce(importance_scores, '... (j block_size) -> ... j', 'mean', block_size = self.selection_block_size)
+
+            importance_scores = F.pad(importance_scores, (1, 0), value = -1e3)
+            importance_scores = importance_scores.softmax(dim = -1)
+            importance_scores = importance_scores[..., 1:]
 
         # handle if number of total blocks is less than number to select for fine attention
 
@@ -496,7 +504,7 @@ class SparseAttention(Module):
 
                 fsim = einsum(fq, fk, 'b h qh i d, b h i j d -> b h qh i j') * self.scale
 
-                mask_value = -torch.finfo(fsim.dtype).max
+                mask_value = max_neg_value(fsim)
 
                 fsim = fsim.masked_fill(~fmask, mask_value)
 
