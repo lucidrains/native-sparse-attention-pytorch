@@ -18,6 +18,9 @@ def exists(v):
 def default(val, d):
     return val if exists(val) else d
 
+def round_up_multiple(n, mult):
+    return ceil(n / mult) * mult
+
 def is_contiguous(x: Tensor):
     return x.stride(-1) == 1
 
@@ -41,6 +44,10 @@ assert pkg_version.parse(triton_version) >= pkg_version.parse('3.0.0'), f'triton
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice
+
+# constants
+
+TRITON_BLOCK_SIZE = 128
 
 # kernels
 
@@ -256,7 +263,7 @@ def flash_attn_forward(
 
     softmax_scale = dim ** -0.5
 
-    seqlen_q_rounded = ceil(seqlen_q / 128) * 128
+    seqlen_q_rounded = round_up_multiple(seqlen_q, TRITON_BLOCK_SIZE)
 
     lse = torch.empty((batch, nheads, seqlen_q_rounded), device=q.device, dtype=torch.float32)
 
@@ -764,18 +771,18 @@ def flash_attn_backward(
     block_size = 128
 ):
     # Make sure that the last dimension is contiguous
-    if do.stride(-1) != 1:
+    if not is_contiguous(do):
         do = do.contiguous()
 
     batch, seqlen_q, nheads, dim = q.shape
     _, seqlen_k, _, _ = k.shape
     # assert d in {16, 32, 64, 128}
     assert dim <= 128
-    seqlen_q_rounded = ceil(seqlen_q / 128) * 128
+    seqlen_q_rounded = round_up_multiple(seqlen_q, TRITON_BLOCK_SIZE)
 
     assert lse.shape == (batch, nheads, seqlen_q_rounded)
-    assert q.stride(-1) == k.stride(-1) == v.stride(-1) == o.stride(-1) == 1
-    assert dq.stride(-1) == dk.stride(-1) == dv.stride(-1) == 1
+    assert all([is_contiguous(t) for t in (q, k, v, o, dq, dk, dv)])
+
     softmax_scale = dim ** -0.5
     # dq_accum = torch.zeros_like(q, dtype=torch.float32)
     dq_accum = torch.empty_like(q, dtype=torch.float32)
@@ -786,6 +793,7 @@ def flash_attn_backward(
 
     delta = torch.empty_like(lse)
     grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK"]), batch * nheads)
+
     _bwd_preprocess_do_o_dot[grid](
         o,
         do,
