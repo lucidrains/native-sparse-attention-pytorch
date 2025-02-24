@@ -240,9 +240,6 @@ def flash_attn_forward(
     q,
     k,
     v,
-    o = None,
-    m = None,
-    lse = None,
     softmax_scale = None,
     remove_padding = False,
     block_size = 128
@@ -263,16 +260,11 @@ def flash_attn_forward(
 
     seqlen_q_rounded = ceil(seqlen_q / 128) * 128
 
-    if not exists(lse):
-        max_neg_value = -torch.finfo(torch.float32).max
-        lse = torch.empty((batch, nheads, seqlen_q_rounded), device=q.device, dtype=torch.float32)
+    lse = torch.empty((batch, nheads, seqlen_q_rounded), device=q.device, dtype=torch.float32)
 
-    if not exists(m):
-        max_neg_value = -torch.finfo(torch.float32).max
-        m = torch.empty((batch, nheads, seqlen_q_rounded), device=q.device, dtype=torch.float32)
+    m = torch.empty((batch, nheads, seqlen_q_rounded), device=q.device, dtype=torch.float32)
 
-    if not exists(o):
-        o = torch.empty_like(q)
+    o = torch.empty_like(q)
 
     BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
     num_warps = 4 if d <= 64 else 8
@@ -779,7 +771,6 @@ def flash_attn_backward(
     dq,
     dk,
     dv,
-    delta = None,
     softmax_scale = None,
     block_size = 128
 ):
@@ -804,26 +795,25 @@ def flash_attn_backward(
 
     BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
 
-    if not exists(delta):
-        delta = torch.empty_like(lse)
-        grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK"]), batch * nheads)
-        _bwd_preprocess_do_o_dot[grid](
-            o,
-            do,
-            delta,
-            o.stride(0),
-            o.stride(2),
-            o.stride(1),
-            do.stride(0),
-            do.stride(2),
-            do.stride(1),
-            nheads,
-            seqlen_q,
-            seqlen_q_rounded,
-            d,
-            BLOCK = block_size,
-            BLOCK_HEADDIM=BLOCK_HEADDIM,
-        )
+    delta = torch.empty_like(lse)
+    grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK"]), batch * nheads)
+    _bwd_preprocess_do_o_dot[grid](
+        o,
+        do,
+        delta,
+        o.stride(0),
+        o.stride(2),
+        o.stride(1),
+        do.stride(0),
+        do.stride(2),
+        do.stride(1),
+        nheads,
+        seqlen_q,
+        seqlen_q_rounded,
+        d,
+        BLOCK = block_size,
+        BLOCK_HEADDIM=BLOCK_HEADDIM,
+    )
 
     # BLOCK_M = 128
     # BLOCK_N = 64
