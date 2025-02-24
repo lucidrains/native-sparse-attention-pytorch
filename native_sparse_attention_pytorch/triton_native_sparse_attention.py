@@ -77,6 +77,9 @@ def _fwd_kernel(
     stride_ob,
     stride_oh,
     stride_om,
+    stride_kvbl_b,
+    stride_kvbl_h,
+    stride_kvbl_m,
     nheads,
     seqlen_q,
     seqlen_k,
@@ -301,6 +304,9 @@ def flash_attn_forward(
         o.stride(0),
         o.stride(2),
         o.stride(1),
+        kv_block_indices.stride(0),
+        kv_block_indices.stride(2),
+        kv_block_indices.stride(1),
         nheads,
         seqlen_q,
         seqlen_k,
@@ -929,6 +935,8 @@ class NSA(Function):
         fmask,
         num_grouped_queries
     ):
+        selected_block_indices, fmask = tuple(rearrange(t, 'b h i sel -> b i h sel') for t in (selected_block_indices, fmask))
+
         fq, fk, fv = tuple(rearrange(t, 'b h n d -> b n h d') for t in (fq, fk, fv))
 
         dtype = fq.dtype
