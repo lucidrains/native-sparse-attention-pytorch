@@ -240,23 +240,21 @@ def flash_attn_forward(
     q,
     k,
     v,
-    softmax_scale = None,
-    remove_padding = False,
     block_size = 128
 ):
     q, k, v = [x if is_contiguous(x) else x.contiguous() for x in (q, k, v)]
 
-    batch, seqlen_q, nheads, d = q.shape
+    batch, seqlen_q, nheads, dim = q.shape
     _, seqlen_k, _, _ = k.shape
 
-    assert k.shape == (batch, seqlen_k, nheads, d)
-    assert v.shape == (batch, seqlen_k, nheads, d)
-    assert d <= 128, "FlashAttention only support head dimensions up to 128"
+    assert k.shape == (batch, seqlen_k, nheads, dim)
+    assert v.shape == (batch, seqlen_k, nheads, dim)
+    assert dim <= 128, "only support head dimensions up to 128"
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same type"
     assert q.dtype in [torch.float16, torch.bfloat16], "Only support fp16 and bf16"
     assert q.is_cuda and k.is_cuda and v.is_cuda
 
-    softmax_scale = default(softmax_scale, d ** -0.5)
+    softmax_scale = dim ** -0.5
 
     seqlen_q_rounded = ceil(seqlen_q / 128) * 128
 
@@ -266,8 +264,8 @@ def flash_attn_forward(
 
     o = torch.empty_like(q)
 
-    BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
-    num_warps = 4 if d <= 64 else 8
+    BLOCK_HEADDIM = max(triton.next_power_of_2(dim), 16)
+    num_warps = 4 if dim <= 64 else 8
     grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK"]), batch * nheads)
 
     _fwd_kernel[grid](
@@ -294,7 +292,7 @@ def flash_attn_forward(
         seqlen_q,
         seqlen_k,
         seqlen_q_rounded,
-        d,
+        dim,
         seqlen_q // 32,
         seqlen_k // 32,
         BLOCK_HEADDIM,
@@ -302,9 +300,6 @@ def flash_attn_forward(
         num_warps = num_warps,
         num_stages = 1,
     )
-
-    if remove_padding:
-        lse = lse[..., :seqlen_q]
 
     return o, lse
 
@@ -351,7 +346,6 @@ def _bwd_preprocess_do_o_dot(
     delta = tl.sum(o * do, axis=1)
     # write-back
     tl.store(Delta + off_hb * seqlen_q_rounded + offs_m, delta)
-
 
 @triton.jit
 def _bwd_store_dk_dv(
@@ -632,10 +626,6 @@ def _bwd_kernel_one_col_block(
         EVEN_HEADDIM=EVEN_HEADDIM,
     )
 
-
-def init_to_zero(name):
-    return lambda nargs: nargs[name].zero_()
-
 @triton.jit
 def _bwd_kernel(
     Q,
@@ -771,29 +761,28 @@ def flash_attn_backward(
     dq,
     dk,
     dv,
-    softmax_scale = None,
     block_size = 128
 ):
     # Make sure that the last dimension is contiguous
     if do.stride(-1) != 1:
         do = do.contiguous()
 
-    batch, seqlen_q, nheads, d = q.shape
+    batch, seqlen_q, nheads, dim = q.shape
     _, seqlen_k, _, _ = k.shape
     # assert d in {16, 32, 64, 128}
-    assert d <= 128
+    assert dim <= 128
     seqlen_q_rounded = ceil(seqlen_q / 128) * 128
 
     assert lse.shape == (batch, nheads, seqlen_q_rounded)
     assert q.stride(-1) == k.stride(-1) == v.stride(-1) == o.stride(-1) == 1
     assert dq.stride(-1) == dk.stride(-1) == dv.stride(-1) == 1
-    softmax_scale = softmax_scale or 1.0 / math.sqrt(d)
+    softmax_scale = dim ** -0.5
     # dq_accum = torch.zeros_like(q, dtype=torch.float32)
     dq_accum = torch.empty_like(q, dtype=torch.float32)
 
     # delta = torch.zeros_like(lse)
 
-    BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
+    BLOCK_HEADDIM = max(triton.next_power_of_2(dim), 16)
 
     delta = torch.empty_like(lse)
     grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK"]), batch * nheads)
@@ -810,7 +799,7 @@ def flash_attn_backward(
         nheads,
         seqlen_q,
         seqlen_q_rounded,
-        d,
+        dim,
         BLOCK = block_size,
         BLOCK_HEADDIM=BLOCK_HEADDIM,
     )
@@ -858,7 +847,7 @@ def flash_attn_backward(
         seqlen_q,
         seqlen_k,
         seqlen_q_rounded,
-        d,
+        dim,
         seqlen_q // 32,
         seqlen_k // 32,  # key for triton cache (limit number of compilations)
         # Can't use kwargs here because triton autotune expects key to be args, not kwargs
@@ -868,7 +857,7 @@ def flash_attn_backward(
         SEQUENCE_PARALLEL = False,
         EVEN_M = (seqlen_q % block_size) == 0,
         EVEN_N = (seqlen_k % block_size) == 0,
-        EVEN_HEADDIM = BLOCK_HEADDIM == d
+        EVEN_HEADDIM = BLOCK_HEADDIM == dim
         # BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
         # num_warps=num_warps,
         # num_stages=1,
