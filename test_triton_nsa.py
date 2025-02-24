@@ -38,7 +38,7 @@ nq, nk, nv = tuple(t.clone().requires_grad_() for t in (q, k, v))
 out = regular_attend(rq, rk, rv, block_size = 64)
 out.sum().backward()
 
-nsa_out = native_sparse_attend(nq, nk, nv, 64, None, 1)
+nsa_out = native_sparse_attend(nq, nk, nv, 64, None, None, 1)
 nsa_out.sum().backward()
 
 assert torch.allclose(out, nsa_out, atol = 1e-2)

@@ -1,7 +1,5 @@
 # taken from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/flash_attn_triton.py
 # with fixes for triton 2.3
-# forward is modified to return unnormalized accumulation, row maxes, row lse - reduced over passed rings
-# both forwards and backwards is modified to allow for masking out the diagonal for striped ring attention
 
 from functools import partial
 import math
@@ -24,6 +22,8 @@ def round_up_multiple(n, mult):
 def is_contiguous(x: Tensor):
     return x.stride(-1) == 1
 
+TRITON_BLOCK_SIZE = 128 # some block size that allows triton not to break, at least half a year ago
+
 INSTALL_COMMAND = 'pip install -U --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/Triton-Nightly/pypi/simple/ triton-nightly'
 
 # make sure triton 2.1+ is installed
@@ -44,10 +44,6 @@ assert pkg_version.parse(triton_version) >= pkg_version.parse('3.0.0'), f'triton
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice
-
-# constants
-
-TRITON_BLOCK_SIZE = 128
 
 # kernels
 
@@ -784,8 +780,8 @@ def flash_attn_backward(
     assert all([is_contiguous(t) for t in (q, k, v, o, dq, dk, dv)])
 
     softmax_scale = dim ** -0.5
-    # dq_accum = torch.zeros_like(q, dtype=torch.float32)
-    dq_accum = torch.empty_like(q, dtype=torch.float32)
+
+    dq_accum = torch.empty_like(q, dtype = torch.float32)
 
     # delta = torch.zeros_like(lse)
 
@@ -812,9 +808,6 @@ def flash_attn_backward(
         BLOCK_HEADDIM=BLOCK_HEADDIM,
     )
 
-    # BLOCK_M = 128
-    # BLOCK_N = 64
-    # num_warps = 4
     grid = lambda META: (
         triton.cdiv(seqlen_k, META["BLOCK"]) if META["SEQUENCE_PARALLEL"] else 1,
         batch * nheads,
@@ -887,6 +880,7 @@ class NSA(Function):
         fq, fk, fv,
         block_size,
         selected_block_indices,
+        fmask,
         num_grouped_queries
     ):
         fq, fk, fv = tuple(rearrange(t, 'b h n d -> b n h d') for t in (fq, fk, fv))
@@ -897,7 +891,7 @@ class NSA(Function):
 
         out, lse = flash_attn_forward(fq, fk, fv, block_size = block_size)
 
-        ctx.save_for_backward(fq, fk, fv, out, lse)
+        ctx.save_for_backward(fq, fk, fv, selected_block_indices, fmask, out, lse)
         ctx._saved_variables = (block_size,)
 
         out = rearrange(out, 'b n h d -> b h n d')
@@ -907,7 +901,7 @@ class NSA(Function):
     def backward(self, ctx, do):
         do = rearrange(do, 'b h n d -> b n h d')
 
-        q, k, v, out, lse = ctx.saved_tensors
+        q, k, v, kv_indices, mask, out, lse = ctx.saved_tensors
 
         (
             block_size,
@@ -921,6 +915,6 @@ class NSA(Function):
         flash_attn_backward(do, q, k, v, out, lse, dq, dk, dv, block_size = block_size)
 
         dq, dk, dv = tuple(rearrange(t, 'b n h d -> b h n d') for t in (dq, dk, dv))
-        return dq, dk, dv, None, None, None
+        return dq, dk, dv, None, None, None, None
 
 native_sparse_attend = NSA.apply

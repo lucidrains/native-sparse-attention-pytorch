@@ -444,10 +444,13 @@ class SparseAttention(Module):
             if self.use_triton_kernel:
                 from native_sparse_attention_pytorch.triton_native_sparse_attention import native_sparse_attend
 
+                fmask = selected_importance_values > 1e-10
+
                 fine_attn_out = native_sparse_attend(
                     fq, fk, fv,
                     self.selection_block_size,
                     selected_block_indices,
+                    fmask,
                     fine_num_grouped_queries
                 )
 
