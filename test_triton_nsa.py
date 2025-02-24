@@ -1,6 +1,7 @@
 import torch
 from native_sparse_attention_pytorch.triton_native_sparse_attention import native_sparse_attend
 
+import einx
 from einops import rearrange, einsum
 
 assert torch.cuda.is_available()
@@ -8,7 +9,12 @@ assert torch.cuda.is_available()
 def exists(v):
     return v is not None
 
-def regular_attend(q, k, v, block_size = None):
+def regular_attend(
+    q, k, v,
+    indices,
+    mask,
+    block_size = None,
+):
     if exists(block_size):
         w = q.shape[-2] // block_size
         q, k, v = tuple(rearrange(t, 'b h (w n) d -> b (h w) n d', n = block_size) for t in (q, k, v))
@@ -28,18 +34,33 @@ def regular_attend(q, k, v, block_size = None):
 
     return out
 
-q = torch.randn(1, 4, 1024, 64).cuda()
-k = torch.randn(1, 4, 1024, 64).cuda()
-v = torch.randn(1, 4, 1024, 64).cuda()
+# mock inputs
+
+fine_block_size = 64
+
+q = torch.randn(1, 2, 512, 64).cuda()
+k = torch.randn(1, 2, 512, 64).cuda()
+v = torch.randn(1, 2, 512, 64).cuda()
+
+indices = torch.zeros(1, 2, 512, 1).long().cuda()
+mask = torch.zeros(1, 2, 512, 1).bool().cuda()
+
+# both regular and nsa pathways `r` and `n`
 
 rq, rk, rv = tuple(t.clone().requires_grad_() for t in (q, k, v))
 nq, nk, nv = tuple(t.clone().requires_grad_() for t in (q, k, v))
 
-out = regular_attend(rq, rk, rv, block_size = 64)
+# regular forwards and backwards
+
+out = regular_attend(rq, rk, rv, indices, mask, block_size = fine_block_size)
 out.sum().backward()
 
-nsa_out = native_sparse_attend(nq, nk, nv, 64, None, None, 1)
+# triton nsa forwards and backwards
+
+nsa_out = native_sparse_attend(nq, nk, nv, fine_block_size, indices, mask, 1)
 nsa_out.sum().backward()
+
+# asserts
 
 assert torch.allclose(out, nsa_out, atol = 1e-2)
 

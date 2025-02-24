@@ -111,13 +111,13 @@ def _fwd_kernel(
 
     m_ptrs = M + off_hb * seqlen_q_rounded + offs_m
 
-    m_i = tl.zeros([BLOCK], dtype=tl.float32) - float("inf")
+    m_i = tl.zeros([BLOCK], dtype = tl.float32) - float("inf")
 
     # lse
 
     lse_ptrs = Lse + off_hb * seqlen_q_rounded + offs_m
 
-    lse_i = tl.zeros([BLOCK], dtype=tl.float32) - float("inf")
+    lse_i = tl.zeros([BLOCK], dtype = tl.float32) - float("inf")
 
     # output
 
@@ -130,7 +130,7 @@ def _fwd_kernel(
         + (offs_m[:, None] * stride_om + offs_d[None, :])
     )
 
-    acc_o = tl.zeros([BLOCK, BLOCK_HEADDIM], dtype=tl.float32)
+    acc_o = tl.zeros([BLOCK, BLOCK_HEADDIM], dtype = tl.float32)
 
     # load queries, keys, values
 
@@ -243,6 +243,8 @@ def flash_attn_forward(
     q,
     k,
     v,
+    indices,
+    mask,
     block_size = 128
 ):
     q, k, v = [x if is_contiguous(x) else x.contiguous() for x in (q, k, v)]
@@ -328,15 +330,20 @@ def _bwd_preprocess_do_o_dot(
     off_hb = tl.program_id(1)
     off_b = off_hb // nheads
     off_h = off_hb % nheads
+
     # initialize offsets
+
     offs_m = start_m * BLOCK + tl.arange(0, BLOCK)
     offs_d = tl.arange(0, BLOCK_HEADDIM)
+
     # load
+
     o = tl.load(
         Out + off_b * stride_ob + off_h * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :],
         mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
         other=0.0,
     ).to(tl.float32)
+
     do = tl.load(
         DO
         + off_b * stride_dob
@@ -346,8 +353,11 @@ def _bwd_preprocess_do_o_dot(
         mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
         other=0.0,
     ).to(tl.float32)
+
     delta = tl.sum(o * do, axis=1)
+
     # write-back
+
     tl.store(Delta + off_hb * seqlen_q_rounded + offs_m, delta)
 
 @triton.jit
@@ -538,22 +548,31 @@ def _bwd_kernel_one_col_block(
     # Also wrong for headdim=64, seqlen=(1023, 1024), and ATOMIC_ADD=False
     if not (EVEN_M & EVEN_HEADDIM):
         tl.debug_barrier()
+
     dp = tl.dot(do, tl.trans(v))
+
     # There's a race condition for headdim=48
     if not EVEN_HEADDIM:
         tl.debug_barrier()
+
     # compute ds = p * (dp - delta[:, None])
     # Putting the subtraction after the dp matmul (instead of before) is slightly faster
+
     Di = tl.load(D + offs_m)
+
     # Converting ds to q.dtype here reduces register pressure and makes it much faster
     # for BLOCK_HEADDIM=128
+
     ds = (p * (dp - Di[:, None]) * softmax_scale)
 
     ds = ds.to(q.dtype)
 
     # compute dk = dot(ds.T, q)
+
     dk += tl.dot(tl.trans(ds), q)
+
     # compute dq
+
     if not (
         EVEN_M & EVEN_HEADDIM
     ):  # Otherewise there's a race condition when BIAS_TYPE='matrix'
@@ -613,6 +632,7 @@ def _bwd_kernel_one_col_block(
     # do_ptrs += BLOCK * stride_dom
 
     # write-back
+
     dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_d[None, :])
     dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_d[None, :])
     _bwd_store_dk_dv(
@@ -756,14 +776,12 @@ def _bwd_kernel(
 
 def flash_attn_backward(
     do,
-    q,
-    k,
-    v,
+    q, k, v,
+    indices,
+    mask,
     o,
     lse,
-    dq,
-    dk,
-    dv,
+    dq, dk, dv,
     block_size = 128
 ):
     # Make sure that the last dimension is contiguous
@@ -805,7 +823,7 @@ def flash_attn_backward(
         seqlen_q_rounded,
         dim,
         BLOCK = block_size,
-        BLOCK_HEADDIM=BLOCK_HEADDIM,
+        BLOCK_HEADDIM = BLOCK_HEADDIM,
     )
 
     grid = lambda META: (
@@ -889,7 +907,12 @@ class NSA(Function):
 
         fq, fk, fv = tuple(t.half() for t in (fq, fk, fv))
 
-        out, lse = flash_attn_forward(fq, fk, fv, block_size = block_size)
+        out, lse = flash_attn_forward(
+            fq, fk, fv,
+            selected_block_indices,
+            fmask,
+            block_size = block_size
+        )
 
         ctx.save_for_backward(fq, fk, fv, selected_block_indices, fmask, out, lse)
         ctx._saved_variables = (block_size,)
@@ -901,7 +924,7 @@ class NSA(Function):
     def backward(self, ctx, do):
         do = rearrange(do, 'b h n d -> b n h d')
 
-        q, k, v, kv_indices, mask, out, lse = ctx.saved_tensors
+        q, k, v, sel_block_indices, mask, out, lse = ctx.saved_tensors
 
         (
             block_size,
@@ -912,7 +935,12 @@ class NSA(Function):
         dk = torch.zeros_like(k)
         dv = torch.zeros_like(v)
 
-        flash_attn_backward(do, q, k, v, out, lse, dq, dk, dv, block_size = block_size)
+        flash_attn_backward(
+            do, q, k, v,
+            sel_block_indices, mask,
+            out, lse, dq, dk, dv,
+            block_size = block_size
+        )
 
         dq, dk, dv = tuple(rearrange(t, 'b n h d -> b h n d') for t in (dq, dk, dv))
         return dq, dk, dv, None, None, None, None
