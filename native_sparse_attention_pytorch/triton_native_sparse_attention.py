@@ -59,6 +59,8 @@ def _fwd_kernel(
     Q,
     K,
     V,
+    KV_block_indices,
+    KV_block_mask,
     Out,
     M,
     Lse,
@@ -87,6 +89,7 @@ def _fwd_kernel(
     EVEN_N: tl.constexpr,
     EVEN_HEADDIM: tl.constexpr,
     BLOCK: tl.constexpr,
+    NUM_SEL_KV_BLOCKS: tl.constexpr
 ):
     start_m = tl.program_id(0)
     off_hb = tl.program_id(1)
@@ -243,14 +246,17 @@ def flash_attn_forward(
     q,
     k,
     v,
-    indices,
-    mask,
+    kv_block_indices,
+    kv_block_mask,
     block_size = 128
 ):
     q, k, v = [x if is_contiguous(x) else x.contiguous() for x in (q, k, v)]
 
     batch, seqlen_q, nheads, dim = q.shape
     _, seqlen_k, _, _ = k.shape
+
+    num_selected_fine_blocks = kv_block_indices.shape[-1]
+    assert kv_block_indices.shape == kv_block_mask.shape
 
     assert k.shape == (batch, seqlen_k, nheads, dim)
     assert v.shape == (batch, seqlen_k, nheads, dim)
@@ -277,6 +283,8 @@ def flash_attn_forward(
         q,
         k,
         v,
+        kv_block_indices,
+        kv_block_mask,
         o,
         m,
         lse,
@@ -302,6 +310,7 @@ def flash_attn_forward(
         seqlen_k // 32,
         BLOCK_HEADDIM,
         BLOCK = block_size,
+        NUM_SEL_KV_BLOCKS = num_selected_fine_blocks,
         num_warps = num_warps,
         num_stages = 1,
     )
@@ -398,6 +407,8 @@ def _bwd_kernel_one_col_block(
     Q,
     K,
     V,
+    kv_block_indices,
+    kv_block_mask,
     DO,
     DQ,
     DK,
@@ -421,6 +432,7 @@ def _bwd_kernel_one_col_block(
     EVEN_N: tl.constexpr,
     EVEN_HEADDIM: tl.constexpr,
     BLOCK: tl.constexpr,
+    NUM_SEL_KV_BLOCKS: tl.constexpr
 ):
     # We need to make sure begin_m is a multiple of BLOCK_M (not BLOCK_N)
     begin_m = ((start_n * BLOCK) // BLOCK) * BLOCK
@@ -654,6 +666,8 @@ def _bwd_kernel(
     Q,
     K,
     V,
+    kv_block_indices,
+    kv_block_mask,
     DO,
     DQ,
     DK,
@@ -695,6 +709,7 @@ def _bwd_kernel(
     EVEN_N: tl.constexpr,
     EVEN_HEADDIM: tl.constexpr,
     BLOCK: tl.constexpr,
+    NUM_SEL_KV_BLOCKS: tl.constexpr
 ):
     off_hb = tl.program_id(1)
     off_b = off_hb // nheads
@@ -718,6 +733,8 @@ def _bwd_kernel(
                 Q,
                 K,
                 V,
+                kv_block_indices,
+                kv_block_mask,
                 DO,
                 DQ,
                 DK,
@@ -735,12 +752,13 @@ def _bwd_kernel(
                 seqlen_q,
                 seqlen_k,
                 headdim,
-                ATOMIC_ADD=False,
-                BLOCK_HEADDIM=BLOCK_HEADDIM,
-                EVEN_M=EVEN_M,
-                EVEN_N=EVEN_N,
-                EVEN_HEADDIM=EVEN_HEADDIM,
-                BLOCK=BLOCK,
+                ATOMIC_ADD = False,
+                BLOCK_HEADDIM = BLOCK_HEADDIM,
+                EVEN_M = EVEN_M,
+                EVEN_N = EVEN_N,
+                EVEN_HEADDIM = EVEN_HEADDIM,
+                BLOCK = BLOCK,
+                NUM_SEL_KV_BLOCKS = NUM_SEL_KV_BLOCKS
             )
     else:
         start_n = tl.program_id(0)
@@ -749,6 +767,8 @@ def _bwd_kernel(
             Q,
             K,
             V,
+            kv_block_indices,
+            kv_block_mask,
             DO,
             DQ,
             DK,
@@ -766,19 +786,20 @@ def _bwd_kernel(
             seqlen_q,
             seqlen_k,
             headdim,
-            ATOMIC_ADD=True,
-            BLOCK_HEADDIM=BLOCK_HEADDIM,
-            EVEN_M=EVEN_M,
-            EVEN_N=EVEN_N,
-            EVEN_HEADDIM=EVEN_HEADDIM,
-            BLOCK=BLOCK,
+            ATOMIC_ADD = True,
+            BLOCK_HEADDIM = BLOCK_HEADDIM,
+            EVEN_M = EVEN_M,
+            EVEN_N = EVEN_N,
+            EVEN_HEADDIM = EVEN_HEADDIM,
+            BLOCK = BLOCK,
+            NUM_SEL_KV_BLOCKS = NUM_SEL_KV_BLOCKS
         )
 
 def flash_attn_backward(
     do,
     q, k, v,
-    indices,
-    mask,
+    kv_block_indices,
+    kv_block_mask,
     o,
     lse,
     dq, dk, dv,
@@ -790,6 +811,10 @@ def flash_attn_backward(
 
     batch, seqlen_q, nheads, dim = q.shape
     _, seqlen_k, _, _ = k.shape
+
+    num_sel_fine_blocks = kv_block_indices.shape[-1]
+    assert kv_block_indices.shape == kv_block_mask.shape
+
     # assert d in {16, 32, 64, 128}
     assert dim <= 128
     seqlen_q_rounded = round_up_multiple(seqlen_q, TRITON_BLOCK_SIZE)
@@ -834,6 +859,8 @@ def flash_attn_backward(
         q,
         k,
         v,
+        kv_block_indices,
+        kv_block_mask,
         do,
         dq_accum,
         dk,
@@ -873,6 +900,7 @@ def flash_attn_backward(
         # IS_CAUSAL=causal, BLOCK_HEADDIM=d,
         BLOCK_HEADDIM,
         BLOCK = block_size,
+        NUM_SEL_KV_BLOCKS = num_sel_fine_blocks,
         SEQUENCE_PARALLEL = False,
         EVEN_M = (seqlen_q % block_size) == 0,
         EVEN_N = (seqlen_k % block_size) == 0,
