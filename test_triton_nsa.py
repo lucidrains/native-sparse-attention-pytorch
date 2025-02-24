@@ -15,16 +15,36 @@ def regular_attend(
     mask,
     block_size = None,
 ):
+    q_heads, kv_heads = q.shape[1], k.shape[1]
+
     if exists(block_size):
         w = q.shape[-2] // block_size
         q, k, v = tuple(rearrange(t, 'b h (w n) d -> b (h w) n d', n = block_size) for t in (q, k, v))
 
     seq_len, device = q.shape[-2], q.device
     scale = q.shape[-1] ** -0.5
+    q = q * scale
 
-    sim = einsum(q, k, 'b h i d, b h j d -> b h i j') * scale
+    # block causal diagonal
+
+    sim = einsum(q, k, 'b h i d, b h j d -> b h i j')
     causal_mask = torch.ones((seq_len, seq_len), device = device, dtype = torch.bool).triu(1)
     sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
+
+    # rest of the indices
+
+    has_sel_kv_blocks = indices.shape[-1] > 0
+
+    if has_sel_kv_blocks:
+        bk, bv = tuple(rearrange(t, 'b (h w) n d -> b h w n d', h = kv_heads) for t in (k, v))
+        sel_bk = einx.get_at('b h [w] n d, b h i sel -> b h i (sel n) d', bk, indices)
+        sel_bv = einx.get_at('b h [w] n d, b h i sel -> b h i (sel n) d', bv, indices)
+
+        q = rearrange(q, 'b (h w) n d -> b h (w n) d', h = q_heads)
+        bsim = einsum(q, sel_bk, 'b h i d, b h i j d -> b h i j') * scale
+
+    # attend
+
     attn = sim.softmax(dim = -1)
 
     out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
