@@ -975,9 +975,9 @@ def flash_attn_backward(
 
     softmax_scale = dim ** -0.5
 
-    dq_accum = torch.empty_like(q, dtype = torch.float32)
-    dk_accum = torch.empty_like(k, dtype = torch.float32)
-    dv_accum = torch.empty_like(v, dtype = torch.float32)
+    dq_accum = torch.zeros_like(q, dtype = torch.float32)
+    dk_accum = torch.zeros_like(k, dtype = torch.float32)
+    dv_accum = torch.zeros_like(v, dtype = torch.float32)
 
     # delta = torch.zeros_like(lse)
 
