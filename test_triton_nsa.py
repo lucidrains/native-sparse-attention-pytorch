@@ -82,8 +82,8 @@ q = torch.randn(1, 2, 512, 64).cuda()
 k = torch.randn(1, 2, 512, 64).cuda()
 v = torch.randn(1, 2, 512, 64).cuda()
 
-indices = torch.zeros(1, 2, 512, 2).long().cuda()
-mask = torch.ones(1, 2, 512, 2).bool().cuda()
+indices = torch.zeros(1, 2, 512, 1).long().cuda()
+mask = torch.ones(1, 2, 512, 1).bool().cuda()
 
 # both regular and nsa pathways `r` and `n`
 

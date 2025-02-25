@@ -55,7 +55,7 @@ from triton.language.extra import libdevice
     }
 )
 @triton.jit
-def _fwd_kernel(
+def forward_kernel(
     Q,
     K,
     V,
@@ -356,7 +356,7 @@ def flash_attn_forward(
     num_warps = 4 if dim <= 64 else 8
     grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK"]), batch * nheads)
 
-    _fwd_kernel[grid](
+    forward_kernel[grid](
         q,
         k,
         v,
@@ -398,7 +398,7 @@ def flash_attn_forward(
     return o, lse
 
 @triton.jit
-def _bwd_preprocess_do_o_dot(
+def backward_preprocess_do_o_dot(
     Out,
     DO,
     Delta,
@@ -450,7 +450,7 @@ def _bwd_preprocess_do_o_dot(
     tl.store(Delta + off_hb * seqlen_q_rounded + offs_m, delta)
 
 @triton.jit
-def _bwd_store_dk_dv(
+def backward_store_dk_dv(
     dk_ptrs,
     dv_ptrs,
     dk,
@@ -482,7 +482,7 @@ def _bwd_store_dk_dv(
 
 
 @triton.jit
-def _bwd_kernel_one_col_block(
+def backward_kernel_one_col_block(
     start_n,
     Q,
     K,
@@ -503,6 +503,9 @@ def _bwd_kernel_one_col_block(
     stride_dqm,
     stride_dkn,
     stride_dvn,
+    stride_kvbl_b,
+    stride_kvbl_h,
+    stride_kvbl_m,
     seqlen_q,
     seqlen_k,
     headdim,
@@ -538,7 +541,7 @@ def _bwd_kernel_one_col_block(
     if begin_m >= seqlen_q:
         dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_d[None, :])
         dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_d[None, :])
-        _bwd_store_dk_dv(
+        backward_store_dk_dv(
             dk_ptrs,
             dv_ptrs,
             dk,
@@ -727,7 +730,7 @@ def _bwd_kernel_one_col_block(
 
     dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_d[None, :])
     dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_d[None, :])
-    _bwd_store_dk_dv(
+    backward_store_dk_dv(
         dk_ptrs,
         dv_ptrs,
         dk,
@@ -742,7 +745,7 @@ def _bwd_kernel_one_col_block(
     )
 
 @triton.jit
-def _bwd_kernel(
+def backward_kernel(
     Q,
     K,
     V,
@@ -776,6 +779,9 @@ def _bwd_kernel(
     stride_dvb,
     stride_dvh,
     stride_dvn,
+    stride_kvbl_b,
+    stride_kvbl_h,
+    stride_kvbl_m,
     nheads,
     seqlen_q,
     seqlen_k,
@@ -805,10 +811,11 @@ def _bwd_kernel(
     # pointer to row-wise quantities in value-like data
     D += off_hb * seqlen_q_rounded
     LSE += off_hb * seqlen_q_rounded
+
     if not SEQUENCE_PARALLEL:
         num_block_n = tl.cdiv(seqlen_k, BLOCK)
         for start_n in range(0, num_block_n):
-            _bwd_kernel_one_col_block(
+            backward_kernel_one_col_block(
                 start_n,
                 Q,
                 K,
@@ -829,6 +836,9 @@ def _bwd_kernel(
                 stride_dqm,
                 stride_dkn,
                 stride_dvn,
+                stride_kvbl_b,
+                stride_kvbl_h,
+                stride_kvbl_m,
                 seqlen_q,
                 seqlen_k,
                 headdim,
@@ -842,7 +852,7 @@ def _bwd_kernel(
             )
     else:
         start_n = tl.program_id(0)
-        _bwd_kernel_one_col_block(
+        backward_kernel_one_col_block(
             start_n,
             Q,
             K,
@@ -863,6 +873,9 @@ def _bwd_kernel(
             stride_dqm,
             stride_dkn,
             stride_dvn,
+            stride_kvbl_b,
+            stride_kvbl_h,
+            stride_kvbl_m,
             seqlen_q,
             seqlen_k,
             headdim,
@@ -913,7 +926,7 @@ def flash_attn_backward(
     delta = torch.empty_like(lse)
     grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK"]), batch * nheads)
 
-    _bwd_preprocess_do_o_dot[grid](
+    backward_preprocess_do_o_dot[grid](
         o,
         do,
         delta,
@@ -935,7 +948,7 @@ def flash_attn_backward(
         triton.cdiv(seqlen_k, META["BLOCK"]) if META["SEQUENCE_PARALLEL"] else 1,
         batch * nheads,
     )
-    _bwd_kernel[grid](
+    backward_kernel[grid](
         q,
         k,
         v,
@@ -969,6 +982,9 @@ def flash_attn_backward(
         dv.stride(0),
         dv.stride(2),
         dv.stride(1),
+        kv_block_indices.stride(0),
+        kv_block_indices.stride(2),
+        kv_block_indices.stride(1),
         nheads,
         seqlen_q,
         seqlen_k,
