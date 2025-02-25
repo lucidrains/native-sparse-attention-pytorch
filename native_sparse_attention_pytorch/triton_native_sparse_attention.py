@@ -34,7 +34,7 @@ import importlib
 from importlib.metadata import version
 
 try:
-    triton_version = version('triton-nightly')
+    triton_version = version('triton')
 except:
     print(f'latest triton must be installed. `{INSTALL_COMMAND}` first')
     exit()
@@ -216,17 +216,91 @@ def _fwd_kernel(
     l_i_new = tl.exp(lse_i - m_ij) + l_ij
     lse_i = m_ij + tl.log(l_i_new)
 
+    # take care of the selected kv blocks
+
+    kv_block_indices_ptrs = (
+        KV_block_indices +
+        off_b * stride_kvbl_b +
+        off_h * stride_kvbl_h +
+        offs_m * stride_kvbl_m
+    )
+
+    kv_block_mask_ptrs = (
+        KV_block_mask +
+        off_b * stride_kvbl_b +
+        off_h * stride_kvbl_h +
+        offs_m * stride_kvbl_m
+    )
+
+    for off_sel_kv_block in range(NUM_SEL_KV_BLOCKS):
+        block_indices = tl.load(kv_block_indices_ptrs + off_sel_kv_block)
+        block_masks = tl.load(kv_block_mask_ptrs + off_sel_kv_block)
+
+        blocks_offs_n = block_indices[:, None] * BLOCK + tl.arange(0, BLOCK)[None, :]
+
+        block_k_ptrs = (
+            K + off_b * stride_kb + off_h * stride_kh + (blocks_offs_n[:, :, None] * stride_kn + offs_d[None, None, :])
+        )
+
+        block_v_ptrs = (
+            V + off_b * stride_vb + off_h * stride_vh + (blocks_offs_n[:, :, None] * stride_vn + offs_d[None, None, :])
+        )
+
+        # load k of shape (m, n, d), sparsely selected by each query
+
+        k_block = tl.load(block_k_ptrs)
+
+        # similarities
+
+        block_qk = tl.zeros([BLOCK, 16, BLOCK], dtype = tl.float32)
+        qk = tl.zeros([BLOCK, BLOCK], dtype = tl.float32)
+
+        k_block = tl.reshape(k_block, (BLOCK, BLOCK, BLOCK_HEADDIM))
+        k_block = tl.permute(k_block, (0, 2, 1))
+
+        q_expanded = tl.expand_dims(q, 1)
+        q_expanded = tl.broadcast_to(q_expanded, (BLOCK, 16, BLOCK_HEADDIM))
+
+        block_qk = tl.dot(q_expanded, k_block)
+        qk += tl.sum(block_qk, 1) / 16.
+        qk += tl.where(block_masks[:, None], 0, float("-inf"))
+
+        m_ij = tl.maximum(tl.max(qk, 1) * softmax_scale, lse_i)
+        p = tl.exp(qk * softmax_scale - m_ij[:, None])
+
+        l_ij = tl.sum(p, 1)
+
+        acc_o_scale = tl.exp(m_i - m_ij)
+        acc_o = acc_o * acc_o_scale[:, None]
+
+        v_block = tl.load(block_v_ptrs)
+        v_block = tl.reshape(v_block, (BLOCK, BLOCK, BLOCK_HEADDIM))
+
+        p = p.to(v_block.dtype)
+        p_expanded = tl.expand_dims(p, 1)
+        p_expanded = tl.broadcast_to(p_expanded, (BLOCK, 16, BLOCK))
+
+        block_acc_o = tl.dot(p_expanded, v_block)
+        block_acc_o = tl.sum(block_acc_o, 1) / 16.
+        acc_o += block_acc_o
+
+        # -- update statistics
+
+        m_i = m_ij
+        l_i_new = tl.exp(lse_i - m_ij) + l_ij
+        lse_i = m_ij + tl.log(l_i_new)
+
     # normalize accumulated out
 
     acc_o_scale = tl.exp(m_i - lse_i)
     acc_o = acc_o * acc_o_scale[:, None]
 
-    # offsets for m and lse
+    # offsets
 
     start_m = tl.program_id(0)
     offs_m = start_m * BLOCK + tl.arange(0, BLOCK)
 
-    # write back lse and m
+    # write back lse
 
     tl.store(lse_ptrs, lse_i)
 
@@ -253,7 +327,7 @@ def flash_attn_forward(
     kv_block_mask,
     block_size = 128
 ):
-    q, k, v = [x if is_contiguous(x) else x.contiguous() for x in (q, k, v)]
+    q, k, v, kv_block_indices = [x if is_contiguous(x) else x.contiguous() for x in (q, k, v, kv_block_indices)]
 
     batch, seqlen_q, nheads, dim = q.shape
     _, seqlen_k, _, _ = k.shape
@@ -266,7 +340,7 @@ def flash_attn_forward(
     assert dim <= 128, "only support head dimensions up to 128"
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same type"
     assert q.dtype in [torch.float16, torch.bfloat16], "Only support fp16 and bf16"
-    assert q.is_cuda and k.is_cuda and v.is_cuda
+    assert all([t.is_cuda for t in (q, k, v)])
 
     softmax_scale = dim ** -0.5
 

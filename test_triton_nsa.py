@@ -42,7 +42,7 @@ def regular_attend(
         sel_bv = einx.get_at('b h [w] n d, b h i sel -> b h i (sel n) d', bv, indices)
 
         q = rearrange(q, 'b (h w) n d -> b h (w n) d', h = q_heads)
-        bsim = einsum(q, sel_bk, 'b h i d, b h i j d -> b h i j') * scale
+        bsim = einsum(q, sel_bk, 'b h i d, b h i j d -> b h i j')
 
         bsim = rearrange(bsim, 'b h (w i) (sel j) -> b h w i sel j', sel = num_sel_kv_blocks, i = fine_block_size)
 
@@ -76,14 +76,14 @@ def regular_attend(
 
 # mock inputs
 
-fine_block_size = 64
+fine_block_size = 16
 
 q = torch.randn(1, 2, 512, 64).cuda()
 k = torch.randn(1, 2, 512, 64).cuda()
 v = torch.randn(1, 2, 512, 64).cuda()
 
-indices = torch.zeros(1, 2, 512, 0).long().cuda()
-mask = torch.zeros(1, 2, 512, 0).bool().cuda()
+indices = torch.zeros(1, 2, 512, 2).long().cuda()
+mask = torch.ones(1, 2, 512, 2).bool().cuda()
 
 # both regular and nsa pathways `r` and `n`
 
