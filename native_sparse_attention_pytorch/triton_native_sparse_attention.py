@@ -59,8 +59,8 @@ def forward_kernel(
     Q,
     K,
     V,
-    KV_block_indices,
-    KV_block_mask,
+    kv_block_indices,
+    kv_block_mask,
     Out,
     M,
     Lse,
@@ -219,14 +219,14 @@ def forward_kernel(
     # take care of the selected kv blocks
 
     kv_block_indices_ptrs = (
-        KV_block_indices +
+        kv_block_indices +
         off_b * stride_kvbl_b +
         off_h * stride_kvbl_h +
         offs_m * stride_kvbl_m
     )
 
     kv_block_mask_ptrs = (
-        KV_block_mask +
+        kv_block_mask +
         off_b * stride_kvbl_b +
         off_h * stride_kvbl_h +
         offs_m * stride_kvbl_m
@@ -503,8 +503,6 @@ def backward_kernel_one_col_block(
     stride_dqm,
     stride_dkn,
     stride_dvn,
-    stride_kvbl_b,
-    stride_kvbl_h,
     stride_kvbl_m,
     seqlen_q,
     seqlen_k,
@@ -721,6 +719,35 @@ def backward_kernel_one_col_block(
                     sem = 'relaxed',
                 )
 
+    # handle kv block indices using atomic adds for starters, todo: swap dq and dk/dv loops at some point, semi big refactor
+
+    kv_block_indices_ptrs = (
+        kv_block_indices +
+        offs_m * stride_kvbl_m
+    )
+
+    kv_block_mask_ptrs = (
+        kv_block_mask +
+        offs_m * stride_kvbl_m
+    )
+
+    for off_sel_kv_block in range(NUM_SEL_KV_BLOCKS):
+        block_indices = tl.load(kv_block_indices_ptrs + off_sel_kv_block)
+        block_masks = tl.load(kv_block_mask_ptrs + off_sel_kv_block)
+
+        blocks_offs_n = block_indices[:, None] * BLOCK + tl.arange(0, BLOCK)[None, :]
+
+        block_k_ptrs = (
+            K + blocks_offs_n[:, :, None] * stride_kn + offs_d[None, None, :]
+        )
+
+        block_v_ptrs = (
+            V + blocks_offs_n[:, :, None] * stride_vn + offs_d[None, None, :]
+        )
+
+        block_k = tl.load(block_k_ptrs)
+        block_v = tl.load(block_v_ptrs)
+
     # # increment pointers
     # dq_ptrs += BLOCK * stride_dqm
     # q_ptrs += BLOCK * stride_qm
@@ -730,6 +757,7 @@ def backward_kernel_one_col_block(
 
     dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_d[None, :])
     dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_d[None, :])
+
     backward_store_dk_dv(
         dk_ptrs,
         dv_ptrs,
@@ -808,6 +836,12 @@ def backward_kernel(
     DQ += off_b * stride_dqb + off_h * stride_dqh
     DK += off_b * stride_dkb + off_h * stride_dkh
     DV += off_b * stride_dvb + off_h * stride_dvh
+
+    # offset pointers for batch/head for selected kv block related
+
+    kv_block_indices += off_b * stride_kvbl_b + off_h * stride_kvbl_h
+    kv_block_mask += off_b * stride_kvbl_b + off_h * stride_kvbl_h
+
     # pointer to row-wise quantities in value-like data
     D += off_hb * seqlen_q_rounded
     LSE += off_hb * seqlen_q_rounded
@@ -836,8 +870,6 @@ def backward_kernel(
                 stride_dqm,
                 stride_dkn,
                 stride_dvn,
-                stride_kvbl_b,
-                stride_kvbl_h,
                 stride_kvbl_m,
                 seqlen_q,
                 seqlen_k,
@@ -873,8 +905,6 @@ def backward_kernel(
             stride_dqm,
             stride_dkn,
             stride_dvn,
-            stride_kvbl_b,
-            stride_kvbl_h,
             stride_kvbl_m,
             seqlen_q,
             seqlen_k,
