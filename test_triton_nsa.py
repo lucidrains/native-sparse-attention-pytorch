@@ -105,6 +105,5 @@ nsa_out.sum().backward()
 assert torch.allclose(out, nsa_out, atol = 1e-2)
 
 assert torch.allclose(nv.grad, rv.grad, atol = 1e-2)
-print((nk.grad - rk.grad).abs().amax())
 assert torch.allclose(nk.grad, rk.grad, atol = 1e-2)
 assert torch.allclose(nq.grad, rq.grad, atol = 1e-2)
