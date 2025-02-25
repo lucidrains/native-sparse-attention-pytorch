@@ -473,18 +473,18 @@ def backward_store_dk_dv(
     # if we just call tl.store(dv_ptrs), there's a race condition
     if EVEN_N & EVEN_M:
         if EVEN_HEADDIM:
-            tl.store(dv_ptrs, dv)
-            tl.store(dk_ptrs, dk)
+            tl.atomic_add(dv_ptrs, dv, sem = 'relaxed')
+            tl.atomic_add(dk_ptrs, dk, sem = 'relaxed')
         else:
-            tl.store(dv_ptrs, dv, mask=offs_d[None, :] < headdim)
-            tl.store(dk_ptrs, dk, mask=offs_d[None, :] < headdim)
+            tl.atomic_add(dv_ptrs, dv, mask=offs_d[None, :] < headdim, sem = 'relaxed')
+            tl.atomic_add(dk_ptrs, dk, mask=offs_d[None, :] < headdim, sem = 'relaxed')
     else:
         if EVEN_HEADDIM:
-            tl.store(dv_ptrs, dv, mask=offs_n[:, None] < seqlen_k)
-            tl.store(dk_ptrs, dk, mask=offs_n[:, None] < seqlen_k)
+            tl.atomic_add(dv_ptrs, dv, mask=offs_n[:, None] < seqlen_k, sem = 'relaxed')
+            tl.atomic_add(dk_ptrs, dk, mask=offs_n[:, None] < seqlen_k, sem = 'relaxed')
         else:
-            tl.store(dv_ptrs, dv, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim))
-            tl.store(dk_ptrs, dk, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim))
+            tl.atomic_add(dv_ptrs, dv, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim), sem = 'relaxed')
+            tl.atomic_add(dk_ptrs, dk, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim), sem = 'relaxed')
 
 
 @triton.jit
@@ -751,6 +751,14 @@ def backward_kernel_one_col_block(
             V + blocks_offs_n[:, :, None] * stride_vn + offs_d[None, None, :]
         )
 
+        block_dv_ptrs = (
+            DV + blocks_offs_n[:, :, None] * stride_dvn + offs_d[None, None, :]
+        )
+
+        block_dk_ptrs = (
+            DK + blocks_offs_n[:, :, None] * stride_dkn + offs_d[None, None, :]
+        )
+
         block_k = tl.load(block_k_ptrs)
         block_v = tl.load(block_v_ptrs)
 
@@ -764,6 +772,11 @@ def backward_kernel_one_col_block(
         qk += tl.where(block_masks[:, None], 0, float("-inf"))
 
         p = tl.exp(qk * softmax_scale - lse_i[:, None])
+
+        block_dv = p.to(do.dtype)[:, :, None] * do[:, None, :]
+        block_dv = tl.where(block_masks[:, None, None], block_dv, 0.)
+
+        tl.atomic_add(block_dv_ptrs, block_dv, sem = 'relaxed')
 
     # # increment pointers
     # dq_ptrs += BLOCK * stride_dqm
@@ -965,6 +978,8 @@ def flash_attn_backward(
     softmax_scale = dim ** -0.5
 
     dq_accum = torch.empty_like(q, dtype = torch.float32)
+    dk_accum = torch.empty_like(k, dtype = torch.float32)
+    dv_accum = torch.empty_like(v, dtype = torch.float32)
 
     # delta = torch.zeros_like(lse)
 
@@ -995,6 +1010,7 @@ def flash_attn_backward(
         triton.cdiv(seqlen_k, META["BLOCK"]) if META["SEQUENCE_PARALLEL"] else 1,
         batch * nheads,
     )
+
     backward_kernel[grid](
         q,
         k,
@@ -1003,8 +1019,8 @@ def flash_attn_backward(
         kv_block_mask,
         do,
         dq_accum,
-        dk,
-        dv,
+        dk_accum,
+        dv_accum,
         lse,
         delta,
         softmax_scale,
@@ -1052,7 +1068,10 @@ def flash_attn_backward(
         # num_warps=num_warps,
         # num_stages=1,
     )
+
     dq.copy_(dq_accum)
+    dk.copy_(dk_accum)
+    dv.copy_(dv_accum)
 
     return delta
 
