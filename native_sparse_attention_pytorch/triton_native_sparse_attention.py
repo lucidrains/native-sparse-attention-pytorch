@@ -773,10 +773,32 @@ def backward_kernel_one_col_block(
 
         p = tl.exp(qk * softmax_scale - lse_i[:, None])
 
+        # take care of block dv
+
         block_dv = p.to(do.dtype)[:, :, None] * do[:, None, :]
         block_dv = tl.where(block_masks[:, None, None], block_dv, 0.)
 
         tl.atomic_add(block_dv_ptrs, block_dv, sem = 'relaxed')
+
+        # get dp
+
+        do_expanded = tl.expand_dims(do, 1)
+        do_expanded = tl.broadcast_to(do_expanded, (BLOCK, 16, BLOCK_HEADDIM))
+        block_v = tl.permute(block_v, (0, 2, 1))
+
+        dp = tl.dot(do_expanded, block_v)
+        dp = tl.sum(dp, 1) / 16.
+
+        # ds
+
+        ds = (p * (dp - Di[:, None]) * softmax_scale)
+        ds = ds.to(q.dtype)
+
+        # block dk
+
+        block_dk = ds[:, :, None] * q[:, None, :]
+
+        tl.atomic_add(block_dk_ptrs, block_dk, sem = 'relaxed')
 
     # # increment pointers
     # dq_ptrs += BLOCK * stride_dqm
