@@ -265,13 +265,19 @@ def forward_kernel(
         qk += tl.sum(block_qk, 1) / 16.
         qk += tl.where(block_masks[:, None], 0, float("-inf"))
 
+        # attention
+
         m_ij = tl.maximum(tl.max(qk, 1) * softmax_scale, lse_i)
         p = tl.exp(qk * softmax_scale - m_ij[:, None])
 
         l_ij = tl.sum(p, 1)
 
+        # renormalize the running output
+
         acc_o_scale = tl.exp(m_i - m_ij)
         acc_o = acc_o * acc_o_scale[:, None]
+
+        # aggregate values
 
         v_block = tl.load(block_v_ptrs)
         v_block = tl.reshape(v_block, (BLOCK, BLOCK, BLOCK_HEADDIM))
@@ -747,6 +753,17 @@ def backward_kernel_one_col_block(
 
         block_k = tl.load(block_k_ptrs)
         block_v = tl.load(block_v_ptrs)
+
+        q_expanded = tl.expand_dims(q, 1)
+        q_expanded = tl.broadcast_to(q_expanded, (BLOCK, 16, BLOCK_HEADDIM))
+
+        block_k = tl.permute(block_k, (0, 2, 1))
+        block_qk = tl.dot(q_expanded, block_k)
+
+        qk = tl.sum(block_qk, 1) / 16.
+        qk += tl.where(block_masks[:, None], 0, float("-inf"))
+
+        p = tl.exp(qk * softmax_scale - lse_i[:, None])
 
     # # increment pointers
     # dq_ptrs += BLOCK * stride_dqm
