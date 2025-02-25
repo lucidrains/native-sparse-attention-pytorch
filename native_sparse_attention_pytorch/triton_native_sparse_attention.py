@@ -677,20 +677,9 @@ def backward_kernel_one_col_block(
     ):  # Otherewise there's a race condition when BIAS_TYPE='matrix'
         tl.debug_barrier()
 
-    dq = tl.dot(ds, k)
+    dq = tl.zeros([BLOCK, BLOCK_HEADDIM], dtype = tl.float32)
 
-    if EVEN_M & EVEN_HEADDIM:  # Race condition if we just do EVEN_M
-        tl.atomic_add(dq_ptrs, dq, sem = 'relaxed')
-    else:
-        if EVEN_HEADDIM:
-            tl.atomic_add(dq_ptrs, dq, mask=offs_m[:, None] < seqlen_q, sem = 'relaxed')
-        else:
-            tl.atomic_add(
-                dq_ptrs,
-                dq,
-                mask = (offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
-                sem = 'relaxed',
-            )
+    dq += tl.dot(ds, k)
 
     # handle kv block indices using atomic adds for starters, todo: swap dq and dk/dv loops at some point, semi big refactor
 
@@ -774,7 +763,22 @@ def backward_kernel_one_col_block(
         block_dq = tl.dot(ds_expanded, block_k)
         block_dq = tl.sum(block_dq, 1) / 16
 
-        tl.atomic_add(dq_ptrs, block_dq, sem = 'relaxed')
+        dq += block_dq
+
+    # update dq
+
+    if EVEN_M & EVEN_HEADDIM:  # Race condition if we just do EVEN_M
+        tl.atomic_add(dq_ptrs, dq, sem = 'relaxed')
+    else:
+        if EVEN_HEADDIM:
+            tl.atomic_add(dq_ptrs, dq, mask=offs_m[:, None] < seqlen_q, sem = 'relaxed')
+        else:
+            tl.atomic_add(
+                dq_ptrs,
+                dq,
+                mask = (offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+                sem = 'relaxed',
+            )
 
     # # increment pointers
     # dq_ptrs += BLOCK * stride_dqm
