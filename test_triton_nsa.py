@@ -93,7 +93,7 @@ def regular_attend(
 
 fine_block_size = 16
 
-q = torch.randn(1, 4, 512, 64).cuda()
+q = torch.randn(1, 2, 512, 64).cuda()
 k = torch.randn(1, 2, 512, 64).cuda()
 v = torch.randn(1, 2, 512, 64).cuda()
 

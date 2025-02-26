@@ -458,7 +458,7 @@ def backward_preprocess_do_o_dot(
     stride_dob,
     stride_doh,
     stride_dom,
-    nheads,
+    qheads,
     seqlen_q,
     seqlen_q_rounded,
     headdim,
@@ -467,8 +467,8 @@ def backward_preprocess_do_o_dot(
 ):
     start_m = tl.program_id(0)
     off_hb = tl.program_id(1)
-    off_b = off_hb // nheads
-    off_h = off_hb % nheads
+    off_b = off_hb // qheads
+    off_h = off_hb % qheads
 
     # initialize offsets
 
@@ -554,8 +554,12 @@ def backward_kernel_one_col_block(
     stride_dkn,
     stride_dvn,
     stride_kvbl_m,
+    stride_qh,
+    stride_doh,
+    stride_dqh,
     seqlen_q,
     seqlen_k,
+    seqlen_q_rounded,
     headdim,
     ATOMIC_ADD: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
@@ -563,29 +567,62 @@ def backward_kernel_one_col_block(
     EVEN_N: tl.constexpr,
     EVEN_HEADDIM: tl.constexpr,
     BLOCK: tl.constexpr,
+    QUERY_HEAD_GROUPS: tl.constexpr,
+    QUERY_EXPAND_DIM: tl.constexpr,
     NUM_SEL_KV_BLOCKS: tl.constexpr
 ):
     # We need to make sure begin_m is a multiple of BLOCK_M (not BLOCK_N)
+
     begin_m = ((start_n * BLOCK) // BLOCK) * BLOCK
+
     # initialize row/col offsets
+
     offs_qm = begin_m + tl.arange(0, BLOCK)
     offs_n = start_n * BLOCK + tl.arange(0, BLOCK)
     offs_m = start_n * BLOCK + tl.arange(0, BLOCK)
     offs_d = tl.arange(0, BLOCK_HEADDIM)
+
+    offs_g = tl.arange(0, QUERY_HEAD_GROUPS)
+
+    offs_d_or_lse = seqlen_q_rounded * offs_g[:, None] + offs_m
+
     # initialize pointers to value-like data
-    q_ptrs = Q + (offs_qm[:, None] * stride_qm + offs_d[None, :])
+
     k_ptrs = K + (offs_n[:, None] * stride_kn + offs_d[None, :])
     v_ptrs = V + (offs_n[:, None] * stride_vn + offs_d[None, :])
-    do_ptrs = DO + (offs_qm[:, None] * stride_dom + offs_d[None, :])
-    dq_ptrs = DQ + (offs_qm[:, None] * stride_dqm + offs_d[None, :])
+
+
+    q_ptrs = (
+        Q +
+        offs_g[:, None, None] * stride_qh +
+        offs_qm[None, :, None] * stride_qm +
+        offs_d[None, None, :]
+    )
+
+    do_ptrs = (
+        DO +
+        offs_g[:, None, None] * stride_doh +
+        offs_qm[None, :, None] * stride_dom +
+        offs_d[None, None, :]
+    )
+
+    dq_ptrs = (
+        DQ +
+        offs_g[:, None, None] * stride_dqh +
+        offs_qm[None, :, None] * stride_dqm +
+        offs_d[None, None, :]
+    )
 
     # initialize dv and dk
+
     dv = tl.zeros([BLOCK, BLOCK_HEADDIM], dtype=tl.float32)
     dk = tl.zeros([BLOCK, BLOCK_HEADDIM], dtype=tl.float32)
+
     # There seems to be some problem with Triton pipelining that makes results wrong for
     # headdim=64, seqlen=(113, 255), bias_type='matrix'. In this case the for loop
     # may have zero step, and pipelining with the bias matrix could screw it up.
     # So we just exit early.
+
     if begin_m >= seqlen_q:
         dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_d[None, :])
         dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_d[None, :])
@@ -641,7 +678,12 @@ def backward_kernel_one_col_block(
                 other=0.0,
             )
     # recompute p = softmax(qk, dim=-1).T
+
+    q = q.reshape([QUERY_HEAD_GROUPS * BLOCK, BLOCK_HEADDIM])
+
     qk = tl.dot(q, tl.trans(k))
+
+    qk = qk.reshape(QUERY_HEAD_GROUPS, BLOCK, BLOCK)
 
     # Trying to combine the two masks seem to make the result wrong
     if not EVEN_N:  # Need to mask out otherwise the softmax is wrong
@@ -649,13 +691,16 @@ def backward_kernel_one_col_block(
 
     qk = tl.where(offs_m[:, None] >= (offs_n[None, :]), qk, float("-inf"))
 
+    qk = qk.reshape(QUERY_HEAD_GROUPS * BLOCK, BLOCK)
+
     # There seems to be a race condition when headdim=48/96, and dq, dk, dv are wrong.
     # Also wrong for headdim=64.
 
     if not (EVEN_M & EVEN_HEADDIM):
         tl.debug_barrier()
 
-    lse_i = tl.load(LSE + offs_m)
+    lse_i = tl.load(LSE + offs_d_or_lse)
+    lse_i = lse_i.reshape(QUERY_HEAD_GROUPS * BLOCK)
 
     p = tl.exp(qk * softmax_scale - lse_i[:, None])
 
@@ -673,22 +718,16 @@ def backward_kernel_one_col_block(
             mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
             other=0.0,
         )
-    # if EVEN_M:
-    #     if EVEN_HEADDIM:
-    #         do = tl.load(do_ptrs)
-    #     else:
-    #         do = tl.load(do_ptrs, mask=offs_d[None, :] < headdim, other=0.0)
-    # else:
-    #     if EVEN_HEADDIM:
-    #         do = tl.load(do_ptrs, mask=offs_m_curr[:, None] < seqlen_q, other=0.0)
-    #     else:
-    #         do = tl.load(do_ptrs, mask=(offs_m_curr[:, None] < seqlen_q)
-    #                                    & (offs_d[None, :] < headdim), other=0.0)
+
+    do = do.reshape(QUERY_HEAD_GROUPS * BLOCK, BLOCK_HEADDIM)
+
     dv += tl.dot(tl.trans(p.to(do.dtype)), do)
+
     # compute dp = dot(v, do)
     # There seems to be a race condition when headdim=48/96, and dq, dk are wrong.
     # Also wrong for headdim=128, seqlen=(108, 256), and ATOMIC_ADD=True
     # Also wrong for headdim=64, seqlen=(1023, 1024), and ATOMIC_ADD=False
+
     if not (EVEN_M & EVEN_HEADDIM):
         tl.debug_barrier()
 
@@ -701,7 +740,8 @@ def backward_kernel_one_col_block(
     # compute ds = p * (dp - delta[:, None])
     # Putting the subtraction after the dp matmul (instead of before) is slightly faster
 
-    Di = tl.load(D + offs_m)
+    Di = tl.load(D + offs_d_or_lse)
+    Di = Di.reshape(QUERY_HEAD_GROUPS * BLOCK)
 
     # Converting ds to q.dtype here reduces register pressure and makes it much faster
     # for BLOCK_HEADDIM=128
@@ -721,7 +761,7 @@ def backward_kernel_one_col_block(
     ):  # Otherewise there's a race condition when BIAS_TYPE='matrix'
         tl.debug_barrier()
 
-    dq = tl.zeros([BLOCK, BLOCK_HEADDIM], dtype = tl.float32)
+    dq = tl.zeros([QUERY_HEAD_GROUPS * BLOCK, BLOCK_HEADDIM], dtype = tl.float32)
 
     dq += tl.dot(ds, k)
 
@@ -811,6 +851,8 @@ def backward_kernel_one_col_block(
 
     # update dq
 
+    dq = dq.reshape(QUERY_HEAD_GROUPS, BLOCK, BLOCK_HEADDIM)
+
     if EVEN_M & EVEN_HEADDIM:  # Race condition if we just do EVEN_M
         tl.atomic_add(dq_ptrs, dq, sem = 'relaxed')
     else:
@@ -843,9 +885,9 @@ def backward_kernel_one_col_block(
         offs_d,
         seqlen_k,
         headdim,
-        EVEN_M=EVEN_M,
-        EVEN_N=EVEN_N,
-        EVEN_HEADDIM=EVEN_HEADDIM,
+        EVEN_M = EVEN_M,
+        EVEN_N = EVEN_N,
+        EVEN_HEADDIM = EVEN_HEADDIM,
     )
 
 @triton.jit
@@ -886,7 +928,7 @@ def backward_kernel(
     stride_kvbl_b,
     stride_kvbl_h,
     stride_kvbl_m,
-    nheads,
+    kv_heads,
     seqlen_q,
     seqlen_k,
     seqlen_q_rounded,
@@ -894,22 +936,26 @@ def backward_kernel(
     CACHE_KEY_SEQLEN_Q,
     CACHE_KEY_SEQLEN_K,
     BLOCK_HEADDIM: tl.constexpr,
-    SEQUENCE_PARALLEL: tl.constexpr,
     EVEN_M: tl.constexpr,
     EVEN_N: tl.constexpr,
     EVEN_HEADDIM: tl.constexpr,
     BLOCK: tl.constexpr,
+    QUERY_HEAD_GROUPS: tl.constexpr,
+    QUERY_EXPAND_DIM: tl.constexpr,
     NUM_SEL_KV_BLOCKS: tl.constexpr
 ):
     off_hb = tl.program_id(1)
-    off_b = off_hb // nheads
-    off_h = off_hb % nheads
+    off_b = off_hb // kv_heads
+    off_h = off_hb % kv_heads
+    off_qh = off_h * QUERY_HEAD_GROUPS
+
     # offset pointers for batch/head
-    Q += off_b * stride_qb + off_h * stride_qh
+
+    Q += off_b * stride_qb + off_qh * stride_qh
     K += off_b * stride_kb + off_h * stride_kh
     V += off_b * stride_vb + off_h * stride_vh
-    DO += off_b * stride_dob + off_h * stride_doh
-    DQ += off_b * stride_dqb + off_h * stride_dqh
+    DO += off_b * stride_dob + off_qh * stride_doh
+    DQ += off_b * stride_dqb + off_qh * stride_dqh
     DK += off_b * stride_dkb + off_h * stride_dkh
     DV += off_b * stride_dvb + off_h * stride_dvh
 
@@ -919,47 +965,11 @@ def backward_kernel(
     kv_block_mask += off_b * stride_kvbl_b + off_h * stride_kvbl_h
 
     # pointer to row-wise quantities in value-like data
-    D += off_hb * seqlen_q_rounded
-    LSE += off_hb * seqlen_q_rounded
+    D += off_hb * QUERY_HEAD_GROUPS * seqlen_q_rounded
+    LSE += off_hb * QUERY_HEAD_GROUPS * seqlen_q_rounded
 
-    if not SEQUENCE_PARALLEL:
-        num_block_n = tl.cdiv(seqlen_k, BLOCK)
-        for start_n in range(0, num_block_n):
-            backward_kernel_one_col_block(
-                start_n,
-                Q,
-                K,
-                V,
-                kv_block_indices,
-                kv_block_mask,
-                DO,
-                DQ,
-                DK,
-                DV,
-                LSE,
-                D,
-                softmax_scale,
-                stride_qm,
-                stride_kn,
-                stride_vn,
-                stride_dom,
-                stride_dqm,
-                stride_dkn,
-                stride_dvn,
-                stride_kvbl_m,
-                seqlen_q,
-                seqlen_k,
-                headdim,
-                ATOMIC_ADD = False,
-                BLOCK_HEADDIM = BLOCK_HEADDIM,
-                EVEN_M = EVEN_M,
-                EVEN_N = EVEN_N,
-                EVEN_HEADDIM = EVEN_HEADDIM,
-                BLOCK = BLOCK,
-                NUM_SEL_KV_BLOCKS = NUM_SEL_KV_BLOCKS
-            )
-    else:
-        start_n = tl.program_id(0)
+    num_block_n = tl.cdiv(seqlen_k, BLOCK)
+    for start_n in range(0, num_block_n):
         backward_kernel_one_col_block(
             start_n,
             Q,
@@ -982,15 +992,21 @@ def backward_kernel(
             stride_dkn,
             stride_dvn,
             stride_kvbl_m,
+            stride_qh,
+            stride_doh,
+            stride_dqh,
             seqlen_q,
             seqlen_k,
+            seqlen_q_rounded,
             headdim,
-            ATOMIC_ADD = True,
+            ATOMIC_ADD = False,
             BLOCK_HEADDIM = BLOCK_HEADDIM,
             EVEN_M = EVEN_M,
             EVEN_N = EVEN_N,
             EVEN_HEADDIM = EVEN_HEADDIM,
             BLOCK = BLOCK,
+            QUERY_HEAD_GROUPS = QUERY_HEAD_GROUPS,
+            QUERY_EXPAND_DIM = QUERY_EXPAND_DIM,
             NUM_SEL_KV_BLOCKS = NUM_SEL_KV_BLOCKS
         )
 
@@ -1004,12 +1020,18 @@ def native_sparse_attn_backward(
     dq, dk, dv,
     block_size = 128
 ):
+    device = do.device
+
     # Make sure that the last dimension is contiguous
     if not is_contiguous(do):
         do = do.contiguous()
 
-    batch, nheads, seqlen_q, dim = q.shape
-    _, _, seqlen_k, _ = k.shape
+    batch, q_heads, seqlen_q, dim = q.shape
+
+    _, kv_heads, seqlen_k, _ = k.shape
+    assert divisible_by(q_heads, kv_heads)
+    head_groups = q_heads // kv_heads
+    assert divisible_by(16, head_groups)
 
     num_sel_fine_blocks = kv_block_indices.shape[-1]
     assert kv_block_indices.shape == kv_block_mask.shape
@@ -1018,21 +1040,17 @@ def native_sparse_attn_backward(
     assert dim <= 128
     seqlen_q_rounded = round_up_multiple(seqlen_q, TRITON_BLOCK_SIZE)
 
-    assert lse.shape == (batch, nheads, seqlen_q_rounded)
+    assert lse.shape == (batch, q_heads, seqlen_q_rounded)
     assert all([is_contiguous(t) for t in (q, k, v, o, dq, dk, dv)])
 
     softmax_scale = dim ** -0.5
-
-    dq_accum = torch.zeros_like(q, dtype = torch.float32)
-    dk_accum = torch.zeros_like(k, dtype = torch.float32)
-    dv_accum = torch.zeros_like(v, dtype = torch.float32)
 
     # delta = torch.zeros_like(lse)
 
     BLOCK_HEADDIM = max(triton.next_power_of_2(dim), 16)
 
     delta = torch.empty_like(lse)
-    grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK"]), batch * nheads)
+    grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK"]), batch * q_heads)
 
     backward_preprocess_do_o_dot[grid](
         o,
@@ -1044,7 +1062,7 @@ def native_sparse_attn_backward(
         do.stride(0),
         do.stride(1),
         do.stride(2),
-        nheads,
+        q_heads,
         seqlen_q,
         seqlen_q_rounded,
         dim,
@@ -1052,10 +1070,7 @@ def native_sparse_attn_backward(
         BLOCK_HEADDIM = BLOCK_HEADDIM,
     )
 
-    grid = lambda META: (
-        triton.cdiv(seqlen_k, META["BLOCK"]) if META["SEQUENCE_PARALLEL"] else 1,
-        batch * nheads,
-    )
+    grid = lambda META: (1, batch * kv_heads)
 
     backward_kernel[grid](
         q,
@@ -1064,9 +1079,9 @@ def native_sparse_attn_backward(
         kv_block_indices,
         kv_block_mask,
         do,
-        dq_accum,
-        dk_accum,
-        dv_accum,
+        dq,
+        dk,
+        dv,
         lse,
         delta,
         softmax_scale,
@@ -1082,19 +1097,19 @@ def native_sparse_attn_backward(
         do.stride(0),
         do.stride(1),
         do.stride(2),
-        dq_accum.stride(0),
-        dq_accum.stride(1),
-        dq_accum.stride(2),
-        dk_accum.stride(0),
-        dk_accum.stride(1),
-        dk_accum.stride(2),
-        dv_accum.stride(0),
-        dv_accum.stride(1),
-        dv_accum.stride(2),
+        dq.stride(0),
+        dq.stride(1),
+        dq.stride(2),
+        dk.stride(0),
+        dk.stride(1),
+        dk.stride(2),
+        dv.stride(0),
+        dv.stride(1),
+        dv.stride(2),
         kv_block_indices.stride(0),
         kv_block_indices.stride(1),
         kv_block_indices.stride(2),
-        nheads,
+        kv_heads,
         seqlen_q,
         seqlen_k,
         seqlen_q_rounded,
@@ -1105,8 +1120,9 @@ def native_sparse_attn_backward(
         # IS_CAUSAL=causal, BLOCK_HEADDIM=d,
         BLOCK_HEADDIM,
         BLOCK = block_size,
+        QUERY_HEAD_GROUPS = head_groups,
+        QUERY_EXPAND_DIM = 16 // head_groups,
         NUM_SEL_KV_BLOCKS = num_sel_fine_blocks,
-        SEQUENCE_PARALLEL = False,
         EVEN_M = divisible_by(seqlen_q, block_size),
         EVEN_N = divisible_by(seqlen_k, block_size),
         EVEN_HEADDIM = BLOCK_HEADDIM == dim
@@ -1114,10 +1130,6 @@ def native_sparse_attn_backward(
         # num_warps=num_warps,
         # num_stages=1,
     )
-
-    dq.copy_(dq_accum)
-    dk.copy_(dk_accum)
-    dv.copy_(dv_accum)
 
     return delta
 
@@ -1150,8 +1162,6 @@ class NSA(Function):
             fmask,
             block_size = block_size
         )
-
-        fk, fv, selected_block_indices, fmask = tuple(repeat(t, 'b h ... -> b (h g) ...', g = head_groups).contiguous() for t in (fk, fv, selected_block_indices, fmask))
 
         ctx.save_for_backward(fq, fk, fv, selected_block_indices, fmask, out, lse)
 
