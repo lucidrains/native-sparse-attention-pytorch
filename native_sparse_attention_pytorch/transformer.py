@@ -183,7 +183,7 @@ class Transformer(Module):
         ids,
         return_loss = False,
         disable_flex = False,
-        disable_triton_kernel = True
+        disable_triton_kernel = False
     ):
         if return_loss:
             ids, labels = ids[:, :-1], ids[:, 1:]

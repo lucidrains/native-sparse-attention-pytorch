@@ -25,16 +25,17 @@ GRAD_ACCUM_EVERY = 4
 LEARNING_RATE = 1e-4
 VALIDATE_EVERY = 100
 PRIME_LENGTH = 64
+SHOULD_GENERATE = False
 GENERATE_EVERY = 500
 GENERATE_LENGTH = 512
 SEQ_LEN = 512
 HEADS = 8
-KV_HEADS = 8
+KV_HEADS = 4
 
 USE_SPARSE_ATTN = True
 USE_TRITON_NSA = True
-USE_FLEX_FOR_FINE_SELECTION = False   # will push flex a bit, won't be efficient as each layer needs sparsity dynmically generated, but may be enough just to compare to full attention before going all-in on triton kernels
-QUERY_HEADS_SHARE_SELECTION = False  # if set to False, each query head can look at a different segment of their corresponding key / value head in GQA
+USE_FLEX_FOR_FINE_SELECTION = False  # will push flex a bit, won't be efficient as each layer needs sparsity dynmically generated, but may be enough just to compare to full attention before going all-in on triton kernels
+QUERY_HEADS_SHARE_SELECTION = True   # if set to False, each query head can look at a different segment of their corresponding key / value head in GQA
 
 # sparse attention related
 
@@ -42,7 +43,7 @@ SLIDING_WINDOW_SIZE = 32
 COMPRESS_BLOCK_SIZE = 16
 
 FINE_BLOCK_SIZE = 16
-NUM_FINE_SELECTED = 1
+NUM_FINE_SELECTED = 0
 
 INTERPOLATED_IMPORTANCE_SCORE = False
 USE_DIFF_TOPK = True
@@ -211,7 +212,7 @@ for i in tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
             wandb.log(dict(valid_loss = loss.item()), step = i)
             print(f"validation loss: {loss.item():.3f}")
 
-    if i % GENERATE_EVERY == 0:
+    if SHOULD_GENERATE and i % GENERATE_EVERY == 0:
         model.eval()
 
         inp = random.choice(val_dataset)[:PRIME_LENGTH]

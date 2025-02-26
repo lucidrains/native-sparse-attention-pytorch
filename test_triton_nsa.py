@@ -93,12 +93,12 @@ def regular_attend(
 
 fine_block_size = 16
 
-q = torch.randn(1, 2, 512, 64).cuda()
-k = torch.randn(1, 2, 512, 64).cuda()
-v = torch.randn(1, 2, 512, 64).cuda()
+q = torch.randn(2, 4, 512, 64).cuda()
+k = torch.randn(2, 2, 512, 64).cuda()
+v = torch.randn(2, 2, 512, 64).cuda()
 
-indices = torch.zeros(1, 2, 512, 1).long().cuda()
-mask = torch.ones(1, 2, 512, 1).bool().cuda()
+indices = torch.zeros(2, 2, 512, 0).long().cuda()
+mask = torch.randint(0, 2, (2, 2, 512, 0)).bool().cuda()
 
 # both regular and nsa pathways `r` and `n`
 

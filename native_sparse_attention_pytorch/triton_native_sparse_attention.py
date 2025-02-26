@@ -802,32 +802,50 @@ def backward_kernel_one_col_block(
         block_k = tl.load(block_k_ptrs)
         block_v = tl.load(block_v_ptrs)
 
-        q_expanded = tl.expand_dims(q, 1)
-        q_expanded = tl.broadcast_to(q_expanded, (BLOCK, 16, BLOCK_HEADDIM))
+        q_expanded = q.reshape(QUERY_HEAD_GROUPS, BLOCK, BLOCK_HEADDIM)
+        q_expanded = q_expanded.permute(1, 0, 2)
+        q_expanded = tl.expand_dims(q_expanded, 2)
+        q_expanded = tl.broadcast_to(q_expanded, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK_HEADDIM))
+        q_expanded = q_expanded.reshape(BLOCK, 16, BLOCK_HEADDIM)
 
         block_k_permuted = tl.permute(block_k, (0, 2, 1))
         block_qk = tl.dot(q_expanded, block_k_permuted)
 
-        qk = tl.sum(block_qk, 1) / 16.
-        qk += tl.where(block_masks[:, None], 0, float("-inf"))
+        block_qk = block_qk.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK)
+        qk = tl.sum(block_qk, 2) / QUERY_EXPAND_DIM
+        qk = qk.permute(1, 0, 2)
+
+        qk += tl.where(block_masks[None, :, None], 0, float("-inf"))
+
+        qk = qk.reshape(QUERY_HEAD_GROUPS * BLOCK, BLOCK)
 
         p = tl.exp(qk * softmax_scale - lse_i[:, None])
 
         # take care of block dv
 
         block_dv = p.to(do.dtype)[:, :, None] * do[:, None, :]
-        block_dv = tl.where(block_masks[:, None, None], block_dv, 0.)
+
+        block_dv = block_dv.reshape(QUERY_HEAD_GROUPS, BLOCK, BLOCK, BLOCK_HEADDIM)
+        block_dv = tl.sum(block_dv, 0)
 
         tl.atomic_add(block_dv_ptrs, block_dv, sem = 'relaxed')
 
         # get dp
 
-        do_expanded = tl.expand_dims(do, 1)
-        do_expanded = tl.broadcast_to(do_expanded, (BLOCK, 16, BLOCK_HEADDIM))
+        do_expanded = do.reshape(QUERY_HEAD_GROUPS, BLOCK, BLOCK_HEADDIM)
+        do_expanded = do_expanded.permute(1, 0, 2)
+        do_expanded = tl.expand_dims(do_expanded, 2)
+        do_expanded = tl.broadcast_to(do_expanded, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK_HEADDIM))
+        do_expanded = do_expanded.reshape(BLOCK, 16, BLOCK_HEADDIM)
+
         block_v = tl.permute(block_v, (0, 2, 1))
 
         dp = tl.dot(do_expanded, block_v)
-        dp = tl.sum(dp, 1) / 16.
+
+        dp = dp.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK)
+        dp = tl.sum(dp, 2) / QUERY_EXPAND_DIM
+        dp = dp.permute(1, 0, 2)
+        dp = dp.reshape(QUERY_HEAD_GROUPS * BLOCK, BLOCK)
 
         # ds
 
@@ -837,15 +855,25 @@ def backward_kernel_one_col_block(
         # block dk
 
         block_dk = ds[:, :, None] * q[:, None, :]
+        block_dk = block_dk.reshape(QUERY_HEAD_GROUPS, BLOCK, BLOCK, BLOCK_HEADDIM)
+        block_dk = tl.sum(block_dk, 0)
 
         tl.atomic_add(block_dk_ptrs, block_dk, sem = 'relaxed')
 
         # block dq
 
-        ds_expanded = tl.expand_dims(ds, 1)
-        ds_expanded = tl.broadcast_to(ds_expanded, (BLOCK, 16, BLOCK))
+        ds_expanded = ds.reshape(QUERY_HEAD_GROUPS, BLOCK, BLOCK)
+        ds_expanded = ds_expanded.permute(1, 0, 2)
+        ds_expanded = tl.expand_dims(ds_expanded, 2)
+        ds_expanded = tl.broadcast_to(ds_expanded, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK))
+        ds_expanded = ds_expanded.reshape(BLOCK, 16, BLOCK)
+
         block_dq = tl.dot(ds_expanded, block_k)
-        block_dq = tl.sum(block_dq, 1) / 16
+
+        block_dq = block_dq.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK_HEADDIM)
+        block_dq = tl.sum(block_dq, 2) / QUERY_EXPAND_DIM
+        block_dq = block_dq.permute(1, 0, 2)
+        block_dq = block_dq.reshape(QUERY_HEAD_GROUPS * BLOCK, BLOCK_HEADDIM)
 
         dq += block_dq
 
@@ -1194,9 +1222,7 @@ class NSA(Function):
             out, lse, dq, dk, dv,
             block_size = block_size
         )
-
-        dk, dv = tuple(reduce(t, 'b (h g) ... -> b h ...', 'sum', g = head_groups) for t in (dk, dv))
-
+    
         return dq, dk, dv, None, None, None, None
 
 _native_sparse_attend = NSA.apply
@@ -1208,6 +1234,8 @@ def native_sparse_attend(
     fmask,
     return_lse = False
 ):
+    assert divisible_by(fq.shape[-2], block_size)
+
     out, lse = _native_sparse_attend(
         fq, fk, fv,
         block_size,
