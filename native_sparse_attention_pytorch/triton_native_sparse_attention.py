@@ -140,8 +140,6 @@ def forward_kernel(
 
     # lse
 
-    offs_lse_qh = tl.arange(0, QUERY_HEAD_GROUPS)
-
     lse_ptrs = (
         Lse +
         offs_qh[:, None] * seqlen_q_rounded +
