@@ -1153,7 +1153,7 @@ class NSA(Function):
             block_size = block_size
         )
 
-        fk, fv, selected_block_indices, fmask = tuple(repeat(t, 'b h ... -> b (h g) ...', g = head_groups) for t in (fk, fv, selected_block_indices, fmask))
+        fk, fv, selected_block_indices, fmask = tuple(repeat(t, 'b h ... -> b (h g) ...', g = head_groups).contiguous() for t in (fk, fv, selected_block_indices, fmask))
 
         ctx.save_for_backward(fq, fk, fv, selected_block_indices, fmask, out, lse)
 
@@ -1162,10 +1162,10 @@ class NSA(Function):
             head_groups
         )
 
-        return out.type(dtype)
+        return out.type(dtype), lse
 
     @classmethod
-    def backward(self, ctx, do):
+    def backward(self, ctx, do, _):
         device = do.device
 
         q, k, v, sel_block_indices, mask, out, lse = ctx.saved_tensors
@@ -1191,4 +1191,23 @@ class NSA(Function):
 
         return dq, dk, dv, None, None, None, None
 
-native_sparse_attend = NSA.apply
+_native_sparse_attend = NSA.apply
+
+def native_sparse_attend(
+    fq, fk, fv,
+    block_size,
+    selected_block_indices,
+    fmask,
+    return_lse = False
+):
+    out, lse = _native_sparse_attend(
+        fq, fk, fv,
+        block_size,
+        selected_block_indices,
+        fmask,
+    )
+
+    if not return_lse:
+        return out
+
+    return out, lse

@@ -9,6 +9,9 @@ assert torch.cuda.is_available()
 def exists(v):
     return v is not None
 
+def abs_diff(x, y):
+    return (x - y).abs().amax()
+
 def divisible_by(num, den):
     return (num % den) == 0
 
@@ -17,6 +20,7 @@ def regular_attend(
     indices,
     mask,
     block_size,
+    return_lse = False
 ):
     q_heads, seq_len, kv_heads, device = q.shape[1], q.shape[-2], k.shape[1], q.device
     assert divisible_by(q_heads, kv_heads)
@@ -77,13 +81,19 @@ def regular_attend(
     else:
         out = einsum(attn, v, 'b h g w i j, b h w j d -> b h g w i d')
 
-    return rearrange(out, 'b h g w n d -> b (h g) (w n) d')
+    out = rearrange(out, 'b h g w n d -> b (h g) (w n) d')
+
+    if not return_lse:
+        return out
+
+    lse = sim.logsumexp(dim = -1)
+    return out, rearrange(lse, 'b g h w n -> b (g h) (w n)')
 
 # mock inputs
 
 fine_block_size = 16
 
-q = torch.randn(1, 4, 512, 64).cuda()
+q = torch.randn(1, 2, 512, 64).cuda()
 k = torch.randn(1, 2, 512, 64).cuda()
 v = torch.randn(1, 2, 512, 64).cuda()
 
@@ -97,17 +107,18 @@ nq, nk, nv = tuple(t.clone().requires_grad_() for t in (q, k, v))
 
 # regular forwards and backwards
 
-out = regular_attend(rq, rk, rv, indices, mask, block_size = fine_block_size)
+out, rlse = regular_attend(rq, rk, rv, indices, mask, block_size = fine_block_size, return_lse = True)
 out.sum().backward()
 
 # triton nsa forwards and backwards
 
-nsa_out = native_sparse_attend(nq, nk, nv, fine_block_size, indices, mask)
+nsa_out, nlse = native_sparse_attend(nq, nk, nv, fine_block_size, indices, mask, return_lse = True)
 nsa_out.sum().backward()
 
 # asserts
 
 assert torch.allclose(out, nsa_out, atol = 1e-2)
+assert torch.allclose(rlse, nlse, atol = 1e-2)
 
 assert torch.allclose(nv.grad, rv.grad, atol = 1e-2)
 assert torch.allclose(nk.grad, rk.grad, atol = 1e-2)
