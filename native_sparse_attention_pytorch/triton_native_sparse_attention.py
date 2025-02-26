@@ -94,49 +94,72 @@ def forward_kernel(
     EVEN_N: tl.constexpr,
     EVEN_HEADDIM: tl.constexpr,
     BLOCK: tl.constexpr,
+    QUERY_HEAD_GROUPS: tl.constexpr,
     NUM_SEL_KV_BLOCKS: tl.constexpr
 ):
     start_m = tl.program_id(0)
     off_hb = tl.program_id(1)
     off_b = off_hb // nheads
+
     off_h = off_hb % nheads
+
+    offs_qh = off_h * QUERY_HEAD_GROUPS + tl.arange(0, QUERY_HEAD_GROUPS)
 
     offs_m = start_m * BLOCK + tl.arange(0, BLOCK)
     offs_n = start_m * BLOCK + tl.arange(0, BLOCK)
     offs_d = tl.arange(0, BLOCK_HEADDIM)
 
     q_ptrs = (
-        Q + off_b * stride_qb + off_h * stride_qh + (offs_m[:, None] * stride_qm + offs_d[None, :])
+        Q +
+        off_b * stride_qb +
+        offs_qh[:, None, None] * stride_qh +
+        offs_m[None, :, None] * stride_qm +
+        offs_d[None, None, :]
     )
+
     k_ptrs = (
-        K + off_b * stride_kb + off_h * stride_kh + (offs_n[:, None] * stride_kn + offs_d[None, :])
+        K +
+        off_b * stride_kb +
+        off_h * stride_kh +
+        offs_n[:, None] * stride_kn +
+        offs_d[None, :]
     )
+
     v_ptrs = (
-        V + off_b * stride_vb + off_h * stride_vh + (offs_n[:, None] * stride_vn + offs_d[None, :])
+        V +
+        off_b * stride_vb +
+        off_h * stride_vh +
+        offs_n[:, None] * stride_vn +
+        offs_d[None, :]
     )
 
     # maximum
 
-    m_i = tl.zeros([BLOCK], dtype = tl.float32) - float("inf")
+    m_i = tl.zeros([BLOCK * QUERY_HEAD_GROUPS], dtype = tl.float32) - float("inf")
 
     # lse
 
-    lse_ptrs = Lse + off_hb * seqlen_q_rounded + offs_m
+    offs_lse_qh = tl.arange(0, QUERY_HEAD_GROUPS)
 
-    lse_i = tl.zeros([BLOCK], dtype = tl.float32) - float("inf")
+    lse_ptrs = (
+        Lse +
+        (off_hb + offs_lse_qh[:, None]) * seqlen_q_rounded +
+        offs_m[None, :]
+    )
+
+    lse_i = tl.zeros([BLOCK * QUERY_HEAD_GROUPS], dtype = tl.float32) - float("inf")
 
     # output
 
-    offs_d = tl.arange(0, BLOCK_HEADDIM)
-
     out_ptrs = (
-        Out
-        + off_b * stride_ob
-        + off_h * stride_oh
-        + (offs_m[:, None] * stride_om + offs_d[None, :])
+        Out +
+        off_b * stride_ob +
+        offs_qh[:, None, None] * stride_oh +
+        offs_m[None, :, None] * stride_om +
+        offs_d[None, None, :]
     )
 
-    acc_o = tl.zeros([BLOCK, BLOCK_HEADDIM], dtype = tl.float32)
+    acc_o = tl.zeros([QUERY_HEAD_GROUPS * BLOCK, BLOCK_HEADDIM], dtype = tl.float32)
 
     # load queries, keys, values
 
@@ -152,6 +175,8 @@ def forward_kernel(
             q = tl.load(
                 q_ptrs, mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim), other=0.0
             )
+
+    q = q.reshape([QUERY_HEAD_GROUPS * BLOCK, BLOCK_HEADDIM])
 
     if EVEN_N & EVEN_M:
         if EVEN_HEADDIM:
@@ -172,13 +197,17 @@ def forward_kernel(
                 other=0.0,
             )
 
-    qk = tl.zeros([BLOCK, BLOCK], dtype=tl.float32)
+    qk = tl.zeros([QUERY_HEAD_GROUPS * BLOCK, BLOCK], dtype=tl.float32)
     qk += tl.dot(q, tl.trans(k))
 
     if not EVEN_N:
         qk += tl.where(offs_n[None, :] < seqlen_k, 0, float("-inf"))
 
+    qk = qk.reshape([QUERY_HEAD_GROUPS, BLOCK, BLOCK])
+
     qk += tl.where(offs_m[:, None] >= offs_n[None, :], 0, float("-inf"))
+
+    qk = qk.reshape([QUERY_HEAD_GROUPS * BLOCK, BLOCK])
 
     m_ij = tl.maximum(tl.max(qk, 1) * softmax_scale, lse_i)
     p = tl.exp(qk * softmax_scale - m_ij[:, None])
@@ -303,9 +332,12 @@ def forward_kernel(
 
     # write back lse
 
+    lse_i = lse_i.reshape([QUERY_HEAD_GROUPS, BLOCK])
     tl.store(lse_ptrs, lse_i)
 
     # write to output
+
+    acc_o = acc_o.reshape([QUERY_HEAD_GROUPS, BLOCK, BLOCK_HEADDIM])
 
     if EVEN_M:
         if EVEN_HEADDIM:
@@ -331,13 +363,15 @@ def flash_attn_forward(
     q, k, v, kv_block_indices = [x if is_contiguous(x) else x.contiguous() for x in (q, k, v, kv_block_indices)]
 
     batch, nheads, seqlen_q, dim, device = *q.shape, q.device
-    _, _, seqlen_k, _ = k.shape
+    _, kv_heads, seqlen_k, _ = k.shape
+    assert divisible_by(nheads, kv_heads)
+    head_groups = nheads // kv_heads
 
     num_selected_fine_blocks = kv_block_indices.shape[-1]
     assert kv_block_indices.shape == kv_block_mask.shape
 
-    assert k.shape == (batch, nheads, seqlen_k, dim)
-    assert v.shape == (batch, nheads, seqlen_k, dim)
+    assert k.shape == (batch, kv_heads, seqlen_k, dim)
+    assert v.shape == (batch, kv_heads, seqlen_k, dim)
     assert dim <= 128, "only support head dimensions up to 128"
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same type"
     assert q.dtype in [torch.float16, torch.bfloat16], "Only support fp16 and bf16"
@@ -353,7 +387,8 @@ def flash_attn_forward(
 
     BLOCK_HEADDIM = max(triton.next_power_of_2(dim), 16)
     num_warps = 4 if dim <= 64 else 8
-    grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK"]), batch * nheads)
+
+    grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK"]), batch * kv_heads) # kv heads here, as grouped query heads all loaded, following the paper
 
     forward_kernel[grid](
         q,
@@ -388,6 +423,7 @@ def flash_attn_forward(
         seqlen_k // 32,
         BLOCK_HEADDIM,
         BLOCK = block_size,
+        QUERY_HEAD_GROUPS = head_groups,
         NUM_SEL_KV_BLOCKS = num_selected_fine_blocks,
         num_warps = num_warps,
         num_stages = 1,
@@ -1090,8 +1126,6 @@ class NSA(Function):
         assert divisible_by(q_heads, kv_heads)
         head_groups = q_heads // kv_heads
 
-        fk, fv, selected_block_indices, fmask = tuple(repeat(t, 'b h ... -> b (h g) ...', g = head_groups) for t in (fk, fv, selected_block_indices, fmask))
-
         fq, fk, fv = tuple(t.half() for t in (fq, fk, fv))
 
         out, lse = flash_attn_forward(
@@ -1100,6 +1134,8 @@ class NSA(Function):
             fmask,
             block_size = block_size
         )
+
+        fk, fv, selected_block_indices, fmask = tuple(repeat(t, 'b h ... -> b (h g) ...', g = head_groups) for t in (fk, fv, selected_block_indices, fmask))
 
         ctx.save_for_backward(fq, fk, fv, selected_block_indices, fmask, out, lse)
 

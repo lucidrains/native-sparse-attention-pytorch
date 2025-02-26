@@ -75,7 +75,7 @@ def regular_attend(
     if has_sel_kv_blocks:
         out = einsum(attn, v, 'b h g w i j, b h w i j d -> b h g w i d')
     else:
-        out = einsum(attn, v, 'b h g w i j, b h j d -> b h g w i d')
+        out = einsum(attn, v, 'b h g w i j, b h w j d -> b h g w i d')
 
     return rearrange(out, 'b h g w n d -> b (h g) (w n) d')
 
@@ -87,8 +87,8 @@ q = torch.randn(1, 4, 512, 64).cuda()
 k = torch.randn(1, 2, 512, 64).cuda()
 v = torch.randn(1, 2, 512, 64).cuda()
 
-indices = torch.zeros(1, 2, 512, 1).long().cuda()
-mask = torch.ones(1, 2, 512, 1).bool().cuda()
+indices = torch.zeros(1, 2, 512, 0).long().cuda()
+mask = torch.ones(1, 2, 512, 0).bool().cuda()
 
 # both regular and nsa pathways `r` and `n`
 
