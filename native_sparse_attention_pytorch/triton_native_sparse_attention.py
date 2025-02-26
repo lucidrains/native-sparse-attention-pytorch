@@ -8,7 +8,7 @@ from math import ceil
 import torch
 from torch import Tensor
 
-from einops import repeat, rearrange
+from einops import repeat, rearrange, reduce
 
 def exists(v):
     return v is not None
@@ -1044,12 +1044,12 @@ def flash_attn_backward(
         dq_accum.stride(0),
         dq_accum.stride(1),
         dq_accum.stride(2),
-        dk.stride(0),
-        dk.stride(1),
-        dk.stride(2),
-        dv.stride(0),
-        dv.stride(1),
-        dv.stride(2),
+        dk_accum.stride(0),
+        dk_accum.stride(1),
+        dk_accum.stride(2),
+        dv_accum.stride(0),
+        dv_accum.stride(1),
+        dv_accum.stride(2),
         kv_block_indices.stride(0),
         kv_block_indices.stride(1),
         kv_block_indices.stride(2),
@@ -1094,9 +1094,14 @@ class NSA(Function):
         block_size,
         selected_block_indices,
         fmask,
-        num_grouped_queries
     ):
         dtype = fq.dtype
+
+        q_heads, kv_heads = fq.shape[1], fk.shape[1]
+        assert divisible_by(q_heads, kv_heads)
+        head_groups = q_heads // kv_heads
+
+        fk, fv, selected_block_indices, fmask = tuple(repeat(t, 'b h ... -> b (h g) ...', g = head_groups) for t in (fk, fv, selected_block_indices, fmask))
 
         fq, fk, fv = tuple(t.half() for t in (fq, fk, fv))
 
@@ -1108,23 +1113,29 @@ class NSA(Function):
         )
 
         ctx.save_for_backward(fq, fk, fv, selected_block_indices, fmask, out, lse)
-        ctx._saved_variables = (block_size,)
+
+        ctx._saved_variables = (
+            block_size,
+            head_groups
+        )
 
         return out.type(dtype)
 
     @classmethod
     def backward(self, ctx, do):
+        device = do.device
 
         q, k, v, sel_block_indices, mask, out, lse = ctx.saved_tensors
 
         (
             block_size,
+            head_groups
         ) = ctx._saved_variables
 
         do = do.half()
-        dq = torch.zeros_like(q)
-        dk = torch.zeros_like(k)
-        dv = torch.zeros_like(v)
+        dq = torch.zeros(q.shape, dtype = torch.float32, device = device)
+        dk = torch.zeros(k.shape, dtype = torch.float32, device = device)
+        dv = torch.zeros(v.shape, dtype = torch.float32, device = device)
 
         flash_attn_backward(
             do, q, k, v,
@@ -1132,6 +1143,8 @@ class NSA(Function):
             out, lse, dq, dk, dv,
             block_size = block_size
         )
+
+        dk, dv = tuple(reduce(t, 'b (h g) ... -> b h ...', 'sum', g = head_groups) for t in (dk, dv))
 
         return dq, dk, dv, None, None, None, None
 

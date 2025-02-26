@@ -451,8 +451,7 @@ class SparseAttention(Module):
                     fq, fk, fv,
                     self.selection_block_size,
                     selected_block_indices,
-                    fmask,
-                    fine_num_grouped_queries
+                    fmask
                 )
 
             elif exists(fine_selection_flex_mask):
