@@ -144,7 +144,7 @@ def forward_kernel(
 
     lse_ptrs = (
         Lse +
-        (off_hb + offs_lse_qh[:, None]) * seqlen_q_rounded +
+        offs_qh[:, None] * seqlen_q_rounded +
         offs_m[None, :]
     )
 
