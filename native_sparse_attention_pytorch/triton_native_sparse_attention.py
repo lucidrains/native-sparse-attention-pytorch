@@ -65,7 +65,6 @@ def forward_kernel(
     kv_block_indices,
     kv_block_mask,
     Out,
-    M,
     Lse,
     softmax_scale,
     stride_qb,
@@ -117,8 +116,6 @@ def forward_kernel(
     )
 
     # maximum
-
-    m_ptrs = M + off_hb * seqlen_q_rounded + offs_m
 
     m_i = tl.zeros([BLOCK], dtype = tl.float32) - float("inf")
 
@@ -189,7 +186,7 @@ def forward_kernel(
     l_ij = tl.sum(p, 1)
 
     acc_o_scale = tl.exp(m_i - m_ij)
-    acc_o = acc_o * acc_o_scale[:, None]
+    acc_o *= acc_o_scale[:, None]
 
     if EVEN_N & EVEN_M:
         if EVEN_HEADDIM:
@@ -302,12 +299,7 @@ def forward_kernel(
     # normalize accumulated out
 
     acc_o_scale = tl.exp(m_i - lse_i)
-    acc_o = acc_o * acc_o_scale[:, None]
-
-    # offsets
-
-    start_m = tl.program_id(0)
-    offs_m = start_m * BLOCK + tl.arange(0, BLOCK)
+    acc_o *= acc_o_scale[:, None]
 
     # write back lse
 
@@ -357,8 +349,6 @@ def flash_attn_forward(
 
     lse = torch.empty((batch, nheads, seqlen_q_rounded), device = device, dtype = torch.float32)
 
-    m = torch.empty((batch, nheads, seqlen_q_rounded), device = device, dtype = torch.float32)
-
     o = torch.empty_like(q)
 
     BLOCK_HEADDIM = max(triton.next_power_of_2(dim), 16)
@@ -372,7 +362,6 @@ def flash_attn_forward(
         kv_block_indices,
         kv_block_mask,
         o,
-        m,
         lse,
         softmax_scale,
         q.stride(0),
