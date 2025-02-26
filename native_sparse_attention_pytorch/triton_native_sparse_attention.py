@@ -95,6 +95,7 @@ def forward_kernel(
     EVEN_HEADDIM: tl.constexpr,
     BLOCK: tl.constexpr,
     QUERY_HEAD_GROUPS: tl.constexpr,
+    QUERY_EXPAND_DIM: tl.constexpr,
     NUM_SEL_KV_BLOCKS: tl.constexpr
 ):
     start_m = tl.program_id(0)
@@ -261,6 +262,12 @@ def forward_kernel(
         offs_m * stride_kvbl_m
     )
 
+    q = q.reshape(QUERY_HEAD_GROUPS, BLOCK, BLOCK_HEADDIM)
+    q = q.permute((1, 0, 2))
+    q = tl.expand_dims(q, 2)
+    q = tl.broadcast_to(q, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK_HEADDIM))
+    q = q.reshape(BLOCK, 16, BLOCK_HEADDIM)
+
     for off_sel_kv_block in range(NUM_SEL_KV_BLOCKS):
         block_indices = tl.load(kv_block_indices_ptrs + off_sel_kv_block)
         block_masks = tl.load(kv_block_mask_ptrs + off_sel_kv_block)
@@ -282,17 +289,20 @@ def forward_kernel(
         # similarities
 
         block_qk = tl.zeros([BLOCK, 16, BLOCK], dtype = tl.float32)
-        qk = tl.zeros([BLOCK, BLOCK], dtype = tl.float32)
+        qk = tl.zeros([QUERY_HEAD_GROUPS, BLOCK, BLOCK], dtype = tl.float32)
 
-        k_block = tl.reshape(k_block, (BLOCK, BLOCK, BLOCK_HEADDIM))
-        k_block = tl.permute(k_block, (0, 2, 1))
+        k_block = k_block.reshape(BLOCK, BLOCK, BLOCK_HEADDIM)
+        k_block = k_block.permute(0, 2, 1)
 
-        q_expanded = tl.expand_dims(q, 1)
-        q_expanded = tl.broadcast_to(q_expanded, (BLOCK, 16, BLOCK_HEADDIM))
+        block_qk = tl.dot(q, k_block)
+        block_qk = block_qk.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK)
+        block_qk = tl.sum(block_qk, 2) / QUERY_EXPAND_DIM
+        block_qk = block_qk.permute(1, 0, 2)
 
-        block_qk = tl.dot(q_expanded, k_block)
-        qk += tl.sum(block_qk, 1) / 16.
+        qk += block_qk
         qk += tl.where(block_masks[:, None], 0, float("-inf"))
+
+        qk = qk.reshape(QUERY_HEAD_GROUPS * BLOCK, BLOCK)
 
         # attention
 
@@ -312,11 +322,18 @@ def forward_kernel(
         v_block = tl.reshape(v_block, (BLOCK, BLOCK, BLOCK_HEADDIM))
 
         p = p.to(v_block.dtype)
-        p_expanded = tl.expand_dims(p, 1)
-        p_expanded = tl.broadcast_to(p_expanded, (BLOCK, 16, BLOCK))
+        p_expanded = p.reshape(QUERY_HEAD_GROUPS, BLOCK, BLOCK)
+        p_expanded = p_expanded.permute(1, 0, 2)
+        p_expanded = tl.expand_dims(p_expanded, 2)
+        p_expanded = tl.broadcast_to(p_expanded, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK))
+        p_expanded = p_expanded.reshape(BLOCK, 16, BLOCK)
 
         block_acc_o = tl.dot(p_expanded, v_block)
-        block_acc_o = tl.sum(block_acc_o, 1) / 16.
+        block_acc_o = block_acc_o.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK_HEADDIM)
+        block_acc_o = tl.sum(block_acc_o, 2) / QUERY_EXPAND_DIM
+        block_acc_o = block_acc_o.permute(1, 0, 2)
+        block_acc_o = block_acc_o.reshape(QUERY_HEAD_GROUPS * BLOCK, BLOCK_HEADDIM)
+
         acc_o += block_acc_o
 
         # -- update statistics
@@ -352,7 +369,7 @@ def forward_kernel(
                 out_ptrs, acc_o, mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim)
             )
 
-def flash_attn_forward(
+def native_sparse_attn_forward(
     q,
     k,
     v,
@@ -424,6 +441,7 @@ def flash_attn_forward(
         BLOCK_HEADDIM,
         BLOCK = block_size,
         QUERY_HEAD_GROUPS = head_groups,
+        QUERY_EXPAND_DIM = 16 // head_groups,
         NUM_SEL_KV_BLOCKS = num_selected_fine_blocks,
         num_warps = num_warps,
         num_stages = 1,
@@ -978,7 +996,7 @@ def backward_kernel(
             NUM_SEL_KV_BLOCKS = NUM_SEL_KV_BLOCKS
         )
 
-def flash_attn_backward(
+def native_sparse_attn_backward(
     do,
     q, k, v,
     kv_block_indices,
@@ -1128,7 +1146,7 @@ class NSA(Function):
 
         fq, fk, fv = tuple(t.half() for t in (fq, fk, fv))
 
-        out, lse = flash_attn_forward(
+        out, lse = native_sparse_attn_forward(
             fq, fk, fv,
             selected_block_indices,
             fmask,
@@ -1162,7 +1180,7 @@ class NSA(Function):
         dk = torch.zeros(k.shape, dtype = torch.float32, device = device)
         dv = torch.zeros(v.shape, dtype = torch.float32, device = device)
 
-        flash_attn_backward(
+        native_sparse_attn_backward(
             do, q, k, v,
             sel_block_indices, mask,
             out, lse, dq, dk, dv,
