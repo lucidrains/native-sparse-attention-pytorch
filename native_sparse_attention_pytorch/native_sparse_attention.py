@@ -318,6 +318,7 @@ class SparseAttention(Module):
     def forward(
         self,
         inp,
+        disable_triton_kernel = False,
         sliding_window_flex_mask = None,
         fine_selection_flex_mask = None
     ):
@@ -441,7 +442,7 @@ class SparseAttention(Module):
                 gates = gates.cumprod(dim = -1)[..., -1]
                 gates = repeat(gates, 'b h ... -> b (h qh) ...', qh = fine_num_grouped_queries)
 
-            if self.use_triton_kernel:
+            if self.use_triton_kernel and not disable_triton_kernel:
                 from native_sparse_attention_pytorch.triton_native_sparse_attention import native_sparse_attend
 
                 fmask = selected_importance_values > 1e-10

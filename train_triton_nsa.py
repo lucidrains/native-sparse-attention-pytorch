@@ -25,7 +25,6 @@ GRAD_ACCUM_EVERY = 4
 LEARNING_RATE = 1e-4
 VALIDATE_EVERY = 100
 PRIME_LENGTH = 64
-SHOULD_GENERATE = False
 GENERATE_EVERY = 500
 GENERATE_LENGTH = 512
 SEQ_LEN = 512
@@ -100,7 +99,11 @@ def base_decoding(
     sample_num_times = max(0, seq_len - prompt_seq_len)
 
     for _ in tqdm(range(sample_num_times)):
-        logits = net(out, disable_flex = True)
+        logits = net(
+            out,
+            disable_flex = True,
+            disable_triton_kernel = True
+        )
 
         logits = logits[:, -1]
         logits = top_k(logits, thres = filter_thres)
@@ -208,7 +211,7 @@ for i in tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
             wandb.log(dict(valid_loss = loss.item()), step = i)
             print(f"validation loss: {loss.item():.3f}")
 
-    if SHOULD_GENERATE and i % GENERATE_EVERY == 0:
+    if i % GENERATE_EVERY == 0:
         model.eval()
 
         inp = random.choice(val_dataset)[:PRIME_LENGTH]

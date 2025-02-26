@@ -182,7 +182,8 @@ class Transformer(Module):
         self,
         ids,
         return_loss = False,
-        disable_flex = False
+        disable_flex = False,
+        disable_triton_kernel = True
     ):
         if return_loss:
             ids, labels = ids[:, :-1], ids[:, 1:]
@@ -195,7 +196,9 @@ class Transformer(Module):
 
         # prepare maybe flex attention masks
 
-        attn_kwargs = dict()
+        attn_kwargs = dict(
+            disable_triton_kernel = disable_triton_kernel
+        )
 
         if not disable_flex and self.use_flex_sliding_window:
             attn_kwargs.update(
