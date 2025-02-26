@@ -16,6 +16,9 @@ def exists(v):
 def default(val, d):
     return val if exists(val) else d
 
+def divisible_by(num, den):
+    return (num % den) == 0
+
 def round_up_multiple(n, mult):
     return ceil(n / mult) * mult
 
@@ -49,8 +52,8 @@ from triton.language.extra import libdevice
 
 @triton.heuristics(
     {
-        "EVEN_M": lambda args: args["seqlen_q"] % args["BLOCK"] == 0,
-        "EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK"] == 0,
+        "EVEN_M": lambda args: divisible_by(args["seqlen_q"], args["BLOCK"]),
+        "EVEN_N": lambda args: divisible_by(args["seqlen_k"], args["BLOCK"]),
         "EVEN_HEADDIM": lambda args: args["headdim"] == args["BLOCK_HEADDIM"],
     }
 )
@@ -335,14 +338,14 @@ def flash_attn_forward(
 ):
     q, k, v, kv_block_indices = [x if is_contiguous(x) else x.contiguous() for x in (q, k, v, kv_block_indices)]
 
-    batch, seqlen_q, nheads, dim = q.shape
-    _, seqlen_k, _, _ = k.shape
+    batch, nheads, seqlen_q, dim, device = *q.shape, q.device
+    _, _, seqlen_k, _ = k.shape
 
     num_selected_fine_blocks = kv_block_indices.shape[-1]
     assert kv_block_indices.shape == kv_block_mask.shape
 
-    assert k.shape == (batch, seqlen_k, nheads, dim)
-    assert v.shape == (batch, seqlen_k, nheads, dim)
+    assert k.shape == (batch, nheads, seqlen_k, dim)
+    assert v.shape == (batch, nheads, seqlen_k, dim)
     assert dim <= 128, "only support head dimensions up to 128"
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same type"
     assert q.dtype in [torch.float16, torch.bfloat16], "Only support fp16 and bf16"
@@ -352,9 +355,9 @@ def flash_attn_forward(
 
     seqlen_q_rounded = round_up_multiple(seqlen_q, TRITON_BLOCK_SIZE)
 
-    lse = torch.empty((batch, nheads, seqlen_q_rounded), device=q.device, dtype=torch.float32)
+    lse = torch.empty((batch, nheads, seqlen_q_rounded), device = device, dtype = torch.float32)
 
-    m = torch.empty((batch, nheads, seqlen_q_rounded), device=q.device, dtype=torch.float32)
+    m = torch.empty((batch, nheads, seqlen_q_rounded), device = device, dtype = torch.float32)
 
     o = torch.empty_like(q)
 
@@ -373,20 +376,20 @@ def flash_attn_forward(
         lse,
         softmax_scale,
         q.stride(0),
-        q.stride(2),
         q.stride(1),
+        q.stride(2),
         k.stride(0),
-        k.stride(2),
         k.stride(1),
+        k.stride(2),
         v.stride(0),
-        v.stride(2),
         v.stride(1),
+        v.stride(2),
         o.stride(0),
-        o.stride(2),
         o.stride(1),
+        o.stride(2),
         kv_block_indices.stride(0),
-        kv_block_indices.stride(2),
         kv_block_indices.stride(1),
+        kv_block_indices.stride(2),
         nheads,
         seqlen_q,
         seqlen_k,
@@ -964,8 +967,8 @@ def flash_attn_backward(
     if not is_contiguous(do):
         do = do.contiguous()
 
-    batch, seqlen_q, nheads, dim = q.shape
-    _, seqlen_k, _, _ = k.shape
+    batch, nheads, seqlen_q, dim = q.shape
+    _, _, seqlen_k, _ = k.shape
 
     num_sel_fine_blocks = kv_block_indices.shape[-1]
     assert kv_block_indices.shape == kv_block_mask.shape
@@ -995,11 +998,11 @@ def flash_attn_backward(
         do,
         delta,
         o.stride(0),
-        o.stride(2),
         o.stride(1),
+        o.stride(2),
         do.stride(0),
-        do.stride(2),
         do.stride(1),
+        do.stride(2),
         nheads,
         seqlen_q,
         seqlen_q_rounded,
@@ -1027,29 +1030,29 @@ def flash_attn_backward(
         delta,
         softmax_scale,
         q.stride(0),
-        q.stride(2),
         q.stride(1),
+        q.stride(2),
         k.stride(0),
-        k.stride(2),
         k.stride(1),
+        k.stride(2),
         v.stride(0),
-        v.stride(2),
         v.stride(1),
+        v.stride(2),
         do.stride(0),
-        do.stride(2),
         do.stride(1),
+        do.stride(2),
         dq_accum.stride(0),
-        dq_accum.stride(2),
         dq_accum.stride(1),
+        dq_accum.stride(2),
         dk.stride(0),
-        dk.stride(2),
         dk.stride(1),
+        dk.stride(2),
         dv.stride(0),
-        dv.stride(2),
         dv.stride(1),
+        dv.stride(2),
         kv_block_indices.stride(0),
-        kv_block_indices.stride(2),
         kv_block_indices.stride(1),
+        kv_block_indices.stride(2),
         nheads,
         seqlen_q,
         seqlen_k,
@@ -1063,8 +1066,8 @@ def flash_attn_backward(
         BLOCK = block_size,
         NUM_SEL_KV_BLOCKS = num_sel_fine_blocks,
         SEQUENCE_PARALLEL = False,
-        EVEN_M = (seqlen_q % block_size) == 0,
-        EVEN_N = (seqlen_k % block_size) == 0,
+        EVEN_M = divisible_by(seqlen_q, block_size),
+        EVEN_N = divisible_by(seqlen_k, block_size),
         EVEN_HEADDIM = BLOCK_HEADDIM == dim
         # BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
         # num_warps=num_warps,
@@ -1093,10 +1096,6 @@ class NSA(Function):
         fmask,
         num_grouped_queries
     ):
-        selected_block_indices, fmask = tuple(rearrange(t, 'b h i sel -> b i h sel') for t in (selected_block_indices, fmask))
-
-        fq, fk, fv = tuple(rearrange(t, 'b h n d -> b n h d') for t in (fq, fk, fv))
-
         dtype = fq.dtype
 
         fq, fk, fv = tuple(t.half() for t in (fq, fk, fv))
@@ -1111,12 +1110,10 @@ class NSA(Function):
         ctx.save_for_backward(fq, fk, fv, selected_block_indices, fmask, out, lse)
         ctx._saved_variables = (block_size,)
 
-        out = rearrange(out, 'b n h d -> b h n d')
         return out.type(dtype)
 
     @classmethod
     def backward(self, ctx, do):
-        do = rearrange(do, 'b h n d -> b n h d')
 
         q, k, v, sel_block_indices, mask, out, lse = ctx.saved_tensors
 
@@ -1136,7 +1133,6 @@ class NSA(Function):
             block_size = block_size
         )
 
-        dq, dk, dv = tuple(rearrange(t, 'b n h d -> b h n d') for t in (dq, dk, dv))
         return dq, dk, dv, None, None, None, None
 
 native_sparse_attend = NSA.apply
