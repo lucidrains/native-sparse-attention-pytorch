@@ -82,7 +82,8 @@ def forward_kernel(
     stride_kvbl_b,
     stride_kvbl_h,
     stride_kvbl_m,
-    nheads,
+    stride_lse_b,
+    kv_heads,
     seqlen_q,
     seqlen_k,
     seqlen_q_rounded,
@@ -100,9 +101,9 @@ def forward_kernel(
 ):
     start_m = tl.program_id(0)
     off_hb = tl.program_id(1)
-    off_b = off_hb // nheads
 
-    off_h = off_hb % nheads
+    off_b = off_hb // kv_heads
+    off_h = off_hb % kv_heads
 
     offs_qh = off_h * QUERY_HEAD_GROUPS + tl.arange(0, QUERY_HEAD_GROUPS)
 
@@ -142,6 +143,7 @@ def forward_kernel(
 
     lse_ptrs = (
         Lse +
+        off_b * stride_lse_b +
         offs_qh[:, None] * seqlen_q_rounded +
         offs_m[None, :]
     )
@@ -348,7 +350,7 @@ def forward_kernel(
     # write back lse
 
     lse_i = lse_i.reshape([QUERY_HEAD_GROUPS, BLOCK])
-    tl.store(lse_ptrs, lse_i)
+    tl.store(lse_ptrs, lse_i, mask = offs_m[None, :] < seqlen_q)
 
     # write to output
 
@@ -429,7 +431,8 @@ def native_sparse_attn_forward(
         kv_block_indices.stride(0),
         kv_block_indices.stride(1),
         kv_block_indices.stride(2),
-        nheads,
+        lse.stride(0),
+        kv_heads,
         seqlen_q,
         seqlen_k,
         seqlen_q_rounded,
@@ -590,7 +593,6 @@ def backward_kernel_one_col_block(
 
     k_ptrs = K + (offs_n[:, None] * stride_kn + offs_d[None, :])
     v_ptrs = V + (offs_n[:, None] * stride_vn + offs_d[None, :])
-
 
     q_ptrs = (
         Q +
@@ -956,6 +958,8 @@ def backward_kernel(
     stride_kvbl_b,
     stride_kvbl_h,
     stride_kvbl_m,
+    stride_lse_b,
+    stride_D_b,
     kv_heads,
     seqlen_q,
     seqlen_k,
@@ -993,8 +997,16 @@ def backward_kernel(
     kv_block_mask += off_b * stride_kvbl_b + off_h * stride_kvbl_h
 
     # pointer to row-wise quantities in value-like data
-    D += off_hb * QUERY_HEAD_GROUPS * seqlen_q_rounded
-    LSE += off_hb * QUERY_HEAD_GROUPS * seqlen_q_rounded
+
+    D += (
+        off_b * stride_D_b +
+        off_h * QUERY_HEAD_GROUPS * seqlen_q_rounded
+    )
+
+    LSE += (
+        off_b * stride_lse_b +
+        off_h * QUERY_HEAD_GROUPS * seqlen_q_rounded
+    )
 
     num_block_n = tl.cdiv(seqlen_k, BLOCK)
     for start_n in range(0, num_block_n):
@@ -1137,6 +1149,8 @@ def native_sparse_attn_backward(
         kv_block_indices.stride(0),
         kv_block_indices.stride(1),
         kv_block_indices.stride(2),
+        lse.stride(0),
+        delta.stride(0),
         kv_heads,
         seqlen_q,
         seqlen_k,
