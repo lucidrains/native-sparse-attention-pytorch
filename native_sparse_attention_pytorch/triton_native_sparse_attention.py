@@ -1,4 +1,5 @@
 from __future__ import annotations
+from native_sparse_attention_pytorch.tensor_typing import Float, Int, Bool
 
 # taken from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/flash_attn_triton.py
 # with fixes for triton 2.3
@@ -1462,11 +1463,22 @@ class NSA(Function):
 
 _native_sparse_attend = NSA.apply
 
+# ein notation
+
+# b - batch
+# qh - query heads
+# kh - key / value heads
+# n - token sequence
+# d - attention head dimension
+# sel - selected indices
+
 def native_sparse_attend(
-    fq, fk, fv,
-    block_size,
-    selected_block_indices,
-    fmask,
+    fq: Float['b qh n d'],
+    fk: Float['b kh n d'],
+    fv: Float['b kh n d'],
+    block_size: int,
+    selected_block_indices: Int['b qh sel'] | Int['b kh sel'],
+    fmask: Bool['b qh sel'] | Bool['b kh sel'],
     return_lse = False
 ):
     seq_len = fq.shape[-2]

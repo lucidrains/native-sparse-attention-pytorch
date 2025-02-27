@@ -25,6 +25,7 @@ classifiers=[
 dependencies = [
     "einx>=0.3.0",
     "einops>=0.8.1",
+    "jaxtyping",
     "local-attention>=1.11.1",
     "rotary-embedding-torch",
     "torch>=2.5",
