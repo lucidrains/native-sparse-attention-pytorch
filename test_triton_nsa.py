@@ -1,5 +1,6 @@
+from math import ceil
 import torch
-from native_sparse_attention_pytorch.triton_native_sparse_attention import native_sparse_attend
+from native_sparse_attention_pytorch.triton_native_sparse_attention import native_sparse_attend, round_up_multiple, pad_to_multiple
 
 import einx
 from einops import rearrange, einsum, repeat
@@ -25,10 +26,12 @@ def regular_attend(
     q_heads, seq_len, kv_heads, device = q.shape[1], q.shape[-2], k.shape[1], q.device
     assert divisible_by(q_heads, kv_heads)
 
+    q, k, v = tuple(pad_to_multiple(t, block_size, dim = -2) for t in (q, k, v))
+    indices, mask = tuple(pad_to_multiple(t, block_size, dim = -2) for t in (indices, mask))
+
     g = q_heads // kv_heads # `g` stands for `g`roups of query heads per kv head
 
-    assert divisible_by(seq_len, block_size)
-    w = seq_len // block_size
+    w = ceil(seq_len / block_size)
 
     q, k, v = tuple(rearrange(t, 'b h (w n) d -> b h w n d', n = block_size) for t in (q, k, v))
 
@@ -83,22 +86,31 @@ def regular_attend(
 
     out = rearrange(out, 'b h g w n d -> b (h g) (w n) d')
 
+    out = out[..., :seq_len, :]
+
     if not return_lse:
         return out
 
     lse = sim.logsumexp(dim = -1)
-    return out, rearrange(lse, 'b g h w n -> b (g h) (w n)')
+    lse = rearrange(lse, 'b g h w n -> b (g h) (w n)')
+    lse = lse[..., :seq_len]
+
+    return out, lse
 
 # mock inputs
 
+seq_len = 511
+q_heads = 4
+kv_heads = 2
 fine_block_size = 16
+num_sel = 1
 
-q = torch.randn(2, 4, 512, 64).cuda()
-k = torch.randn(2, 2, 512, 64).cuda()
-v = torch.randn(2, 2, 512, 64).cuda()
+q = torch.randn(2, q_heads, seq_len, 64).cuda()
+k = torch.randn(2, kv_heads, seq_len, 64).cuda()
+v = torch.randn(2, kv_heads, seq_len, 64).cuda()
 
-indices = torch.zeros(2, 2, 512, 0).long().cuda()
-mask = torch.randint(0, 2, (2, 2, 512, 0)).bool().cuda()
+indices = torch.zeros(2, kv_heads, seq_len, num_sel).long().cuda()
+mask = torch.randint(0, 2, (2, kv_heads, seq_len, num_sel)).bool().cuda()
 
 # both regular and nsa pathways `r` and `n`
 

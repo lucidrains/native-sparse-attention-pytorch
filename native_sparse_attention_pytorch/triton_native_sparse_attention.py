@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # taken from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/flash_attn_triton.py
 # with fixes for triton 2.3
 
@@ -7,6 +9,7 @@ from math import ceil
 
 import torch
 from torch import Tensor
+import torch.nn.functional as F
 
 from einops import repeat, rearrange, reduce
 
@@ -21,6 +24,17 @@ def divisible_by(num, den):
 
 def round_up_multiple(n, mult):
     return ceil(n / mult) * mult
+
+def pad_at_dim(t, pad: tuple[int, int], *, dim = -1, value = 0.):
+    dims_from_right = (- dim - 1) if dim < 0 else (t.ndim - dim - 1)
+    zeros = ((0, 0) * dims_from_right)
+    return F.pad(t, (*zeros, *pad), value = value)
+
+def pad_to_multiple(t, mult, *, dim):
+    length = t.shape[dim]
+    padded_length = round_up_multiple(length, mult)
+    remainder = padded_length - length
+    return pad_at_dim(t, (0, remainder), dim = dim)
 
 def is_contiguous(x: Tensor):
     return x.stride(-1) == 1
@@ -168,13 +182,13 @@ def forward_kernel(
         if EVEN_HEADDIM:
             q = tl.load(q_ptrs)
         else:
-            q = tl.load(q_ptrs, mask=offs_d[None, :] < headdim, other=0.0)
+            q = tl.load(q_ptrs, mask=offs_d[None, None, :] < headdim, other=0.0)
     else:
         if EVEN_HEADDIM:
-            q = tl.load(q_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0)
+            q = tl.load(q_ptrs, mask=offs_m[None, :, None] < seqlen_q, other=0.0)
         else:
             q = tl.load(
-                q_ptrs, mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim), other=0.0
+                q_ptrs, mask=(offs_m[None, :, None] < seqlen_q) & (offs_d[None, None, :] < headdim), other=0.0
             )
 
     q = q.reshape([QUERY_HEAD_GROUPS * BLOCK, BLOCK_HEADDIM])
@@ -360,13 +374,13 @@ def forward_kernel(
         if EVEN_HEADDIM:
             tl.store(out_ptrs, acc_o)
         else:
-            tl.store(out_ptrs, acc_o, mask=offs_d[None, :] < headdim)
+            tl.store(out_ptrs, acc_o, mask=offs_d[None, None, :] < headdim)
     else:
         if EVEN_HEADDIM:
-            tl.store(out_ptrs, acc_o, mask=offs_m[:, None] < seqlen_q)
+            tl.store(out_ptrs, acc_o, mask=offs_m[None, :, None] < seqlen_q)
         else:
             tl.store(
-                out_ptrs, acc_o, mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim)
+                out_ptrs, acc_o, mask=(offs_m[None, :, None] < seqlen_q) & (offs_d[None, None, :] < headdim)
             )
 
 def native_sparse_attn_forward(
@@ -672,11 +686,11 @@ def backward_kernel_one_col_block(
         q = tl.load(q_ptrs)
     else:
         if EVEN_HEADDIM:
-            q = tl.load(q_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0)
+            q = tl.load(q_ptrs, mask=offs_m[None, :, None] < seqlen_q, other=0.0)
         else:
             q = tl.load(
                 q_ptrs,
-                mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+                mask=(offs_m[None, :, None] < seqlen_q) & (offs_d[None, None, :] < headdim),
                 other=0.0,
             )
     # recompute p = softmax(qk, dim=-1).T
@@ -717,7 +731,7 @@ def backward_kernel_one_col_block(
         # [2022-11-01] TD: Triton bug, there's a race condition if we just use m_mask and not d_mask.
         do = tl.load(
             do_ptrs,
-            mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+            mask=(offs_m[None, :, None] < seqlen_q) & (offs_d[None, None, :] < headdim),
             other=0.0,
         )
 
@@ -887,12 +901,12 @@ def backward_kernel_one_col_block(
         tl.atomic_add(dq_ptrs, dq, sem = 'relaxed')
     else:
         if EVEN_HEADDIM:
-            tl.atomic_add(dq_ptrs, dq, mask=offs_m[:, None] < seqlen_q, sem = 'relaxed')
+            tl.atomic_add(dq_ptrs, dq, mask=offs_m[None, :, None] < seqlen_q, sem = 'relaxed')
         else:
             tl.atomic_add(
                 dq_ptrs,
                 dq,
-                mask = (offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+                mask = (offs_m[None, :, None] < seqlen_q) & (offs_d[None, None, :] < headdim),
                 sem = 'relaxed',
             )
 
@@ -1248,7 +1262,7 @@ def native_sparse_attend(
     fmask,
     return_lse = False
 ):
-    assert divisible_by(fq.shape[-2], block_size)
+    seq_len = fq.shape[-2]
 
     out, lse = _native_sparse_attend(
         fq, fk, fv,
@@ -1260,4 +1274,4 @@ def native_sparse_attend(
     if not return_lse:
         return out
 
-    return out, lse
+    return out, lse[..., :seq_len]
