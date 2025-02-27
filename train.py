@@ -69,50 +69,6 @@ def decode_token(token):
 def decode_tokens(tokens):
     return "".join(list(map(decode_token, tokens)))
 
-# sampling helpers
-
-def log(t, eps = 1e-20):
-    return torch.log(t.clamp(min = eps))
-
-def gumbel_noise(t):
-    noise = torch.zeros_like(t).uniform_(0, 1)
-    return -log(-log(noise))
-
-def gumbel_sample(t, temperature = 1., dim = -1, keepdim = True):
-    return ((t / max(temperature, 1e-10)) + gumbel_noise(t)).argmax(dim = dim, keepdim = keepdim)
-
-def top_k(logits, thres = 0.9):
-    k = math.ceil((1 - thres) * logits.shape[-1])
-    val, ind = torch.topk(logits, k)
-    probs = torch.full_like(logits, float('-inf'))
-    probs.scatter_(-1, ind, val)
-    return probs
-
-def base_decoding(
-    net,
-    prompt: Tensor,
-    seq_len: int,
-    temperature = 1.,
-    filter_thres = 0.9,
-):
-    prompt_seq_len, out = prompt.shape[-1], prompt.clone()
-    sample_num_times = max(0, seq_len - prompt_seq_len)
-
-    for _ in tqdm(range(sample_num_times)):
-        logits = net(
-            out,
-            disable_flex = True,
-            disable_triton_kernel = True
-        )
-
-        logits = logits[:, -1]
-        logits = top_k(logits, thres = filter_thres)
-        sample = gumbel_sample(logits, temperature = temperature, dim = -1)
-
-        out = torch.cat((out, sample), dim = -1)
-
-    return out[..., prompt_seq_len:]
-
 # printing
 
 if USE_TRITON_NSA:
@@ -231,7 +187,7 @@ for i in tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
 
         prompt = inp[None, ...]
 
-        sampled = base_decoding(model, prompt, GENERATE_LENGTH)
+        sampled = model.sample(prompt, GENERATE_LENGTH)
 
         base_decode_output = decode_tokens(sampled[0])
 
