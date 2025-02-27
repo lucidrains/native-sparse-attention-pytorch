@@ -32,15 +32,16 @@ HEADS = 8
 KV_HEADS = 4
 
 USE_SPARSE_ATTN = True
-USE_FLEX_FOR_FINE_SELECTION = True   # will push flex a bit, won't be efficient as each layer needs sparsity dynmically generated, but may be enough just to compare to full attention before going all-in on triton kernels
+USE_TRITON_NSA = True
+USE_FLEX_FOR_FINE_SELECTION = False   # will push flex a bit, won't be efficient as each layer needs sparsity dynmically generated, but may be enough just to compare to full attention before going all-in on triton kernels
 QUERY_HEADS_SHARE_SELECTION = False  # if set to False, each query head can look at a different segment of their corresponding key / value head in GQA
 
 # sparse attention related
 
 SLIDING_WINDOW_SIZE = 64
-COMPRESS_BLOCK_SIZE = 64
+COMPRESS_BLOCK_SIZE = 16
 
-FINE_BLOCK_SIZE = 32
+FINE_BLOCK_SIZE = 16
 NUM_FINE_SELECTED = 1
 
 INTERPOLATED_IMPORTANCE_SCORE = False
@@ -108,6 +109,15 @@ def base_decoding(
 
     return out[..., prompt_seq_len:]
 
+# printing
+
+if USE_TRITON_NSA:
+    print('using custom triton kernel')
+elif USE_FLEX_FOR_FINE_SELECTION:
+    print('using flex attn')
+else:
+    print('sparse attn in regular pytorch')
+
 # model
 
 model = Transformer(
@@ -119,6 +129,7 @@ model = Transformer(
     kv_heads = KV_HEADS,
     use_sparse_attn = USE_SPARSE_ATTN,
     use_flex_sliding_window = True,
+    use_triton_fine_selection = USE_TRITON_NSA,
     use_flex_fine_selection = USE_FLEX_FOR_FINE_SELECTION,
     sparse_attn_kwargs = dict(
         sliding_window_size = SLIDING_WINDOW_SIZE,
