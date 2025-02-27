@@ -549,7 +549,7 @@ def backward_store_dk_dv(
 
 
 @triton.jit
-def backward_kernel_one_col_block(
+def backward_kernel_one_col_block_sparse(
     start_n,
     Q,
     K,
@@ -585,7 +585,345 @@ def backward_kernel_one_col_block(
     BLOCK: tl.constexpr,
     QUERY_HEAD_GROUPS: tl.constexpr,
     QUERY_EXPAND_DIM: tl.constexpr,
-    NUM_SEL_KV_BLOCKS: tl.constexpr
+    OFF_SEL_KV_BLOCKS: tl.constexpr
+):
+        # We need to make sure begin_m is a multiple of BLOCK_M (not BLOCK_N)
+
+    begin_m = ((start_n * BLOCK) // BLOCK) * BLOCK
+
+    # initialize row/col offsets
+
+    offs_qm = begin_m + tl.arange(0, BLOCK)
+    offs_n = start_n * BLOCK + tl.arange(0, BLOCK)
+    offs_m = start_n * BLOCK + tl.arange(0, BLOCK)
+    offs_d = tl.arange(0, BLOCK_HEADDIM)
+
+    offs_g = tl.arange(0, QUERY_HEAD_GROUPS)
+
+    offs_d_or_lse = seqlen_q_rounded * offs_g[:, None] + offs_m
+
+    # initialize pointers to value-like data
+
+    k_ptrs = K + (offs_n[:, None] * stride_kn + offs_d[None, :])
+    v_ptrs = V + (offs_n[:, None] * stride_vn + offs_d[None, :])
+
+    q_ptrs = (
+        Q +
+        offs_g[:, None, None] * stride_qh +
+        offs_qm[None, :, None] * stride_qm +
+        offs_d[None, None, :]
+    )
+
+    do_ptrs = (
+        DO +
+        offs_g[:, None, None] * stride_doh +
+        offs_qm[None, :, None] * stride_dom +
+        offs_d[None, None, :]
+    )
+
+    dq_ptrs = (
+        DQ +
+        offs_g[:, None, None] * stride_dqh +
+        offs_qm[None, :, None] * stride_dqm +
+        offs_d[None, None, :]
+    )
+
+    # initialize dv and dk
+
+    dv = tl.zeros([BLOCK, BLOCK_HEADDIM], dtype=tl.float32)
+    dk = tl.zeros([BLOCK, BLOCK_HEADDIM], dtype=tl.float32)
+
+    # There seems to be some problem with Triton pipelining that makes results wrong for
+    # headdim=64, seqlen=(113, 255), bias_type='matrix'. In this case the for loop
+    # may have zero step, and pipelining with the bias matrix could screw it up.
+    # So we just exit early.
+
+    if begin_m >= seqlen_q:
+        dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_d[None, :])
+        dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_d[None, :])
+        backward_store_dk_dv(
+            dk_ptrs,
+            dv_ptrs,
+            dk,
+            dv,
+            offs_n,
+            offs_d,
+            seqlen_k,
+            headdim,
+            EVEN_M=EVEN_M,
+            EVEN_N=EVEN_N,
+            EVEN_HEADDIM=EVEN_HEADDIM,
+        )
+        return
+    # k and v stay in SRAM throughout
+    # [2022-10-30] TD: Same bug as the fwd. In the case of EVEN_N=True and EVEN_M=False,
+    # if we just call tl.load(k_ptrs), we get the wrong output!
+    if EVEN_N & EVEN_M:
+        if EVEN_HEADDIM:
+            k = tl.load(k_ptrs)
+            v = tl.load(v_ptrs)
+        else:
+            k = tl.load(k_ptrs, mask=offs_d[None, :] < headdim, other=0.0)
+            v = tl.load(v_ptrs, mask=offs_d[None, :] < headdim, other=0.0)
+    else:
+        if EVEN_HEADDIM:
+            k = tl.load(k_ptrs, mask=offs_n[:, None] < seqlen_k, other=0.0)
+            v = tl.load(v_ptrs, mask=offs_n[:, None] < seqlen_k, other=0.0)
+        else:
+            k = tl.load(
+                k_ptrs, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim), other=0.0
+            )
+            v = tl.load(
+                v_ptrs, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim), other=0.0
+            )
+
+    # same block for block causal diagonal
+
+    # load q, k, v, do on-chip
+    # Same bug as below. Otherwise gives wrong result for headdim=40, seqlen=(128, 117)
+    if EVEN_M & EVEN_HEADDIM:
+        q = tl.load(q_ptrs)
+    else:
+        if EVEN_HEADDIM:
+            q = tl.load(q_ptrs, mask=offs_m[None, :, None] < seqlen_q, other=0.0)
+        else:
+            q = tl.load(
+                q_ptrs,
+                mask=(offs_m[None, :, None] < seqlen_q) & (offs_d[None, None, :] < headdim),
+                other=0.0,
+            )
+    # recompute p = softmax(qk, dim=-1).T
+
+    q = q.reshape([QUERY_HEAD_GROUPS * BLOCK, BLOCK_HEADDIM])
+
+    qk = tl.dot(q, tl.trans(k))
+
+    qk = qk.reshape(QUERY_HEAD_GROUPS, BLOCK, BLOCK)
+
+    # Trying to combine the two masks seem to make the result wrong
+    if not EVEN_N:  # Need to mask out otherwise the softmax is wrong
+        qk = tl.where(offs_n[None, :] < seqlen_k, qk, float("-inf"))
+
+    qk = tl.where(offs_m[:, None] >= (offs_n[None, :]), qk, float("-inf"))
+
+    qk = qk.reshape(QUERY_HEAD_GROUPS * BLOCK, BLOCK)
+
+    # There seems to be a race condition when headdim=48/96, and dq, dk, dv are wrong.
+    # Also wrong for headdim=64.
+
+    if not (EVEN_M & EVEN_HEADDIM):
+        tl.debug_barrier()
+
+    lse_i = tl.load(LSE + offs_d_or_lse)
+    lse_i = lse_i.reshape(QUERY_HEAD_GROUPS * BLOCK)
+
+    p = tl.exp(qk * softmax_scale - lse_i[:, None])
+
+    # compute dv
+    # [2022-10-30] TD: A Triton bug: if EVEN_M=True and EVEN_HEADDIM=False, if we call
+    # do = tl.load(do_ptrs, mask=offs_d[None, :] < headdim, other=0.0), we get wrong outputs
+    # in the case of headdim=48/96, seqlen_q & seqlen_k >= 512. If headdim=40 or seqlen < 512,
+    # the output is correct.
+    if EVEN_M & EVEN_HEADDIM:
+        do = tl.load(do_ptrs)
+    else:
+        # [2022-11-01] TD: Triton bug, there's a race condition if we just use m_mask and not d_mask.
+        do = tl.load(
+            do_ptrs,
+            mask=(offs_m[None, :, None] < seqlen_q) & (offs_d[None, None, :] < headdim),
+            other=0.0,
+        )
+
+    do = do.reshape(QUERY_HEAD_GROUPS * BLOCK, BLOCK_HEADDIM)
+
+    # compute dp = dot(v, do)
+    # There seems to be a race condition when headdim=48/96, and dq, dk are wrong.
+    # Also wrong for headdim=128, seqlen=(108, 256), and ATOMIC_ADD=True
+    # Also wrong for headdim=64, seqlen=(1023, 1024), and ATOMIC_ADD=False
+
+    if not (EVEN_M & EVEN_HEADDIM):
+        tl.debug_barrier()
+
+    # There's a race condition for headdim=48
+    if not EVEN_HEADDIM:
+        tl.debug_barrier()
+
+    # compute ds = p * (dp - delta[:, None])
+    # Putting the subtraction after the dp matmul (instead of before) is slightly faster
+
+    Di = tl.load(D + offs_d_or_lse)
+    Di = Di.reshape(QUERY_HEAD_GROUPS * BLOCK)
+
+    # Converting ds to q.dtype here reduces register pressure and makes it much faster
+    # for BLOCK_HEADDIM=128
+
+    dq = tl.zeros([QUERY_HEAD_GROUPS * BLOCK, BLOCK_HEADDIM], dtype = tl.float32)
+
+    # handle kv block indices using atomic adds for starters, todo: swap dq and dk/dv loops at some point, semi big refactor
+
+    kv_block_indices_ptrs = (
+        kv_block_indices +
+        offs_m * stride_kvbl_m
+    )
+
+    kv_block_mask_ptrs = (
+        kv_block_mask +
+        offs_m * stride_kvbl_m
+    )
+
+    block_indices = tl.load(kv_block_indices_ptrs + OFF_SEL_KV_BLOCKS)
+    block_masks = tl.load(kv_block_mask_ptrs + OFF_SEL_KV_BLOCKS)
+
+    blocks_offs_n = block_indices[:, None] * BLOCK + tl.arange(0, BLOCK)[None, :]
+
+    block_k_ptrs = (
+        K + blocks_offs_n[:, :, None] * stride_kn + offs_d[None, None, :]
+    )
+
+    block_v_ptrs = (
+        V + blocks_offs_n[:, :, None] * stride_vn + offs_d[None, None, :]
+    )
+
+    block_dv_ptrs = (
+        DV + blocks_offs_n[:, :, None] * stride_dvn + offs_d[None, None, :]
+    )
+
+    block_dk_ptrs = (
+        DK + blocks_offs_n[:, :, None] * stride_dkn + offs_d[None, None, :]
+    )
+
+    block_k = tl.load(block_k_ptrs)
+    block_v = tl.load(block_v_ptrs)
+
+    q_expanded = q.reshape(QUERY_HEAD_GROUPS, BLOCK, BLOCK_HEADDIM)
+    q_expanded = q_expanded.permute(1, 0, 2)
+    q_expanded = tl.expand_dims(q_expanded, 2)
+    q_expanded = tl.broadcast_to(q_expanded, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK_HEADDIM))
+    q_expanded = q_expanded.reshape(BLOCK, 16, BLOCK_HEADDIM)
+
+    block_k_permuted = tl.permute(block_k, (0, 2, 1))
+    block_qk = tl.dot(q_expanded, block_k_permuted)
+
+    block_qk = block_qk.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK)
+    qk = tl.sum(block_qk, 2) / QUERY_EXPAND_DIM
+    qk = qk.permute(1, 0, 2)
+
+    qk += tl.where(block_masks[None, :, None], 0, float("-inf"))
+
+    qk = qk.reshape(QUERY_HEAD_GROUPS * BLOCK, BLOCK)
+
+    p = tl.exp(qk * softmax_scale - lse_i[:, None])
+
+    # take care of block dv
+
+    block_dv = p.to(do.dtype)[:, :, None] * do[:, None, :]
+
+    block_dv = block_dv.reshape(QUERY_HEAD_GROUPS, BLOCK, BLOCK, BLOCK_HEADDIM)
+    block_dv = tl.sum(block_dv, 0)
+
+    tl.atomic_add(block_dv_ptrs, block_dv, sem = 'relaxed')
+
+    # get dp
+
+    do_expanded = do.reshape(QUERY_HEAD_GROUPS, BLOCK, BLOCK_HEADDIM)
+    do_expanded = do_expanded.permute(1, 0, 2)
+    do_expanded = tl.expand_dims(do_expanded, 2)
+    do_expanded = tl.broadcast_to(do_expanded, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK_HEADDIM))
+    do_expanded = do_expanded.reshape(BLOCK, 16, BLOCK_HEADDIM)
+
+    block_v = tl.permute(block_v, (0, 2, 1))
+
+    dp = tl.dot(do_expanded, block_v)
+
+    dp = dp.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK)
+    dp = tl.sum(dp, 2) / QUERY_EXPAND_DIM
+    dp = dp.permute(1, 0, 2)
+    dp = dp.reshape(QUERY_HEAD_GROUPS * BLOCK, BLOCK)
+
+    # ds
+
+    ds = (p * (dp - Di[:, None]) * softmax_scale)
+    ds = ds.to(q.dtype)
+
+    # block dk
+
+    block_dk = ds[:, :, None] * q[:, None, :]
+    block_dk = block_dk.reshape(QUERY_HEAD_GROUPS, BLOCK, BLOCK, BLOCK_HEADDIM)
+    block_dk = tl.sum(block_dk, 0)
+
+    tl.atomic_add(block_dk_ptrs, block_dk, sem = 'relaxed')
+
+    # block dq
+
+    ds_expanded = ds.reshape(QUERY_HEAD_GROUPS, BLOCK, BLOCK)
+    ds_expanded = ds_expanded.permute(1, 0, 2)
+    ds_expanded = tl.expand_dims(ds_expanded, 2)
+    ds_expanded = tl.broadcast_to(ds_expanded, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK))
+    ds_expanded = ds_expanded.reshape(BLOCK, 16, BLOCK)
+
+    block_dq = tl.dot(ds_expanded, block_k)
+
+    block_dq = block_dq.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK_HEADDIM)
+    block_dq = tl.sum(block_dq, 2) / QUERY_EXPAND_DIM
+    block_dq = block_dq.permute(1, 0, 2)
+    block_dq = block_dq.reshape(QUERY_HEAD_GROUPS * BLOCK, BLOCK_HEADDIM)
+
+    dq += block_dq
+
+    # update dq
+
+    dq = dq.reshape(QUERY_HEAD_GROUPS, BLOCK, BLOCK_HEADDIM)
+
+    if EVEN_M & EVEN_HEADDIM:  # Race condition if we just do EVEN_M
+        tl.atomic_add(dq_ptrs, dq, sem = 'relaxed')
+    else:
+        if EVEN_HEADDIM:
+            tl.atomic_add(dq_ptrs, dq, mask=offs_m[None, :, None] < seqlen_q, sem = 'relaxed')
+        else:
+            tl.atomic_add(
+                dq_ptrs,
+                dq,
+                mask = (offs_m[None, :, None] < seqlen_q) & (offs_d[None, None, :] < headdim),
+                sem = 'relaxed',
+            )
+
+@triton.jit
+def backward_kernel_one_col_block_causal(
+    start_n,
+    Q,
+    K,
+    V,
+    kv_block_indices,
+    kv_block_mask,
+    DO,
+    DQ,
+    DK,
+    DV,
+    LSE,
+    D,
+    softmax_scale,
+    stride_qm,
+    stride_kn,
+    stride_vn,
+    stride_dom,
+    stride_dqm,
+    stride_dkn,
+    stride_dvn,
+    stride_kvbl_m,
+    stride_qh,
+    stride_doh,
+    stride_dqh,
+    seqlen_q,
+    seqlen_k,
+    seqlen_q_rounded,
+    headdim,
+    BLOCK_HEADDIM: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    EVEN_HEADDIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+    QUERY_HEAD_GROUPS: tl.constexpr,
+    QUERY_EXPAND_DIM: tl.constexpr,
 ):
     # We need to make sure begin_m is a multiple of BLOCK_M (not BLOCK_N)
 
@@ -780,118 +1118,6 @@ def backward_kernel_one_col_block(
 
     dq += tl.dot(ds, k)
 
-    # handle kv block indices using atomic adds for starters, todo: swap dq and dk/dv loops at some point, semi big refactor
-
-    kv_block_indices_ptrs = (
-        kv_block_indices +
-        offs_m * stride_kvbl_m
-    )
-
-    kv_block_mask_ptrs = (
-        kv_block_mask +
-        offs_m * stride_kvbl_m
-    )
-
-    for off_sel_kv_block in range(NUM_SEL_KV_BLOCKS):
-        block_indices = tl.load(kv_block_indices_ptrs + off_sel_kv_block)
-        block_masks = tl.load(kv_block_mask_ptrs + off_sel_kv_block)
-
-        blocks_offs_n = block_indices[:, None] * BLOCK + tl.arange(0, BLOCK)[None, :]
-
-        block_k_ptrs = (
-            K + blocks_offs_n[:, :, None] * stride_kn + offs_d[None, None, :]
-        )
-
-        block_v_ptrs = (
-            V + blocks_offs_n[:, :, None] * stride_vn + offs_d[None, None, :]
-        )
-
-        block_dv_ptrs = (
-            DV + blocks_offs_n[:, :, None] * stride_dvn + offs_d[None, None, :]
-        )
-
-        block_dk_ptrs = (
-            DK + blocks_offs_n[:, :, None] * stride_dkn + offs_d[None, None, :]
-        )
-
-        block_k = tl.load(block_k_ptrs)
-        block_v = tl.load(block_v_ptrs)
-
-        q_expanded = q.reshape(QUERY_HEAD_GROUPS, BLOCK, BLOCK_HEADDIM)
-        q_expanded = q_expanded.permute(1, 0, 2)
-        q_expanded = tl.expand_dims(q_expanded, 2)
-        q_expanded = tl.broadcast_to(q_expanded, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK_HEADDIM))
-        q_expanded = q_expanded.reshape(BLOCK, 16, BLOCK_HEADDIM)
-
-        block_k_permuted = tl.permute(block_k, (0, 2, 1))
-        block_qk = tl.dot(q_expanded, block_k_permuted)
-
-        block_qk = block_qk.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK)
-        qk = tl.sum(block_qk, 2) / QUERY_EXPAND_DIM
-        qk = qk.permute(1, 0, 2)
-
-        qk += tl.where(block_masks[None, :, None], 0, float("-inf"))
-
-        qk = qk.reshape(QUERY_HEAD_GROUPS * BLOCK, BLOCK)
-
-        p = tl.exp(qk * softmax_scale - lse_i[:, None])
-
-        # take care of block dv
-
-        block_dv = p.to(do.dtype)[:, :, None] * do[:, None, :]
-
-        block_dv = block_dv.reshape(QUERY_HEAD_GROUPS, BLOCK, BLOCK, BLOCK_HEADDIM)
-        block_dv = tl.sum(block_dv, 0)
-
-        tl.atomic_add(block_dv_ptrs, block_dv, sem = 'relaxed')
-
-        # get dp
-
-        do_expanded = do.reshape(QUERY_HEAD_GROUPS, BLOCK, BLOCK_HEADDIM)
-        do_expanded = do_expanded.permute(1, 0, 2)
-        do_expanded = tl.expand_dims(do_expanded, 2)
-        do_expanded = tl.broadcast_to(do_expanded, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK_HEADDIM))
-        do_expanded = do_expanded.reshape(BLOCK, 16, BLOCK_HEADDIM)
-
-        block_v = tl.permute(block_v, (0, 2, 1))
-
-        dp = tl.dot(do_expanded, block_v)
-
-        dp = dp.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK)
-        dp = tl.sum(dp, 2) / QUERY_EXPAND_DIM
-        dp = dp.permute(1, 0, 2)
-        dp = dp.reshape(QUERY_HEAD_GROUPS * BLOCK, BLOCK)
-
-        # ds
-
-        ds = (p * (dp - Di[:, None]) * softmax_scale)
-        ds = ds.to(q.dtype)
-
-        # block dk
-
-        block_dk = ds[:, :, None] * q[:, None, :]
-        block_dk = block_dk.reshape(QUERY_HEAD_GROUPS, BLOCK, BLOCK, BLOCK_HEADDIM)
-        block_dk = tl.sum(block_dk, 0)
-
-        tl.atomic_add(block_dk_ptrs, block_dk, sem = 'relaxed')
-
-        # block dq
-
-        ds_expanded = ds.reshape(QUERY_HEAD_GROUPS, BLOCK, BLOCK)
-        ds_expanded = ds_expanded.permute(1, 0, 2)
-        ds_expanded = tl.expand_dims(ds_expanded, 2)
-        ds_expanded = tl.broadcast_to(ds_expanded, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK))
-        ds_expanded = ds_expanded.reshape(BLOCK, 16, BLOCK)
-
-        block_dq = tl.dot(ds_expanded, block_k)
-
-        block_dq = block_dq.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK_HEADDIM)
-        block_dq = tl.sum(block_dq, 2) / QUERY_EXPAND_DIM
-        block_dq = block_dq.permute(1, 0, 2)
-        block_dq = block_dq.reshape(QUERY_HEAD_GROUPS * BLOCK, BLOCK_HEADDIM)
-
-        dq += block_dq
-
     # update dq
 
     dq = dq.reshape(QUERY_HEAD_GROUPS, BLOCK, BLOCK_HEADDIM)
@@ -908,11 +1134,6 @@ def backward_kernel_one_col_block(
                 mask = (offs_m[None, :, None] < seqlen_q) & (offs_d[None, None, :] < headdim),
                 sem = 'relaxed',
             )
-
-    # # increment pointers
-    # dq_ptrs += BLOCK * stride_dqm
-    # q_ptrs += BLOCK * stride_qm
-    # do_ptrs += BLOCK * stride_dom
 
     # write-back
 
@@ -1022,8 +1243,9 @@ def backward_kernel(
     )
 
     num_block_n = tl.cdiv(seqlen_k, BLOCK)
+
     for start_n in range(0, num_block_n):
-        backward_kernel_one_col_block(
+        backward_kernel_one_col_block_causal(
             start_n,
             Q,
             K,
@@ -1059,8 +1281,47 @@ def backward_kernel(
             BLOCK = BLOCK,
             QUERY_HEAD_GROUPS = QUERY_HEAD_GROUPS,
             QUERY_EXPAND_DIM = QUERY_EXPAND_DIM,
-            NUM_SEL_KV_BLOCKS = NUM_SEL_KV_BLOCKS
         )
+
+        for off_sel_kv_blocks in range(NUM_SEL_KV_BLOCKS):
+            backward_kernel_one_col_block_sparse(
+                start_n,
+                Q,
+                K,
+                V,
+                kv_block_indices,
+                kv_block_mask,
+                DO,
+                DQ,
+                DK,
+                DV,
+                LSE,
+                D,
+                softmax_scale,
+                stride_qm,
+                stride_kn,
+                stride_vn,
+                stride_dom,
+                stride_dqm,
+                stride_dkn,
+                stride_dvn,
+                stride_kvbl_m,
+                stride_qh,
+                stride_doh,
+                stride_dqh,
+                seqlen_q,
+                seqlen_k,
+                seqlen_q_rounded,
+                headdim,
+                BLOCK_HEADDIM = BLOCK_HEADDIM,
+                EVEN_M = EVEN_M,
+                EVEN_N = EVEN_N,
+                EVEN_HEADDIM = EVEN_HEADDIM,
+                BLOCK = BLOCK,
+                QUERY_HEAD_GROUPS = QUERY_HEAD_GROUPS,
+                QUERY_EXPAND_DIM = QUERY_EXPAND_DIM,
+                OFF_SEL_KV_BLOCKS = off_sel_kv_blocks
+            )
 
 def native_sparse_attn_backward(
     do,
