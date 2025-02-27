@@ -34,7 +34,7 @@ KV_HEADS = 4
 USE_SPARSE_ATTN = True
 USE_TRITON_NSA = True
 USE_FLEX_FOR_FINE_SELECTION = False   # will push flex a bit, won't be efficient as each layer needs sparsity dynmically generated, but may be enough just to compare to full attention before going all-in on triton kernels
-QUERY_HEADS_SHARE_SELECTION = False  # if set to False, each query head can look at a different segment of their corresponding key / value head in GQA
+QUERY_HEADS_SHARE_SELECTION = True    # if set to False, each query head can look at a different segment of their corresponding key / value head in GQA
 
 # sparse attention related
 
@@ -99,7 +99,11 @@ def base_decoding(
     sample_num_times = max(0, seq_len - prompt_seq_len)
 
     for _ in tqdm(range(sample_num_times)):
-        logits = net(out, disable_flex = True)
+        logits = net(
+            out,
+            disable_flex = True,
+            disable_triton_kernel = True
+        )
 
         logits = logits[:, -1]
         logits = top_k(logits, thres = filter_thres)

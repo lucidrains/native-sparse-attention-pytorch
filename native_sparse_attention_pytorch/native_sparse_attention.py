@@ -443,6 +443,7 @@ class SparseAttention(Module):
                 gates = repeat(gates, 'b h ... -> b (h qh) ...', qh = fine_num_grouped_queries)
 
             if self.use_triton_kernel and not disable_triton_kernel:
+
                 from native_sparse_attention_pytorch.triton_native_sparse_attention import native_sparse_attend
 
                 fmask = selected_importance_values > 1e-10

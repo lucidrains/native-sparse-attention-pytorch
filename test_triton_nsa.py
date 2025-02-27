@@ -27,7 +27,6 @@ def regular_attend(
     assert divisible_by(q_heads, kv_heads)
 
     q, k, v = tuple(pad_to_multiple(t, block_size, dim = -2) for t in (q, k, v))
-    indices, mask = tuple(pad_to_multiple(t, block_size, dim = -2) for t in (indices, mask))
 
     g = q_heads // kv_heads # `g` stands for `g`roups of query heads per kv head
 
@@ -52,6 +51,8 @@ def regular_attend(
     has_sel_kv_blocks = num_sel_kv_blocks > 0
 
     if has_sel_kv_blocks:
+        indices, mask = tuple(pad_to_multiple(t, block_size, dim = -2) for t in (indices, mask))
+
         bk, bv = k, v
         sel_bk = einx.get_at('b h [w] n d, b h i sel -> b h i (sel n) d', bk, indices)
         sel_bv = einx.get_at('b h [w] n d, b h i sel -> b h i (sel n) d', bv, indices)
@@ -99,18 +100,19 @@ def regular_attend(
 
 # mock inputs
 
+batch = 2
 seq_len = 511
 q_heads = 4
-kv_heads = 2
+kv_heads = 4
 fine_block_size = 16
-num_sel = 1
+num_sel = 2
 
-q = torch.randn(2, q_heads, seq_len, 64).cuda()
-k = torch.randn(2, kv_heads, seq_len, 64).cuda()
-v = torch.randn(2, kv_heads, seq_len, 64).cuda()
+q = torch.randn(batch, q_heads, seq_len, 64).cuda()
+k = torch.randn(batch, kv_heads, seq_len, 64).cuda()
+v = torch.randn(batch, kv_heads, seq_len, 64).cuda()
 
-indices = torch.zeros(2, kv_heads, seq_len, num_sel).long().cuda()
-mask = torch.randint(0, 2, (2, kv_heads, seq_len, num_sel)).bool().cuda()
+indices = torch.zeros(batch, kv_heads, seq_len, num_sel).long().cuda()
+mask = torch.randint(0, 2, (batch, kv_heads, seq_len, num_sel)).bool().cuda()
 
 # both regular and nsa pathways `r` and `n`
 

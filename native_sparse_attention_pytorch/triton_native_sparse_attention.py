@@ -578,7 +578,6 @@ def backward_kernel_one_col_block(
     seqlen_k,
     seqlen_q_rounded,
     headdim,
-    ATOMIC_ADD: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
     EVEN_M: tl.constexpr,
     EVEN_N: tl.constexpr,
@@ -1053,7 +1052,6 @@ def backward_kernel(
             seqlen_k,
             seqlen_q_rounded,
             headdim,
-            ATOMIC_ADD = False,
             BLOCK_HEADDIM = BLOCK_HEADDIM,
             EVEN_M = EVEN_M,
             EVEN_N = EVEN_N,
@@ -1263,6 +1261,15 @@ def native_sparse_attend(
     return_lse = False
 ):
     seq_len = fq.shape[-2]
+    q_heads, kv_heads, sel_heads = fq.shape[1], fk.shape[1], selected_block_indices.shape[1]
+
+    assert divisible_by(q_heads, kv_heads)
+    assert sel_heads in (q_heads, kv_heads)
+
+    # query heads within each group to attend to different segments
+
+    if kv_heads != sel_heads:
+        fk, fv = tuple(repeat(t, 'b h ... -> b (h gh) ...', gh = q_heads // kv_heads) for t in (fk, fv))
 
     out, lse = _native_sparse_attend(
         fq, fk, fv,
