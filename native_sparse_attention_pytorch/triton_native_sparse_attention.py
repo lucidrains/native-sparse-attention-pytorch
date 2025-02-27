@@ -1477,8 +1477,8 @@ def native_sparse_attend(
     fk: Float['b kh n d'],
     fv: Float['b kh n d'],
     block_size: int,
-    selected_block_indices: Int['b qh sel'] | Int['b kh sel'],
-    fmask: Bool['b qh sel'] | Bool['b kh sel'],
+    selected_block_indices: Int['b qh n sel'] | Int['b kh n sel'],
+    fmask: Bool['b qh n sel'] | Bool['b kh n sel'],
     return_lse = False
 ):
     seq_len = fq.shape[-2]
