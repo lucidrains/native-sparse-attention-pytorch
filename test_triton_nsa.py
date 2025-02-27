@@ -111,7 +111,7 @@ q = torch.randn(batch, q_heads, seq_len, 64).cuda()
 k = torch.randn(batch, kv_heads, seq_len, 64).cuda()
 v = torch.randn(batch, kv_heads, seq_len, 64).cuda()
 
-indices = torch.zeros(batch, kv_heads, seq_len, num_sel).long().cuda()
+indices = torch.randint(0, 2, (batch, kv_heads, seq_len, num_sel)).cuda()
 mask = torch.randint(0, 2, (batch, kv_heads, seq_len, num_sel)).bool().cuda()
 
 # both regular and nsa pathways `r` and `n`

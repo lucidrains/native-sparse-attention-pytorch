@@ -1208,12 +1208,14 @@ def backward_kernel(
     BLOCK: tl.constexpr,
     QUERY_HEAD_GROUPS: tl.constexpr,
     QUERY_EXPAND_DIM: tl.constexpr,
-    NUM_SEL_KV_BLOCKS: tl.constexpr
 ):
     off_hb = tl.program_id(1)
     off_b = off_hb // kv_heads
     off_h = off_hb % kv_heads
     off_qh = off_h * QUERY_HEAD_GROUPS
+
+    IS_CAUSAL = tl.program_id(0) == 0
+    OFF_SEL_KV_BLOCKS = tl.program_id(0) - 1
 
     # offset pointers for batch/head
 
@@ -1244,46 +1246,47 @@ def backward_kernel(
 
     num_block_n = tl.cdiv(seqlen_k, BLOCK)
 
-    for start_n in range(0, num_block_n):
-        backward_kernel_one_col_block_causal(
-            start_n,
-            Q,
-            K,
-            V,
-            kv_block_indices,
-            kv_block_mask,
-            DO,
-            DQ,
-            DK,
-            DV,
-            LSE,
-            D,
-            softmax_scale,
-            stride_qm,
-            stride_kn,
-            stride_vn,
-            stride_dom,
-            stride_dqm,
-            stride_dkn,
-            stride_dvn,
-            stride_kvbl_m,
-            stride_qh,
-            stride_doh,
-            stride_dqh,
-            seqlen_q,
-            seqlen_k,
-            seqlen_q_rounded,
-            headdim,
-            BLOCK_HEADDIM = BLOCK_HEADDIM,
-            EVEN_M = EVEN_M,
-            EVEN_N = EVEN_N,
-            EVEN_HEADDIM = EVEN_HEADDIM,
-            BLOCK = BLOCK,
-            QUERY_HEAD_GROUPS = QUERY_HEAD_GROUPS,
-            QUERY_EXPAND_DIM = QUERY_EXPAND_DIM,
-        )
-
-        for off_sel_kv_blocks in range(NUM_SEL_KV_BLOCKS):
+    if IS_CAUSAL:
+        for start_n in range(0, num_block_n):
+            backward_kernel_one_col_block_causal(
+                start_n,
+                Q,
+                K,
+                V,
+                kv_block_indices,
+                kv_block_mask,
+                DO,
+                DQ,
+                DK,
+                DV,
+                LSE,
+                D,
+                softmax_scale,
+                stride_qm,
+                stride_kn,
+                stride_vn,
+                stride_dom,
+                stride_dqm,
+                stride_dkn,
+                stride_dvn,
+                stride_kvbl_m,
+                stride_qh,
+                stride_doh,
+                stride_dqh,
+                seqlen_q,
+                seqlen_k,
+                seqlen_q_rounded,
+                headdim,
+                BLOCK_HEADDIM = BLOCK_HEADDIM,
+                EVEN_M = EVEN_M,
+                EVEN_N = EVEN_N,
+                EVEN_HEADDIM = EVEN_HEADDIM,
+                BLOCK = BLOCK,
+                QUERY_HEAD_GROUPS = QUERY_HEAD_GROUPS,
+                QUERY_EXPAND_DIM = QUERY_EXPAND_DIM,
+            )
+    else:
+        for start_n in range(0, num_block_n):
             backward_kernel_one_col_block_sparse(
                 start_n,
                 Q,
@@ -1320,7 +1323,7 @@ def backward_kernel(
                 BLOCK = BLOCK,
                 QUERY_HEAD_GROUPS = QUERY_HEAD_GROUPS,
                 QUERY_EXPAND_DIM = QUERY_EXPAND_DIM,
-                OFF_SEL_KV_BLOCKS = off_sel_kv_blocks
+                OFF_SEL_KV_BLOCKS = OFF_SEL_KV_BLOCKS
             )
 
 def native_sparse_attn_backward(
@@ -1383,7 +1386,7 @@ def native_sparse_attn_backward(
         BLOCK_HEADDIM = BLOCK_HEADDIM,
     )
 
-    grid = lambda META: (1, batch * kv_heads)
+    grid = lambda META: (num_sel_fine_blocks + 1, batch * kv_heads)
 
     backward_kernel[grid](
         q,
@@ -1437,7 +1440,6 @@ def native_sparse_attn_backward(
         BLOCK = block_size,
         QUERY_HEAD_GROUPS = head_groups,
         QUERY_EXPAND_DIM = 16 // head_groups,
-        NUM_SEL_KV_BLOCKS = num_sel_fine_blocks,
         EVEN_M = divisible_by(seqlen_q, block_size),
         EVEN_N = divisible_by(seqlen_k, block_size),
         EVEN_HEADDIM = BLOCK_HEADDIM == dim
