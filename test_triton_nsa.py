@@ -103,9 +103,9 @@ def regular_attend(
 batch = 2
 seq_len = 511
 q_heads = 4
-kv_heads = 4
+kv_heads = 2
 fine_block_size = 16
-num_sel = 4
+num_sel = 6
 
 q = torch.randn(batch, q_heads, seq_len, 64).cuda()
 k = torch.randn(batch, kv_heads, seq_len, 64).cuda()
