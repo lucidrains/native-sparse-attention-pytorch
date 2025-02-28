@@ -137,3 +137,5 @@ assert torch.allclose(rlse, nlse, atol = 1e-2)
 assert torch.allclose(nv.grad, rv.grad, atol = 1e-2)
 assert torch.allclose(nk.grad, rk.grad, atol = 1e-2)
 assert torch.allclose(nq.grad, rq.grad, atol = 1e-2)
+
+print('✅ outputs and gradients are same between pytorch native sparse attn and triton native sparse attn')

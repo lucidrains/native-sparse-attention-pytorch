@@ -129,8 +129,8 @@ def forward_kernel(
     q_ptrs = (
         Q +
         off_b * stride_qb +
-        offs_qh[:, None, None] * stride_qh +
-        offs_m[None, :, None] * stride_qm +
+        offs_qh[None, :, None] * stride_qh +
+        offs_m[:, None, None] * stride_qm +
         offs_d[None, None, :]
     )
 
@@ -152,30 +152,30 @@ def forward_kernel(
 
     # maximum
 
-    m_i = tl.zeros([BLOCK * QUERY_HEAD_GROUPS], dtype = tl.float32) - float("inf")
+    m_i = tl.zeros([BLOCK, QUERY_HEAD_GROUPS], dtype = tl.float32) - float("inf")
 
     # lse
 
     lse_ptrs = (
         Lse +
         off_b * stride_lse_b +
-        offs_qh[:, None] * seqlen_q_rounded +
-        offs_m[None, :]
+        offs_qh[None, :] * seqlen_q_rounded +
+        offs_m[:, None]
     )
 
-    lse_i = tl.zeros([BLOCK * QUERY_HEAD_GROUPS], dtype = tl.float32) - float("inf")
+    lse_i = tl.zeros([BLOCK, QUERY_HEAD_GROUPS], dtype = tl.float32) - float("inf")
 
     # output
 
     out_ptrs = (
         Out +
         off_b * stride_ob +
-        offs_qh[:, None, None] * stride_oh +
-        offs_m[None, :, None] * stride_om +
+        offs_qh[None, :, None] * stride_oh +
+        offs_m[:, None, None] * stride_om +
         offs_d[None, None, :]
     )
 
-    acc_o = tl.zeros([QUERY_HEAD_GROUPS * BLOCK, BLOCK_HEADDIM], dtype = tl.float32)
+    acc_o = tl.zeros([BLOCK,  QUERY_HEAD_GROUPS, BLOCK_HEADDIM], dtype = tl.float32)
 
     # load queries, keys, values
 
@@ -183,16 +183,24 @@ def forward_kernel(
         if EVEN_HEADDIM:
             q = tl.load(q_ptrs)
         else:
-            q = tl.load(q_ptrs, mask=offs_d[None, None, :] < headdim, other=0.0)
+            q = tl.load(
+                q_ptrs,
+                mask = offs_d[None, None, :] < headdim,
+                other = 0.0
+            )
     else:
         if EVEN_HEADDIM:
-            q = tl.load(q_ptrs, mask=offs_m[None, :, None] < seqlen_q, other=0.0)
+            q = tl.load(
+                q_ptrs,
+                mask = offs_m[:, None, None] < seqlen_q,
+                other = 0.0
+            )
         else:
             q = tl.load(
-                q_ptrs, mask=(offs_m[None, :, None] < seqlen_q) & (offs_d[None, None, :] < headdim), other=0.0
+                q_ptrs,
+                mask = (offs_m[:, None, None] < seqlen_q) & (offs_d[None, None, :] < headdim),
+                other = 0.0
             )
-
-    q = q.reshape([QUERY_HEAD_GROUPS * BLOCK, BLOCK_HEADDIM])
 
     if EVEN_N & EVEN_M:
         if EVEN_HEADDIM:
@@ -203,57 +211,67 @@ def forward_kernel(
         if EVEN_HEADDIM:
             k = tl.load(
                 k_ptrs,
-                mask=offs_n[:, None] < seqlen_k,
-                other=0.0,
+                mask = offs_n[:, None] < seqlen_k,
+                other = 0.0,
             )
         else:
             k = tl.load(
                 k_ptrs,
-                mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
-                other=0.0,
+                mask = (offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
+                other = 0.0,
             )
 
-    qk = tl.zeros([QUERY_HEAD_GROUPS * BLOCK, BLOCK], dtype=tl.float32)
+    qk = tl.zeros([BLOCK * QUERY_HEAD_GROUPS, BLOCK], dtype=tl.float32)
+
+    q = q.reshape(BLOCK * QUERY_HEAD_GROUPS, BLOCK_HEADDIM)
+
     qk += tl.dot(q, tl.trans(k))
+
+    qk = qk.reshape(BLOCK, QUERY_HEAD_GROUPS, BLOCK)
 
     if not EVEN_N:
         qk += tl.where(offs_n[None, :] < seqlen_k, 0, float("-inf"))
 
-    qk = qk.reshape([QUERY_HEAD_GROUPS, BLOCK, BLOCK])
+    qk = qk.reshape(BLOCK, QUERY_HEAD_GROUPS, BLOCK)
 
-    qk += tl.where(offs_m[:, None] >= offs_n[None, :], 0, float("-inf"))
+    qk += tl.where(offs_m[:, None, None] >= offs_n[None, None, :], 0, float("-inf"))
 
-    qk = qk.reshape([QUERY_HEAD_GROUPS * BLOCK, BLOCK])
+    m_ij = tl.maximum(tl.max(qk, 2) * softmax_scale, lse_i)
+    p = tl.exp(qk * softmax_scale - m_ij[:, :, None])
 
-    m_ij = tl.maximum(tl.max(qk, 1) * softmax_scale, lse_i)
-    p = tl.exp(qk * softmax_scale - m_ij[:, None])
-
-    l_ij = tl.sum(p, 1)
+    l_ij = tl.sum(p, 2)
 
     acc_o_scale = tl.exp(m_i - m_ij)
-    acc_o *= acc_o_scale[:, None]
+    acc_o *= acc_o_scale[:, :, None]
 
     if EVEN_N & EVEN_M:
         if EVEN_HEADDIM:
             v = tl.load(v_ptrs)
         else:
-            v = tl.load(v_ptrs, mask=offs_d[None, :] < headdim, other=0.0)
+            v = tl.load(
+                v_ptrs,
+                mask = offs_d[None, :] < headdim,
+                other = 0.0
+            )
     else:
         if EVEN_HEADDIM:
             v = tl.load(
                 v_ptrs,
-                mask=offs_n[:, None] < seqlen_k,
-                other=0.0,
+                mask = offs_n[:, None] < seqlen_k,
+                other = 0.0,
             )
         else:
             v = tl.load(
                 v_ptrs,
-                mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
-                other=0.0,
+                mask = (offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
+                other = 0.0,
             )
 
-    p = p.to(v.dtype)
-    acc_o += tl.dot(p, v)
+    p = p.reshape(BLOCK * QUERY_HEAD_GROUPS, BLOCK).to(v.dtype)
+
+    causal_o = tl.dot(p, v)
+
+    acc_o += causal_o.reshape(BLOCK, QUERY_HEAD_GROUPS, BLOCK_HEADDIM)
 
     # -- update statistics
 
@@ -261,7 +279,7 @@ def forward_kernel(
     l_i_new = tl.exp(lse_i - m_ij) + l_ij
     lse_i = m_ij + tl.log(l_i_new)
 
-    # take care of the selected kv blocks
+    # # take care of the selected kv blocks
 
     kv_block_indices_ptrs = (
         kv_block_indices +
@@ -277,8 +295,7 @@ def forward_kernel(
         offs_m * stride_kvbl_m
     )
 
-    q = q.reshape(QUERY_HEAD_GROUPS, BLOCK, BLOCK_HEADDIM)
-    q = q.permute((1, 0, 2))
+    q = q.reshape(BLOCK, QUERY_HEAD_GROUPS, BLOCK_HEADDIM)
     q = tl.expand_dims(q, 2)
     q = tl.broadcast_to(q, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK_HEADDIM))
     q = q.reshape(BLOCK, 16, BLOCK_HEADDIM)
@@ -290,11 +307,19 @@ def forward_kernel(
         blocks_offs_n = block_indices[:, None] * BLOCK + tl.arange(0, BLOCK)[None, :]
 
         block_k_ptrs = (
-            K + off_b * stride_kb + off_h * stride_kh + (blocks_offs_n[:, :, None] * stride_kn + offs_d[None, None, :])
+            K +
+            off_b * stride_kb +
+            off_h * stride_kh +
+            blocks_offs_n[:, :, None] * stride_kn +
+            offs_d[None, None, :]
         )
 
         block_v_ptrs = (
-            V + off_b * stride_vb + off_h * stride_vh + (blocks_offs_n[:, :, None] * stride_vn + offs_d[None, None, :])
+            V +
+            off_b * stride_vb +
+            off_h * stride_vh + 
+            blocks_offs_n[:, :, None] * stride_vn +
+            offs_d[None, None, :]
         )
 
         # load k of shape (m, n, d), sparsely selected by each query
@@ -304,41 +329,37 @@ def forward_kernel(
         # similarities
 
         block_qk = tl.zeros([BLOCK, 16, BLOCK], dtype = tl.float32)
-        qk = tl.zeros([QUERY_HEAD_GROUPS, BLOCK, BLOCK], dtype = tl.float32)
+        qk = tl.zeros([BLOCK, QUERY_HEAD_GROUPS, BLOCK], dtype = tl.float32)
 
         k_block = k_block.reshape(BLOCK, BLOCK, BLOCK_HEADDIM)
         k_block = k_block.permute(0, 2, 1)
 
-        block_qk = tl.dot(q, k_block)
+        block_qk += tl.dot(q, k_block)
         block_qk = block_qk.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK)
         block_qk = tl.sum(block_qk, 2) / QUERY_EXPAND_DIM
-        block_qk = block_qk.permute(1, 0, 2)
 
         qk += block_qk
-        qk += tl.where(block_masks[:, None], 0, float("-inf"))
-
-        qk = qk.reshape(QUERY_HEAD_GROUPS * BLOCK, BLOCK)
+        qk += tl.where(block_masks[:, None, None], 0, float("-inf"))
 
         # attention
 
-        m_ij = tl.maximum(tl.max(qk, 1) * softmax_scale, lse_i)
-        p = tl.exp(qk * softmax_scale - m_ij[:, None])
+        m_ij = tl.maximum(tl.max(qk, 2) * softmax_scale, lse_i)
+        block_p = tl.exp(qk * softmax_scale - m_ij[:, :, None])
 
-        l_ij = tl.sum(p, 1)
+        l_ij = tl.sum(block_p, 2)
 
         # renormalize the running output
 
         acc_o_scale = tl.exp(m_i - m_ij)
-        acc_o = acc_o * acc_o_scale[:, None]
+        acc_o = acc_o * acc_o_scale[:, :, None]
 
         # aggregate values
 
         v_block = tl.load(block_v_ptrs)
         v_block = tl.reshape(v_block, (BLOCK, BLOCK, BLOCK_HEADDIM))
 
-        p = p.to(v_block.dtype)
-        p_expanded = p.reshape(QUERY_HEAD_GROUPS, BLOCK, BLOCK)
-        p_expanded = p_expanded.permute(1, 0, 2)
+        block_p = block_p.to(v_block.dtype)
+        p_expanded = block_p.reshape(BLOCK, QUERY_HEAD_GROUPS, BLOCK)
         p_expanded = tl.expand_dims(p_expanded, 2)
         p_expanded = tl.broadcast_to(p_expanded, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK))
         p_expanded = p_expanded.reshape(BLOCK, 16, BLOCK)
@@ -346,8 +367,6 @@ def forward_kernel(
         block_acc_o = tl.dot(p_expanded, v_block)
         block_acc_o = block_acc_o.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK_HEADDIM)
         block_acc_o = tl.sum(block_acc_o, 2) / QUERY_EXPAND_DIM
-        block_acc_o = block_acc_o.permute(1, 0, 2)
-        block_acc_o = block_acc_o.reshape(QUERY_HEAD_GROUPS * BLOCK, BLOCK_HEADDIM)
 
         acc_o += block_acc_o
 
@@ -360,28 +379,38 @@ def forward_kernel(
     # normalize accumulated out
 
     acc_o_scale = tl.exp(m_i - lse_i)
-    acc_o *= acc_o_scale[:, None]
+    acc_o *= acc_o_scale[:, :, None]
 
     # write back lse
 
-    lse_i = lse_i.reshape([QUERY_HEAD_GROUPS, BLOCK])
-    tl.store(lse_ptrs, lse_i, mask = offs_m[None, :] < seqlen_q)
+    lse_i = lse_i.reshape(BLOCK, QUERY_HEAD_GROUPS)
+    tl.store(lse_ptrs, lse_i, mask = offs_m[:, None] < seqlen_q)
 
     # write to output
 
-    acc_o = acc_o.reshape([QUERY_HEAD_GROUPS, BLOCK, BLOCK_HEADDIM])
+    acc_o = acc_o.reshape(BLOCK, QUERY_HEAD_GROUPS, BLOCK_HEADDIM)
 
     if EVEN_M:
         if EVEN_HEADDIM:
             tl.store(out_ptrs, acc_o)
         else:
-            tl.store(out_ptrs, acc_o, mask=offs_d[None, None, :] < headdim)
+            tl.store(
+                out_ptrs,
+                acc_o,
+                mask = offs_d[None, None, :] < headdim
+            )
     else:
         if EVEN_HEADDIM:
-            tl.store(out_ptrs, acc_o, mask=offs_m[None, :, None] < seqlen_q)
+            tl.store(
+                out_ptrs,
+                acc_o,
+                mask = offs_m[:, None, None] < seqlen_q
+            )
         else:
             tl.store(
-                out_ptrs, acc_o, mask=(offs_m[None, :, None] < seqlen_q) & (offs_d[None, None, :] < headdim)
+                out_ptrs,
+                acc_o,
+                mask = (offs_m[:, None, None] < seqlen_q) & (offs_d[None, None, :] < headdim)
             )
 
 def native_sparse_attn_forward(
