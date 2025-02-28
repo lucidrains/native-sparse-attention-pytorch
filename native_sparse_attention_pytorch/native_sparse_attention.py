@@ -315,13 +315,121 @@ class SparseAttention(Module):
 
         self.combine_heads = nn.Linear(dim_inner, dim, bias = False)
 
+    def forward_inference(
+        self,
+        inp,
+        cache,
+        return_cache = True
+    ):
+        # destruct cache
+
+        (cache_k, cache_v), (cache_ck, cache_cv) = cache
+
+        # variables
+
+        batch, scale, heads, device = inp.shape[0], self.scale, self.heads, inp.device
+        seq_len = cache_k.shape[-2] + 1
+
+        sliding_window = self.sliding_window_size
+        compress_divisible_seq_len = round_down_mult(seq_len, self.compress_block_size)
+        num_compress_blocks = compress_divisible_seq_len // self.compress_block_size
+
+        fine_divisible_seq_len = round_up_mult(seq_len, self.selection_block_size)
+        num_fine_blocks = fine_divisible_seq_len // self.selection_block_size
+
+        # maybe prenorm
+
+        inp = self.norm(inp)
+
+        # queries, keys, values
+
+        q, k, v = self.to_qkv(inp).split(self.qkv_split, dim = -1)
+
+        q, k, v = map(self.split_heads, (q, k, v))
+
+        # handle cache
+
+        k = cat((cache_k, k), dim = -2)
+        v = cat((cache_v, v), dim = -2)
+
+        if return_cache:
+            cache_kv = (k, v)
+
+        # 1. compressed attn inference
+
+        cq = q
+        ck = cache_ck
+        cv = cache_cv
+
+        if divisible_by(seq_len, self.compress_block_size):
+            k_compress_input = self.split_compress_window(k[..., -self.compress_block_size:, :] + self.k_intrablock_positions)
+            v_compress_input = self.split_compress_window(v[..., -self.compress_block_size:, :] + self.v_intrablock_positions)
+
+            next_ck = self.k_compress(k_compress_input)
+            next_cv = self.v_compress(v_compress_input)
+
+            ck = cat((ck, next_ck), dim = -2)
+            cv = cat((cv, next_cv), dim = -2)
+
+        if return_cache:
+            cache_compressed_kv = (ck, cv)
+
+        ck = repeat(ck, 'b h ... -> b (h gh) ...', gh = self.num_grouped_queries)
+        cv = repeat(cv, 'b h ... -> b (h gh) ...', gh = self.num_grouped_queries)
+
+        csim = einsum(q, ck, 'b h i d, b h j d -> b h i j') * scale
+        cattn = csim.softmax(dim = -1)
+
+        compressed_attn_out = einsum(cattn, cv, 'b h i j, b h j d -> b h i d')
+
+        # 2. fine attention inference (todo)
+
+        # not implemented
+
+        # 3. sliding window
+
+        k = repeat(k, 'b h ... -> b (h gh) ...', gh = self.num_grouped_queries)
+        v = repeat(v, 'b h ... -> b (h gh) ...', gh = self.num_grouped_queries)
+
+        sliding_slice = (Ellipsis, slice(-(sliding_window + 1), None), slice(None))
+        rotated_q, rotated_k = self.rotary_emb.rotate_queries_with_cached_keys(q, k[sliding_slice])
+
+        sim = einsum(rotated_q, rotated_k, 'b h i d, b h j d -> b h i j') * scale
+        attn = sim.softmax(dim = -1)
+        sliding_window_attn_out = einsum(attn, v[sliding_slice], 'b h i j, b h j d -> b h i d')
+
+        # combine strategies
+
+        strategy_weighted_combine = self.to_strategy_combine(inp)
+
+        out = einsum(strategy_weighted_combine, stack([compressed_attn_out, sliding_window_attn_out, sliding_window_attn_out]), 'b h n s, s b h n d -> b h n d')
+
+        # merge heads and combine them
+
+        out = self.merge_heads(out)
+
+        out = self.combine_heads(out)
+
+        if not return_cache:
+            return out
+
+        return out, (cache_kv, cache_compressed_kv)
+
     def forward(
         self,
         inp,
+        cache = None,
         disable_triton_kernel = False,
         sliding_window_flex_mask = None,
-        fine_selection_flex_mask = None
+        fine_selection_flex_mask = None,
+        return_cache = False
     ):
+        is_inferencing = exists(cache)
+
+        if is_inferencing:
+            assert inp.shape[1] == 1, 'input must be single tokens if inferencing with cache key values'
+            return self.forward_inference(inp, cache, return_cache = return_cache)
+
         batch, seq_len, scale, heads, device = *inp.shape[:2], self.scale, self.heads, inp.device
 
         compress_divisible_seq_len = round_down_mult(seq_len, self.compress_block_size)
@@ -340,6 +448,11 @@ class SparseAttention(Module):
 
         q, k, v = map(self.split_heads, (q, k, v))
 
+        # handle cache
+
+        if return_cache:
+            cache_kv = (k, v)
+
         # compressed key / values - variables prepended with `c` stands for compressed
 
         k_pos = repeat(self.k_intrablock_positions, 'h n d -> h (r n) d', r = num_compress_blocks)
@@ -351,6 +464,9 @@ class SparseAttention(Module):
         cq = q
         ck = self.k_compress(k_compress_input)   # Equation (7) of the Native Sparse Attention paper
         cv = self.v_compress(v_compress_input)
+
+        if return_cache:
+            cache_compressed_kv = (ck, cv)
 
         # 1. coarse attention over compressed
 
@@ -570,4 +686,9 @@ class SparseAttention(Module):
 
         out = self.merge_heads(out)
 
-        return self.combine_heads(out)
+        out = self.combine_heads(out)
+
+        if not return_cache:
+            return out
+
+        return out, (cache_kv, cache_compressed_kv)

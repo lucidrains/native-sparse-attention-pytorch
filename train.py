@@ -47,6 +47,8 @@ NUM_FINE_SELECTED = 4
 INTERPOLATED_IMPORTANCE_SCORE = False
 USE_DIFF_TOPK = True
 
+USE_EFFICIENT_INFERENCE = False # fine attn inference logic still needs implementing
+
 # experiment related
 
 PROJECT_NAME = 'native-sparse-attention'
@@ -187,7 +189,11 @@ for i in tqdm(range(NUM_BATCHES), mininterval = 10.0, desc = "training"):
 
         prompt = inp[None, ...]
 
-        sampled = model.sample(prompt, GENERATE_LENGTH)
+        sampled = model.sample(
+            prompt,
+            GENERATE_LENGTH,
+            use_cache_kv = USE_EFFICIENT_INFERENCE
+        )
 
         base_decode_output = decode_tokens(sampled[0])
 

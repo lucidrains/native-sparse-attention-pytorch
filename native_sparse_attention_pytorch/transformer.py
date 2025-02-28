@@ -200,22 +200,30 @@ class Transformer(Module):
         self.norm = RMSNorm(dim)
         self.to_logits = Linear(dim, num_tokens, bias = False)
  
+    @torch.no_grad()
     def sample(
         self,
         prompt: Tensor,
         seq_len: int,
         temperature = 1.,
         filter_thres = 0.9,
+        use_cache_kv = False
     ):
         prompt_seq_len, out = prompt.shape[-1], prompt.clone()
         sample_num_times = max(0, seq_len - prompt_seq_len)
 
+        cache = None
+
         for _ in tqdm(range(sample_num_times)):
-            logits = self.forward(
+
+            logits, next_cache = self.forward(
                 out,
-                disable_flex = True,
-                disable_triton_kernel = True
+                cache = cache,
+                return_cache = True
             )
+
+            if use_cache_kv:
+                cache = next_cache
 
             logits = logits[:, -1]
             logits = top_k(logits, thres = filter_thres)
@@ -225,13 +233,28 @@ class Transformer(Module):
 
         return out[..., prompt_seq_len:]
 
+    def forward_inference(
+        self,
+        ids,
+        cache = None
+    ):
+        return ids
+
     def forward(
         self,
         ids,
         return_loss = False,
         disable_flex = False,
-        disable_triton_kernel = False
+        disable_triton_kernel = False,
+        cache = None,
+        return_cache = False
     ):
+        is_inferencing = exists(cache)
+
+        if is_inferencing:
+            disable_flex &= False
+            disable_triton_kernel &= False
+
         if return_loss:
             ids, labels = ids[:, :-1], ids[:, 1:]
 
@@ -257,13 +280,28 @@ class Transformer(Module):
                 fine_selection_flex_mask = create_fine_mask(seq_len, self.attn_fine_block_size)
             )
 
+        # cache
+
+        cache = default(cache, [])
+        iter_cache = iter(cache)
+
+        next_cache = []
+
+        if is_inferencing:
+            tokens = tokens[:, -1:]
+
         # layers
 
         for attn, ff in self.layers:
-            attn_out = attn(
+
+            attn_out, layer_cache = attn(
                 tokens,
+                cache = next(iter_cache, None),
+                return_cache = True,
                 **attn_kwargs
             )
+
+            next_cache.append(layer_cache)
 
             tokens = attn_out + tokens
             tokens = ff(tokens) + tokens
@@ -273,6 +311,9 @@ class Transformer(Module):
         logits = self.to_logits(embed)
 
         if not return_loss:
-            return logits
+            if not return_cache:
+                return logits
+
+            return logits, next_cache
 
         return F.cross_entropy(rearrange(logits, 'b n l -> b l n'), labels)
