@@ -214,12 +214,15 @@ class Transformer(Module):
 
         cache = None
 
-        for _ in tqdm(range(sample_num_times)):
+        for ind in tqdm(range(sample_num_times)):
+            is_first = ind == 0
 
             logits, next_cache = self.forward(
                 out,
                 cache = cache,
-                return_cache = True
+                return_cache = True,
+                disable_flex = not is_first,
+                disable_triton_kernel = not is_first
             )
 
             if use_cache_kv:
