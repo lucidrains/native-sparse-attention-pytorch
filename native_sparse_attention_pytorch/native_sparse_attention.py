@@ -395,8 +395,10 @@ class SparseAttention(Module):
 
         # block causal diagonal
 
+        rotated_q, rotated_k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
+
         fine_sliding_window = (seq_len % self.selection_block_size) + 1
-        fk = k[..., -fine_sliding_window:, :]
+        fk = rotated_k[..., -fine_sliding_window:, :]
         fv = v[..., -fine_sliding_window:, :]
 
         # select out the sparse kv segments as defined by compressed attention map as importance score
@@ -410,7 +412,7 @@ class SparseAttention(Module):
             fine_divisible_seq_len = round_up_mult(seq_len, self.selection_block_size)
             remainder = fine_divisible_seq_len - k.shape[-2]
 
-            sel_fk = pad_at_dim(k, (0, remainder), dim = -2)
+            sel_fk = pad_at_dim(rotated_k, (0, remainder), dim = -2)
             sel_fv = pad_at_dim(v, (0, remainder), dim = -2)
 
             sel_fk = rearrange(sel_fk, 'b h (w j) d -> b h w j d', j = self.selection_block_size)
@@ -430,7 +432,7 @@ class SparseAttention(Module):
 
         # remove later
 
-        fq = rearrange(q, 'b (h gh) ... -> b h gh ...', gh = self.num_grouped_queries)
+        fq = rearrange(rotated_q, 'b (h gh) ... -> b h gh ...', gh = self.num_grouped_queries)
 
         fsim = einsum(fq, fk, 'b h gh i d, b h j d -> b h gh i j') * scale
 
@@ -457,7 +459,7 @@ class SparseAttention(Module):
 
         strategy_weighted_combine = self.to_strategy_combine(inp)
 
-        out = einsum(strategy_weighted_combine, stack([compressed_attn_out, compressed_attn_out, sliding_window_attn_out]), 'b h n s, s b h n d -> b h n d')
+        out = einsum(strategy_weighted_combine, stack([compressed_attn_out, fine_attn_out, sliding_window_attn_out]), 'b h n s, s b h n d -> b h n d')
 
         # merge heads and combine them
 
