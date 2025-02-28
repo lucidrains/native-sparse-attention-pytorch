@@ -418,8 +418,14 @@ class SparseAttention(Module):
             sel_fk = rearrange(sel_fk, 'b h (w j) d -> b h w j d', j = self.selection_block_size)
             sel_fv = rearrange(sel_fv, 'b h (w j) d -> b h w j d', j = self.selection_block_size)
 
-            sel_fk = einx.get_at('b h [w] j d, b h 1 sel -> b h (sel j) d', sel_fk, sel_indices)
-            sel_fv = einx.get_at('b h [w] j d, b h 1 sel -> b h (sel j) d', sel_fv, sel_indices)
+            # get_at('b h [w] j d, b h 1 sel -> b h (sel j) d'
+
+            sel_indices = repeat(sel_indices, 'b h 1 sel -> b h sel j d', j = self.selection_block_size, d = sel_fk.shape[-1])
+
+            sel_fk = sel_fk.gather(2, sel_indices)
+            sel_fv = sel_fv.gather(2, sel_indices)
+
+            sel_fk, sel_fv = tuple(rearrange(t, 'b h sel j d -> b h (sel j) d') for t in (sel_fk, sel_fv))
 
             fmask = sel_scores > 1e-10
 
