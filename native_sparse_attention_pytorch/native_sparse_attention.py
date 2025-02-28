@@ -252,6 +252,7 @@ class SparseAttention(Module):
 
         self.split_compress_window = Rearrange('b h (w n) d -> b h w n d', n = compress_block_size)
 
+        self.num_mem_compress_kv = num_compressed_mem_kv
         self.compress_mem_kv = nn.Parameter(torch.zeros(2, kv_heads, num_compressed_mem_kv, dim_head))
         
         self.k_intrablock_positions = nn.Parameter(torch.zeros(kv_heads, compress_block_size, dim_head))
@@ -332,7 +333,6 @@ class SparseAttention(Module):
 
         sliding_window = self.sliding_window_size
         compress_divisible_seq_len = round_down_mult(seq_len, self.compress_block_size)
-        num_compress_blocks = compress_divisible_seq_len // self.compress_block_size
 
         fine_divisible_seq_len = round_up_mult(seq_len, self.selection_block_size)
         num_fine_blocks = fine_divisible_seq_len // self.selection_block_size
@@ -361,6 +361,14 @@ class SparseAttention(Module):
         ck = cache_ck
         cv = cache_cv
 
+        repeated_ck = repeat(ck, 'b h ... -> b (h gh) ...', gh = self.num_grouped_queries)
+        repeated_cv = repeat(cv, 'b h ... -> b (h gh) ...', gh = self.num_grouped_queries)
+
+        csim = einsum(q, repeated_ck, 'b h i d, b h j d -> b h i j') * scale
+        cattn = csim.softmax(dim = -1)
+
+        compressed_attn_out = einsum(cattn, repeated_cv, 'b h i j, b h j d -> b h i d')
+
         if divisible_by(seq_len, self.compress_block_size):
             k_compress_input = self.split_compress_window(k[..., -self.compress_block_size:, :] + self.k_intrablock_positions)
             v_compress_input = self.split_compress_window(v[..., -self.compress_block_size:, :] + self.v_intrablock_positions)
@@ -374,17 +382,64 @@ class SparseAttention(Module):
         if return_cache:
             cache_compressed_kv = (ck, cv)
 
-        ck = repeat(ck, 'b h ... -> b (h gh) ...', gh = self.num_grouped_queries)
-        cv = repeat(cv, 'b h ... -> b (h gh) ...', gh = self.num_grouped_queries)
+        # 2. fine attention inference (todo - compress and fine diff block sizes)
 
-        csim = einsum(q, ck, 'b h i d, b h j d -> b h i j') * scale
-        cattn = csim.softmax(dim = -1)
+        assert self.compress_block_size == self.selection_block_size
 
-        compressed_attn_out = einsum(cattn, cv, 'b h i j, b h j d -> b h i d')
+        importance_scores = csim[..., self.num_mem_compress_kv:]
+        importance_scores += torch.randn_like(importance_scores) * 100
 
-        # 2. fine attention inference (todo)
+        num_compress_blocks = importance_scores.shape[-1]
+        num_selected = min(self.num_selected_blocks, num_compress_blocks)
+        has_selected_kv_for_fine_attn = num_selected > 0
 
-        # not implemented
+        # block causal diagonal
+
+        fine_sliding_window = (seq_len % self.selection_block_size) + 1
+        fk = k[..., -fine_sliding_window:, :]
+        fv = v[..., -fine_sliding_window:, :]
+
+        # select out the sparse kv segments as defined by compressed attention map as importance score
+
+        if has_selected_kv_for_fine_attn:
+            if self.query_heads_share_selected_kv:
+                importance_scores = reduce(importance_scores, 'b (h grouped_queries) ... -> b h ...', 'mean', grouped_queries = self.num_grouped_queries)
+
+            sel_scores, sel_indices = importance_scores.topk(num_selected, dim = -1)
+    
+            fine_divisible_seq_len = round_up_mult(seq_len, self.selection_block_size)
+            remainder = fine_divisible_seq_len - k.shape[-2]
+
+            sel_fk = pad_at_dim(k, (0, remainder), dim = -2)
+            sel_fv = pad_at_dim(v, (0, remainder), dim = -2)
+
+            sel_fk = rearrange(sel_fk, 'b h (w j) d -> b h w j d', j = self.selection_block_size)
+            sel_fv = rearrange(sel_fv, 'b h (w j) d -> b h w j d', j = self.selection_block_size)
+
+            sel_fk = einx.get_at('b h [w] j d, b h 1 sel -> b h (sel j) d', sel_fk, sel_indices)
+            sel_fv = einx.get_at('b h [w] j d, b h 1 sel -> b h (sel j) d', sel_fv, sel_indices)
+
+            fmask = sel_scores > 1e-10
+
+            fmask = repeat(fmask, 'b h i sel -> b h i (sel j)', j = self.selection_block_size)
+
+            fk = cat((sel_fk, fk), dim = -2)
+            fv = cat((sel_fv, fv), dim = -2)
+
+            fmask = F.pad(fmask, (0, fk.shape[-2] - fmask.shape[-1]), value = True)
+
+        # remove later
+
+        fq = rearrange(q, 'b (h gh) ... -> b h gh ...', gh = self.num_grouped_queries)
+
+        fsim = einsum(fq, fk, 'b h gh i d, b h j d -> b h gh i j') * scale
+
+        fsim = einx.where('b h i j, b h gh i j, -> b h gh i j', fmask, fsim, max_neg_value(fsim))
+
+        fattn = fsim.softmax(dim = -1)
+
+        fine_attn_out = einsum(fattn, fv, 'b h gh i j, b h j d -> b h gh i d')
+        fine_attn_out = rearrange(fine_attn_out, 'b h gh ... -> b (h gh) ...')
 
         # 3. sliding window
 
@@ -402,7 +457,7 @@ class SparseAttention(Module):
 
         strategy_weighted_combine = self.to_strategy_combine(inp)
 
-        out = einsum(strategy_weighted_combine, stack([compressed_attn_out, sliding_window_attn_out, sliding_window_attn_out]), 'b h n s, s b h n d -> b h n d')
+        out = einsum(strategy_weighted_combine, stack([compressed_attn_out, compressed_attn_out, sliding_window_attn_out]), 'b h n s, s b h n d -> b h n d')
 
         # merge heads and combine them
 

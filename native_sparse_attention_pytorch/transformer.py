@@ -255,8 +255,8 @@ class Transformer(Module):
         is_inferencing = exists(cache)
 
         if is_inferencing:
-            disable_flex &= False
-            disable_triton_kernel &= False
+            disable_flex |= True
+            disable_triton_kernel |= True
 
         if return_loss:
             ids, labels = ids[:, :-1], ids[:, 1:]

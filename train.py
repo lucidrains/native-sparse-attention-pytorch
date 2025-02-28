@@ -47,7 +47,7 @@ NUM_FINE_SELECTED = 4
 INTERPOLATED_IMPORTANCE_SCORE = False
 USE_DIFF_TOPK = True
 
-USE_EFFICIENT_INFERENCE = False # fine attn inference logic still needs implementing
+USE_EFFICIENT_INFERENCE = True # needs validation still
 
 # experiment related
 
