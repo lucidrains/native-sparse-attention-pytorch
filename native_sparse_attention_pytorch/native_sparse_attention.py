@@ -657,6 +657,9 @@ class SparseAttention(Module):
 
                     selected_block_indices = pad_at_dim(selected_block_indices, (0, remainder), value = 0, dim = -2)
 
+                    if exists(gates):
+                        gates = pad_at_dim(gates, (0, remainder), value = 0, dim = -2)
+
                 # handle block causal diagonal in the diagram, but run experiments without to see
 
                 fine_window_seq = arange(fine_divisible_seq_len, device = device) // self.selection_block_size
@@ -693,6 +696,7 @@ class SparseAttention(Module):
                 # differential topk gating
 
                 if self.use_diff_topk:
+                    gates = F.pad(gates, (0, 1), value = 1.)
                     fk = einx.multiply('b h i sel, b h i sel j d -> b h i sel j d', gates, fk)
 
                 # merge selected key values
