@@ -100,8 +100,8 @@ def regular_attend(
 
 # mock inputs
 
-batch = 2
-seq_len = 511
+batch = 4
+seq_len = 507
 q_heads = 4
 kv_heads = 2
 fine_block_size = 16
@@ -135,7 +135,7 @@ assert torch.allclose(out, nsa_out, atol = 1e-2)
 assert torch.allclose(rlse, nlse, atol = 1e-2)
 
 assert torch.allclose(nv.grad, rv.grad, atol = 1e-2)
-assert torch.allclose(nk.grad, rk.grad, atol = 1e-2)
 assert torch.allclose(nq.grad, rq.grad, atol = 1e-2)
+assert torch.allclose(nk.grad, rk.grad, atol = 1e-2)
 
 print('✅ outputs and gradients are same between pytorch native sparse attn and triton native sparse attn')

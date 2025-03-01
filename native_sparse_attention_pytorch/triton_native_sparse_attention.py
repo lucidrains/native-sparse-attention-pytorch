@@ -822,20 +822,25 @@ def backward_kernel_one_col_block_sparse(
     # ds
 
     ds = (p * (dp - Di[:, :, None]) * softmax_scale)
-    ds = ds.to(q.dtype)
 
     # block dk
 
-    block_dk = ds[:, :, :, None] * q[:, :, None, :]
+    block_dk = ds[:, :, :, None] * q[:, :, None, :].to(ds.dtype)
     block_dk = tl.sum(block_dk, 1)
 
-    tl.atomic_add(block_dk_ptrs, block_dk, mask = block_masks[:, None, None], sem = 'relaxed')
+    tl.atomic_add(
+        block_dk_ptrs,
+        block_dk,
+        mask = block_masks[:, None, None] & (blocks_offs_n[:, :, None] < seqlen_k),
+        sem = 'relaxed'
+    )
 
     # block dq
 
     ds_expanded = tl.expand_dims(ds, 2)
     ds_expanded = tl.broadcast_to(ds_expanded, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK))
     ds_expanded = ds_expanded.reshape(BLOCK, 16, BLOCK)
+    ds_expanded = ds_expanded.to(block_k.dtype)
 
     block_dq = tl.dot(ds_expanded, block_k)
 
