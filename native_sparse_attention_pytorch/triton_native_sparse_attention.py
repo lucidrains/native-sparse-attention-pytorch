@@ -590,6 +590,7 @@ def backward_kernel_one_col_block_sparse(
     V,
     kv_block_indices,
     kv_block_mask,
+    kv_block_grads,
     DO,
     DQ,
     DK,
@@ -619,6 +620,7 @@ def backward_kernel_one_col_block_sparse(
     BLOCK: tl.constexpr,
     QUERY_HEAD_GROUPS: tl.constexpr,
     QUERY_EXPAND_DIM: tl.constexpr,
+    RETURN_SEL_GRADS: tl.constexpr,
     OFF_SEL_KV_BLOCKS: tl.constexpr
 ):
     # We need to make sure begin_m is a multiple of BLOCK_M (not BLOCK_N)
@@ -637,9 +639,6 @@ def backward_kernel_one_col_block_sparse(
     offs_d_or_lse = seqlen_q_rounded * offs_g[:, None] + offs_m
 
     # initialize pointers to value-like data
-
-    k_ptrs = K + (offs_n[:, None] * stride_kn + offs_d[None, :])
-    v_ptrs = V + (offs_n[:, None] * stride_vn + offs_d[None, :])
 
     q_ptrs = (
         Q +
@@ -794,9 +793,9 @@ def backward_kernel_one_col_block_sparse(
     block_qk = block_qk.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK)
     qk = tl.sum(block_qk, 2) / QUERY_EXPAND_DIM
 
-    qk += tl.where(block_masks[:, None, None], 0, float("-inf"))
+    masked_qk = qk + tl.where(block_masks[:, None, None], 0, float("-inf"))
 
-    p = tl.exp(qk * softmax_scale - lse_i[:, :, None])
+    p = tl.exp(masked_qk * softmax_scale - lse_i[:, :, None])
 
     # take care of block dv
 
@@ -822,6 +821,26 @@ def backward_kernel_one_col_block_sparse(
     # ds
 
     ds = (p * (dp - Di[:, :, None]) * softmax_scale)
+
+    # maybe return gradients for better differentiable topk
+
+    if RETURN_SEL_GRADS:
+
+        kv_block_grads_ptrs = (
+            kv_block_grads +
+            offs_m * stride_kvbl_m
+        )
+
+        sel_grads = ds * qk
+        sel_grads = tl.where(block_masks[:, None, None], sel_grads, 0.)
+        sel_grads = sel_grads.reshape(BLOCK, QUERY_HEAD_GROUPS * BLOCK)
+        sel_grads = tl.sum(sel_grads, 1)
+
+        tl.atomic_add(
+            kv_block_grads_ptrs + OFF_SEL_KV_BLOCKS,
+            sel_grads,
+            sem = 'relaxed'
+        )
 
     # block dk
 
@@ -1145,6 +1164,7 @@ def backward_kernel(
     V,
     kv_block_indices,
     kv_block_mask,
+    kv_block_grads,
     DO,
     DQ,
     DK,
@@ -1192,6 +1212,7 @@ def backward_kernel(
     BLOCK: tl.constexpr,
     QUERY_HEAD_GROUPS: tl.constexpr,
     QUERY_EXPAND_DIM: tl.constexpr,
+    RETURN_SEL_GRADS: tl.constexpr,
     INCLUDE_BLOCK_CAUSAL: tl.constexpr
 ):
     off_hb = tl.program_id(1)
@@ -1199,12 +1220,8 @@ def backward_kernel(
     off_h = off_hb % kv_heads
     off_qh = off_h * QUERY_HEAD_GROUPS
 
-    if INCLUDE_BLOCK_CAUSAL:
-        IS_CAUSAL = tl.program_id(0) == 0
-        OFF_SEL_KV_BLOCKS = tl.program_id(0) - 1
-    else:
-        IS_CAUSAL = False
-        OFF_SEL_KV_BLOCKS = tl.program_id(0)
+    OFF_SEL_KV_BLOCKS = tl.program_id(0) - int(INCLUDE_BLOCK_CAUSAL)
+    IS_CAUSAL = INCLUDE_BLOCK_CAUSAL and tl.program_id(0) == 0
 
     # offset pointers for batch/head
 
@@ -1220,6 +1237,7 @@ def backward_kernel(
 
     kv_block_indices += off_b * stride_kvbl_b + off_h * stride_kvbl_h
     kv_block_mask += off_b * stride_kvbl_b + off_h * stride_kvbl_h
+    kv_block_grads += off_b * stride_kvbl_b + off_h * stride_kvbl_h
 
     # pointer to row-wise quantities in value-like data
 
@@ -1283,6 +1301,7 @@ def backward_kernel(
                 V,
                 kv_block_indices,
                 kv_block_mask,
+                kv_block_grads,
                 DO,
                 DQ,
                 DK,
@@ -1312,6 +1331,7 @@ def backward_kernel(
                 BLOCK = BLOCK,
                 QUERY_HEAD_GROUPS = QUERY_HEAD_GROUPS,
                 QUERY_EXPAND_DIM = QUERY_EXPAND_DIM,
+                RETURN_SEL_GRADS = RETURN_SEL_GRADS,
                 OFF_SEL_KV_BLOCKS = OFF_SEL_KV_BLOCKS
             )
 
@@ -1320,11 +1340,13 @@ def native_sparse_attn_backward(
     q, k, v,
     kv_block_indices,
     kv_block_mask,
+    kv_block_grads,
     o,
     lse,
     dq, dk, dv,
     block_size = 128,
-    include_block_causal = True
+    include_block_causal = True,
+    return_sel_grads = False
 ):
     device = do.device
 
@@ -1387,6 +1409,7 @@ def native_sparse_attn_backward(
         v,
         kv_block_indices,
         kv_block_mask,
+        kv_block_grads,
         do,
         dq,
         dk,
@@ -1436,6 +1459,7 @@ def native_sparse_attn_backward(
         EVEN_M = divisible_by(seqlen_q, block_size),
         EVEN_N = divisible_by(seqlen_k, block_size),
         EVEN_HEADDIM = BLOCK_HEADDIM == dim,
+        RETURN_SEL_GRADS = return_sel_grads,
         INCLUDE_BLOCK_CAUSAL = include_block_causal,
         # BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
         # num_warps=num_warps,
@@ -1458,6 +1482,7 @@ class NSA(Function):
         block_size,
         selected_block_indices,
         fmask,
+        sel_scale,
         include_block_causal
     ):
         dtype = fq.dtype
@@ -1478,10 +1503,16 @@ class NSA(Function):
 
         ctx.save_for_backward(fq, fk, fv, selected_block_indices, fmask, out, lse)
 
+        return_sel_grads = exists(sel_scale)
+
+        if return_sel_grads:
+            assert (sel_scale == 1.).all(), 'for now, must be straight through as multiplier of 1.'
+
         ctx._saved_variables = (
             block_size,
             head_groups,
-            include_block_causal
+            return_sel_grads,
+            include_block_causal,
         )
 
         return out.type(dtype), lse
@@ -1495,6 +1526,7 @@ class NSA(Function):
         (
             block_size,
             head_groups,
+            return_sel_grads,
             include_block_causal
         ) = ctx._saved_variables
 
@@ -1503,15 +1535,23 @@ class NSA(Function):
         dk = torch.zeros(k.shape, dtype = torch.float32, device = device)
         dv = torch.zeros(v.shape, dtype = torch.float32, device = device)
 
+        sel_grads = torch.zeros_like(sel_block_indices).float()
+
         native_sparse_attn_backward(
             do, q, k, v,
-            sel_block_indices, mask,
+            sel_block_indices, mask, sel_grads,
             out, lse, dq, dk, dv,
             block_size = block_size,
-            include_block_causal = include_block_causal
+            include_block_causal = include_block_causal,
+            return_sel_grads = return_sel_grads
         )
     
-        return dq, dk, dv, None, None, None, None
+        ret_sel_grads = None
+
+        if return_sel_grads:
+            ret_sel_grads = sel_grads
+
+        return dq, dk, dv, None, None, None, ret_sel_grads, None
 
 _native_sparse_attend = NSA.apply
 
@@ -1531,6 +1571,7 @@ def native_sparse_attend(
     block_size: int,
     selected_block_indices: Int['b qh n sel'] | Int['b kh n sel'],
     fmask: Bool['b qh n sel'] | Bool['b kh n sel'],
+    sel_scale: Float['b kh n sel'] | Float['b qh n sel'] | None = None,
     include_block_causal = True,
     return_lse = False
 ):
@@ -1550,6 +1591,7 @@ def native_sparse_attend(
         block_size,
         selected_block_indices,
         fmask,
+        sel_scale,
         include_block_causal
     )
 

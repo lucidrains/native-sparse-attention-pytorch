@@ -616,10 +616,10 @@ class SparseAttention(Module):
 
             selected_importance_values, selected_block_indices = importance_scores.topk(num_selected, dim = -1)
 
+            gates = None
+
             if self.use_diff_topk:
                 gates = straight_through(selected_importance_values, 1.)
-                gates = gates.cumprod(dim = -1)[..., -1]
-                gates = repeat(gates, 'b h ... -> b (h qh) ...', qh = fine_num_grouped_queries)
 
             if self.use_triton_kernel and not disable_triton_kernel:
 
@@ -631,10 +631,13 @@ class SparseAttention(Module):
                     fq, fk, fv,
                     self.selection_block_size,
                     selected_block_indices,
-                    fmask
+                    fmask,
+                    sel_scale = gates
                 )
 
             elif exists(fine_selection_flex_mask):
+                assert not self.use_diff_topk, 'differential topk is not available for flex attention'
+
                 # flex attention for the selection for fine attention
 
                 fine_block_mask = fine_selection_flex_mask(selected_block_indices, num_grouped_queries = fine_num_grouped_queries)
@@ -653,9 +656,6 @@ class SparseAttention(Module):
                     fmask = pad_at_dim(fmask, (0, remainder), value = False, dim = -2)
 
                     selected_block_indices = pad_at_dim(selected_block_indices, (0, remainder), value = 0, dim = -2)
-
-                    if self.use_diff_topk:
-                        gates = pad_at_dim(gates, (0, remainder), value = 1.)
 
                 # handle block causal diagonal in the diagram, but run experiments without to see
 
@@ -690,6 +690,13 @@ class SparseAttention(Module):
                 fk = fk.gather(3, selected_block_indices)
                 fv = fv.gather(3, selected_block_indices)
 
+                # differential topk gating
+
+                if self.use_diff_topk:
+                    fk = einx.multiply('b h i sel, b h i sel j d -> b h i sel j d', gates, fk)
+
+                # merge selected key values
+
                 fk, fv = tuple(rearrange(t, 'b h i w j d -> b h i (w j) d') for t in (fk, fv))
 
                 # fine attention
@@ -711,12 +718,6 @@ class SparseAttention(Module):
                 fine_attn_out = rearrange(fine_attn_out, 'b h qh ... -> b (h qh) ...')
 
                 fine_attn_out = fine_attn_out[..., :seq_len, :]
-
-            # handle maybe gating
-
-            if self.use_diff_topk:
-                gates = gates[..., :seq_len]
-                fine_attn_out = einx.multiply('b h n, b h n d -> b h n d', gates, fine_attn_out)
 
         else:
             # if only first block, just do a simple block causal

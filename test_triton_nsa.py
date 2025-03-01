@@ -21,12 +21,16 @@ def regular_attend(
     indices,
     mask,
     block_size,
+    sel_scale = None, 
     return_lse = False
 ):
     q_heads, seq_len, kv_heads, device = q.shape[1], q.shape[-2], k.shape[1], q.device
     assert divisible_by(q_heads, kv_heads)
 
     q, k, v = tuple(pad_to_multiple(t, block_size, dim = -2) for t in (q, k, v))
+
+    if exists(sel_scale):
+        sel_scale = pad_to_multiple(sel_scale, block_size, dim = -2)
 
     g = q_heads // kv_heads # `g` stands for `g`roups of query heads per kv head
 
@@ -35,7 +39,6 @@ def regular_attend(
     q, k, v = tuple(rearrange(t, 'b h (w n) d -> b h w n d', n = block_size) for t in (q, k, v))
 
     scale = q.shape[-1] ** -0.5
-    q = q * scale
 
     q = rearrange(q, 'b (h g) ... -> b h g ...', g = g)
 
@@ -62,6 +65,10 @@ def regular_attend(
 
         bsim = rearrange(bsim, 'b h g (w i) (sel j) -> b h g w i sel j', sel = num_sel_kv_blocks, i = fine_block_size)
 
+        if exists(sel_scale):
+            sel_scale = rearrange(sel_scale, 'b h (w i) sel -> b h w i sel', i = fine_block_size)
+            bsim = einx.multiply('b h g w i sel j, b h w i sel -> b h g w i sel j', bsim, sel_scale)
+
         mask = rearrange(mask, 'b h (w i) sel -> b h 1 w i sel', i = fine_block_size)
         bsim = torch.where(mask[..., None], bsim, -torch.finfo(bsim.dtype).max)
 
@@ -78,6 +85,7 @@ def regular_attend(
 
     # attend
 
+    sim = sim * scale
     attn = sim.softmax(dim = -1)
 
     if has_sel_kv_blocks:
@@ -113,20 +121,21 @@ v = torch.randn(batch, kv_heads, seq_len, 64).cuda()
 
 indices = torch.randint(0, 2, (batch, kv_heads, seq_len, num_sel)).cuda()
 mask = torch.randint(0, 2, (batch, kv_heads, seq_len, num_sel)).bool().cuda()
+sel_scale = torch.ones((batch, kv_heads, seq_len, num_sel)).cuda()
 
 # both regular and nsa pathways `r` and `n`
 
-rq, rk, rv = tuple(t.clone().requires_grad_() for t in (q, k, v))
-nq, nk, nv = tuple(t.clone().requires_grad_() for t in (q, k, v))
+rq, rk, rv, rsel_scale = tuple(t.clone().requires_grad_() for t in (q, k, v, sel_scale))
+nq, nk, nv, nsel_scale = tuple(t.clone().requires_grad_() for t in (q, k, v, sel_scale))
 
 # regular forwards and backwards
 
-out, rlse = regular_attend(rq, rk, rv, indices, mask, block_size = fine_block_size, return_lse = True)
+out, rlse = regular_attend(rq, rk, rv, indices, mask, block_size = fine_block_size, sel_scale = rsel_scale, return_lse = True)
 out.sum().backward()
 
 # triton nsa forwards and backwards
 
-nsa_out, nlse = native_sparse_attend(nq, nk, nv, fine_block_size, indices, mask, return_lse = True)
+nsa_out, nlse = native_sparse_attend(nq, nk, nv, fine_block_size, indices, mask, sel_scale = nsel_scale, return_lse = True)
 nsa_out.sum().backward()
 
 # asserts
@@ -134,6 +143,7 @@ nsa_out.sum().backward()
 assert torch.allclose(out, nsa_out, atol = 1e-2)
 assert torch.allclose(rlse, nlse, atol = 1e-2)
 
+assert torch.allclose(rsel_scale.grad, nsel_scale.grad, atol = 1e-2)
 assert torch.allclose(nv.grad, rv.grad, atol = 1e-2)
 assert torch.allclose(nq.grad, rq.grad, atol = 1e-2)
 assert torch.allclose(nk.grad, rk.grad, atol = 1e-2)
