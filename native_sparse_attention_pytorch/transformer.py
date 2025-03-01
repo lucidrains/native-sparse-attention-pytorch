@@ -221,7 +221,7 @@ class Transformer(Module):
                 out,
                 cache = cache,
                 return_cache = True,
-                disable_flex = not is_first,
+                disable_flex = True,
                 disable_triton_kernel = not is_first
             )
 
