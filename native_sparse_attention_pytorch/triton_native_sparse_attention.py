@@ -65,15 +65,8 @@ from triton.language.extra import libdevice
 
 # kernels
 
-@triton.heuristics(
-    {
-        "EVEN_M": lambda args: divisible_by(args["seqlen_q"], args["BLOCK"]),
-        "EVEN_N": lambda args: divisible_by(args["seqlen_k"], args["BLOCK"]),
-        "EVEN_HEADDIM": lambda args: args["headdim"] == args["BLOCK_HEADDIM"],
-    }
-)
 @triton.jit
-def forward_kernel(
+def forward_kernel_causal_and_sparse(
     Q,
     K,
     V,
@@ -414,6 +407,99 @@ def forward_kernel(
                 acc_o,
                 mask = (offs_m[:, None, None] < seqlen_q) & (offs_d[None, None, :] < headdim)
             )
+
+@triton.heuristics(
+    {
+        "EVEN_M": lambda args: divisible_by(args["seqlen_q"], args["BLOCK"]),
+        "EVEN_N": lambda args: divisible_by(args["seqlen_k"], args["BLOCK"]),
+        "EVEN_HEADDIM": lambda args: args["headdim"] == args["BLOCK_HEADDIM"],
+    }
+)
+@triton.jit
+def forward_kernel(
+    Q,
+    K,
+    V,
+    kv_block_indices,
+    kv_block_mask,
+    Out,
+    Lse,
+    softmax_scale,
+    stride_qb,
+    stride_qh,
+    stride_qm,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_vb,
+    stride_vh,
+    stride_vn,
+    stride_ob,
+    stride_oh,
+    stride_om,
+    stride_kvbl_b,
+    stride_kvbl_h,
+    stride_kvbl_m,
+    stride_lse_b,
+    kv_heads,
+    seqlen_q,
+    seqlen_k,
+    seqlen_q_rounded,
+    headdim,
+    CACHE_KEY_SEQLEN_Q,
+    CACHE_KEY_SEQLEN_K,
+    BLOCK_HEADDIM: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    EVEN_HEADDIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+    QUERY_HEAD_GROUPS: tl.constexpr,
+    QUERY_EXPAND_DIM: tl.constexpr,
+    NUM_SEL_KV_BLOCKS: tl.constexpr,
+    INCLUDE_BLOCK_CAUSAL: tl.constexpr
+):
+    forward_kernel_causal_and_sparse(
+        Q,
+        K,
+        V,
+        kv_block_indices,
+        kv_block_mask,
+        Out,
+        Lse,
+        softmax_scale,
+        stride_qb,
+        stride_qh,
+        stride_qm,
+        stride_kb,
+        stride_kh,
+        stride_kn,
+        stride_vb,
+        stride_vh,
+        stride_vn,
+        stride_ob,
+        stride_oh,
+        stride_om,
+        stride_kvbl_b,
+        stride_kvbl_h,
+        stride_kvbl_m,
+        stride_lse_b,
+        kv_heads,
+        seqlen_q,
+        seqlen_k,
+        seqlen_q_rounded,
+        headdim,
+        CACHE_KEY_SEQLEN_Q,
+        CACHE_KEY_SEQLEN_K,
+        BLOCK_HEADDIM,
+        EVEN_M,
+        EVEN_N,
+        EVEN_HEADDIM,
+        BLOCK,
+        QUERY_HEAD_GROUPS,
+        QUERY_EXPAND_DIM,
+        NUM_SEL_KV_BLOCKS,
+        INCLUDE_BLOCK_CAUSAL
+    )
 
 def native_sparse_attn_forward(
     q,
