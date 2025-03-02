@@ -106,7 +106,8 @@ def forward_kernel_causal_and_sparse(
     QUERY_HEAD_GROUPS: tl.constexpr,
     QUERY_EXPAND_DIM: tl.constexpr,
     NUM_SEL_KV_BLOCKS: tl.constexpr,
-    INCLUDE_BLOCK_CAUSAL: tl.constexpr
+    INCLUDE_BLOCK_CAUSAL: tl.constexpr,
+    SLIDING: tl.constexpr
 ):
     start_m = tl.program_id(0)
     off_hb = tl.program_id(1)
@@ -117,7 +118,6 @@ def forward_kernel_causal_and_sparse(
     offs_qh = off_h * QUERY_HEAD_GROUPS + tl.arange(0, QUERY_HEAD_GROUPS)
 
     offs_m = start_m * BLOCK + tl.arange(0, BLOCK)
-    offs_n = start_m * BLOCK + tl.arange(0, BLOCK)
     offs_d = tl.arange(0, BLOCK_HEADDIM)
 
     q_ptrs = (
@@ -181,6 +181,9 @@ def forward_kernel_causal_and_sparse(
             )
 
     if INCLUDE_BLOCK_CAUSAL:
+
+        offs_n = start_m * BLOCK + tl.arange(0, BLOCK)
+
         k_ptrs = (
             K +
             off_b * stride_kb +
@@ -225,11 +228,21 @@ def forward_kernel_causal_and_sparse(
         qk = qk.reshape(BLOCK, QUERY_HEAD_GROUPS, BLOCK)
 
         if not EVEN_N:
-            qk += tl.where(offs_n[None, :] < seqlen_k, 0, float("-inf"))
+            within_range_mask = offs_n[None, :] < seqlen_k
+
+            if SLIDING:
+                within_range_mask &= offs_n[None, :] >= 0.
+
+            qk += tl.where(within_range_mask, 0, float("-inf"))
 
         qk = qk.reshape(BLOCK, QUERY_HEAD_GROUPS, BLOCK)
 
-        qk += tl.where(offs_m[:, None, None] >= offs_n[None, None, :], 0, float("-inf"))
+        causal_mask = offs_m[:, None, None] >= offs_n[None, None, :]
+
+        if SLIDING:
+            causal_mask &= (offs_n[None, None, :] - offs_m[:, None, None]) <= BLOCK
+
+        qk += tl.where(causal_mask, 0, float("-inf"))
 
         m_ij = tl.maximum(tl.max(qk, 2) * softmax_scale, lse_i)
         p = tl.exp(qk * softmax_scale - m_ij[:, :, None])
@@ -456,7 +469,8 @@ def forward_kernel(
     QUERY_HEAD_GROUPS: tl.constexpr,
     QUERY_EXPAND_DIM: tl.constexpr,
     NUM_SEL_KV_BLOCKS: tl.constexpr,
-    INCLUDE_BLOCK_CAUSAL: tl.constexpr
+    INCLUDE_BLOCK_CAUSAL: tl.constexpr,
+    SLIDING: tl.constexpr
 ):
     forward_kernel_causal_and_sparse(
         Q,
@@ -498,7 +512,8 @@ def forward_kernel(
         QUERY_HEAD_GROUPS,
         QUERY_EXPAND_DIM,
         NUM_SEL_KV_BLOCKS,
-        INCLUDE_BLOCK_CAUSAL
+        INCLUDE_BLOCK_CAUSAL,
+        SLIDING
     )
 
 def native_sparse_attn_forward(
@@ -578,6 +593,7 @@ def native_sparse_attn_forward(
         QUERY_EXPAND_DIM = 16 // head_groups,
         NUM_SEL_KV_BLOCKS = num_selected_fine_blocks,
         INCLUDE_BLOCK_CAUSAL = include_block_causal,
+        SLIDING = False,
         num_warps = num_warps,
         num_stages = 1,
     )
@@ -626,8 +642,8 @@ def backward_preprocess_do_o_dot(
         + off_h * stride_doh
         + offs_m[:, None] * stride_dom
         + offs_d[None, :],
-        mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
-        other=0.0,
+        mask = (offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+        other = 0.0,
     ).to(tl.float32)
 
     delta = tl.sum(o * do, axis=1)
