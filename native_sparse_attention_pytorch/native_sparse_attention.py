@@ -361,7 +361,7 @@ class SparseAttention(Module):
 
         # rotate after updating the compression running k/v
 
-        q = self.rotary_emb.rotate_queries_or_keys(q, offset = cache_len)
+        rotated_q = self.rotary_emb.rotate_queries_or_keys(q, offset = cache_len)
         k = self.rotary_emb.rotate_queries_or_keys(k, offset = cache_len)
 
         # handle cache, which stores the rotated
@@ -459,7 +459,7 @@ class SparseAttention(Module):
 
         # remove later
 
-        fq = rearrange(q, 'b (h gh) ... -> b h gh ...', gh = self.num_grouped_queries)
+        fq = rearrange(rotated_q, 'b (h gh) ... -> b h gh ...', gh = self.num_grouped_queries)
 
         fsim = einsum(fq, fk, 'b h gh i d, b h j d -> b h gh i j') * scale
 
@@ -476,11 +476,12 @@ class SparseAttention(Module):
         v = repeat(v, 'b h ... -> b (h gh) ...', gh = self.num_grouped_queries)
 
         sliding_slice = (Ellipsis, slice(-(sliding_window + 1), None), slice(None))
-        rotated_q, rotated_k = self.rotary_emb.rotate_queries_with_cached_keys(q, k[sliding_slice])
 
-        sim = einsum(rotated_q, rotated_k, 'b h i d, b h j d -> b h i j') * scale
+        k, v  = k[sliding_slice], v[sliding_slice]
+
+        sim = einsum(rotated_q, k, 'b h i d, b h j d -> b h i j') * scale
         attn = sim.softmax(dim = -1)
-        sliding_window_attn_out = einsum(attn, v[sliding_slice], 'b h i j, b h j d -> b h i d')
+        sliding_window_attn_out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
 
         # combine strategies
 
@@ -630,8 +631,8 @@ class SparseAttention(Module):
 
         # handle if number of total blocks is less than number to select for fine attention
 
-        fq = rotated_q
-        fk = rotated_k
+        fq = q
+        fk = k
         fv = v
 
         if has_selected_kv_for_fine_attn:
@@ -757,8 +758,8 @@ class SparseAttention(Module):
 
         # 3. overlapping sliding window, this is unsurprising and expected - `s` for sliding
 
-        sq = rotated_q
-        sk = rotated_k
+        sq = q
+        sk = k
         sv = v
 
         if exists(sliding_window_flex_mask):
