@@ -532,11 +532,6 @@ class SparseAttention(Module):
 
         q, k, v = map(self.split_heads, (q, k, v))
 
-        # handle cache
-
-        if return_cache:
-            cache_kv = (k, v)
-
         # compressed key / values - variables prepended with `c` stands for compressed
 
         k_pos = repeat(self.k_intrablock_positions, 'h n d -> h (r n) d', r = num_compress_blocks)
@@ -573,7 +568,13 @@ class SparseAttention(Module):
         compressed_attn_out, csim = attend(cq, ck, cv, mask = cmask, return_sim = True)
 
         # for 2. and 3., will give them relative positions with rotary - compressed needs to be handled separately (even if they already have intra block absolute positions)
-        rotated_q, rotated_k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
+
+        q, k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
+
+        # handle cache
+
+        if return_cache:
+            cache_kv = (k, v)
 
         # 2. fine attention over selected based on compressed attention logits - variables prepended with `f` stands for the fine attention pathway
 
