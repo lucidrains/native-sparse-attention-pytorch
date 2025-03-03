@@ -1094,6 +1094,7 @@ def backward_kernel_one_col_block_causal(
     if begin_m >= seqlen_q:
         dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_d[None, :])
         dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_d[None, :])
+
         backward_store_dk_dv(
             dk_ptrs,
             dv_ptrs,

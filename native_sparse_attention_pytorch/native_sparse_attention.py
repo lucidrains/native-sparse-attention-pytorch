@@ -324,12 +324,19 @@ class SparseAttention(Module):
     ):
         # destruct cache
 
-        (cache_k, cache_v), (cache_ck, cache_cv) = cache
+        (
+            (cache_k, cache_v),
+            (
+                (cache_ck, cache_cv),
+                (run_k, run_v)
+            )
+         ) = cache
 
         # variables
 
         batch, scale, heads, device = inp.shape[0], self.scale, self.heads, inp.device
-        seq_len = cache_k.shape[-2] + 1
+        cache_len = cache_k.shape[-2]
+        seq_len = cache_len + 1
 
         sliding_window = self.sliding_window_size
         compress_divisible_seq_len = round_down_mult(seq_len, self.compress_block_size)
@@ -347,7 +354,17 @@ class SparseAttention(Module):
 
         q, k, v = map(self.split_heads, (q, k, v))
 
-        # handle cache
+        # take care of running k and v for compression, which should NOT be rotated https://arxiv.org/abs/2501.18795
+
+        run_k = cat((run_k, k), dim = -2)
+        run_v = cat((run_v, v), dim = -2)
+
+        # rotate after updating the compression running k/v
+
+        q = self.rotary_emb.rotate_queries_or_keys(q, offset = cache_len)
+        k = self.rotary_emb.rotate_queries_or_keys(k, offset = cache_len)
+
+        # handle cache, which stores the rotated
 
         k = cat((cache_k, k), dim = -2)
         v = cat((cache_v, v), dim = -2)
@@ -369,18 +386,24 @@ class SparseAttention(Module):
 
         compressed_attn_out = einsum(cattn, repeated_cv, 'b h i j, b h j d -> b h i d')
 
-        if divisible_by(seq_len, self.compress_block_size):
-            k_compress_input = self.split_compress_window(k[..., -self.compress_block_size:, :] + self.k_intrablock_positions)
-            v_compress_input = self.split_compress_window(v[..., -self.compress_block_size:, :] + self.v_intrablock_positions)
+        running_compress_seq_len = run_k.shape[-2]
+
+        if divisible_by(running_compress_seq_len, self.compress_block_size):
+
+            k_compress_input = self.split_compress_window(run_k + self.k_intrablock_positions)
+            v_compress_input = self.split_compress_window(run_v + self.v_intrablock_positions)
 
             next_ck = self.k_compress(k_compress_input)
             next_cv = self.v_compress(v_compress_input)
+
+            run_k = run_k[..., 0:0, :]
+            run_v = run_v[..., 0:0, :]
 
             ck = cat((ck, next_ck), dim = -2)
             cv = cat((cv, next_cv), dim = -2)
 
         if return_cache:
-            cache_compressed_kv = (ck, cv)
+            cache_compressed_kv = ((ck, cv), (run_k, run_v))
 
         # 2. fine attention inference (todo - compress and fine diff block sizes)
 
@@ -395,10 +418,8 @@ class SparseAttention(Module):
 
         # block causal diagonal
 
-        rotated_q, rotated_k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
-
         fine_sliding_window = (seq_len % self.selection_block_size) + 1
-        fk = rotated_k[..., -fine_sliding_window:, :]
+        fk = k[..., -fine_sliding_window:, :]
         fv = v[..., -fine_sliding_window:, :]
 
         # select out the sparse kv segments as defined by compressed attention map as importance score
@@ -412,7 +433,7 @@ class SparseAttention(Module):
             fine_divisible_seq_len = round_up_mult(seq_len, self.selection_block_size)
             remainder = fine_divisible_seq_len - k.shape[-2]
 
-            sel_fk = pad_at_dim(rotated_k, (0, remainder), dim = -2)
+            sel_fk = pad_at_dim(k, (0, remainder), dim = -2)
             sel_fv = pad_at_dim(v, (0, remainder), dim = -2)
 
             sel_fk = rearrange(sel_fk, 'b h (w j) d -> b h w j d', j = self.selection_block_size)
@@ -438,7 +459,7 @@ class SparseAttention(Module):
 
         # remove later
 
-        fq = rearrange(rotated_q, 'b (h gh) ... -> b h gh ...', gh = self.num_grouped_queries)
+        fq = rearrange(q, 'b (h gh) ... -> b h gh ...', gh = self.num_grouped_queries)
 
         fsim = einsum(fq, fk, 'b h gh i d, b h j d -> b h gh i j') * scale
 
@@ -524,12 +545,15 @@ class SparseAttention(Module):
         k_compress_input = self.split_compress_window(k[..., :compress_divisible_seq_len, :] + k_pos)
         v_compress_input = self.split_compress_window(v[..., :compress_divisible_seq_len, :] + v_pos)
 
+        run_k = k[..., compress_divisible_seq_len:, :]
+        run_v = v[..., compress_divisible_seq_len:, :]
+
         cq = q
         ck = self.k_compress(k_compress_input)   # Equation (7) of the Native Sparse Attention paper
         cv = self.v_compress(v_compress_input)
 
         if return_cache:
-            cache_compressed_kv = (ck, cv)
+            cache_compressed_kv = ((ck, cv), (run_k, run_v))
 
         # 1. coarse attention over compressed
 
@@ -549,7 +573,6 @@ class SparseAttention(Module):
         compressed_attn_out, csim = attend(cq, ck, cv, mask = cmask, return_sim = True)
 
         # for 2. and 3., will give them relative positions with rotary - compressed needs to be handled separately (even if they already have intra block absolute positions)
-
         rotated_q, rotated_k = self.rotary_emb.rotate_queries_with_cached_keys(q, k)
 
         # 2. fine attention over selected based on compressed attention logits - variables prepended with `f` stands for the fine attention pathway
