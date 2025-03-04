@@ -41,18 +41,18 @@ except ImportError:
 
 # flex attn sliding attention mask
 
+
 def create_sliding_mask(seq_len, window_size, causal = True):
+
     def sliding_mask(_, __, q_idx, kv_idx):
 
         distance = q_idx - kv_idx
-        mask = distance <= window_size
+        backward_sliding_mask = distance <= window_size
 
-        if causal:
-            mask = mask & q_idx >= kv_idx
-        else:
-            mask = mask & (distance >= -window_size)
+        forward_distance = 0 if causal else -window_size
+        forward_sliding_mask = distance >= forward_distance
 
-        return mask
+        return backward_sliding_mask & forward_sliding_mask
 
     block_mask = create_block_mask(sliding_mask, B = None, H = None, Q_LEN = seq_len, KV_LEN = seq_len, _compile = True)
     return block_mask
