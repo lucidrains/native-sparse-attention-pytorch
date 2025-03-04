@@ -533,7 +533,7 @@ class SparseAttention(Module):
             assert inp.shape[1] == 1, 'input must be single tokens if inferencing with cache key values'
             return self.forward_inference(inp, cache, return_cache = return_cache)
 
-        assert not (self.causal and return_cache)
+        assert not (not self.causal and return_cache)
 
         batch, seq_len, scale, heads, device = *inp.shape[:2], self.scale, self.heads, inp.device
 
@@ -683,7 +683,7 @@ class SparseAttention(Module):
                     selected_block_indices,
                     fmask,
                     sel_scale = gates,
-                    include_block_diagonal = self.causal
+                    include_block_causal = self.causal
                 )
 
             elif exists(fine_selection_flex_mask):
