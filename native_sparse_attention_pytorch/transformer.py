@@ -68,6 +68,7 @@ class Attention(Module):
         dim,
         dim_head = 64,
         heads = 8,
+        causal = True,
         kv_heads = None
     ):
         super().__init__()
@@ -77,6 +78,8 @@ class Attention(Module):
         self.kv_heads = default(kv_heads, heads)
         dim_inner = heads * dim_head
         dim_kv_inner = kv_heads * dim_head
+
+        self.causal = causal
 
         self.rotary_embed = RotaryEmbedding(dim_head)
 
@@ -114,7 +117,7 @@ class Attention(Module):
 
         out = F.scaled_dot_product_attention(
             q, k, v,
-            is_causal = True
+            is_causal = self.causal
         )
 
         out = self.merge_heads(out)
@@ -146,6 +149,7 @@ class Transformer(Module):
         kv_heads = None,
         ff_expansion_factor = 4.,
         use_sparse_attn = False,
+        causal = True,
         use_flex_sliding_window = False,
         use_flex_fine_selection = False,
         use_triton_fine_selection = False,
@@ -164,6 +168,8 @@ class Transformer(Module):
         if use_flex_sliding_window or use_flex_fine_selection:
             assert exists(flex_attention), 'flex attention is not available on your current version of pytorch'
 
+        self.causal = causal
+
         self.use_sparse_attn = use_sparse_attn
         self.use_flex_sliding_window = use_sparse_attn & use_flex_sliding_window
         self.use_flex_fine_selection = use_sparse_attn & use_flex_fine_selection
@@ -177,6 +183,7 @@ class Transformer(Module):
                     dim_head = dim_head,
                     heads = heads,
                     kv_heads = kv_heads,
+                    causal = causal,
                     use_triton_kernel = use_triton_fine_selection,
                     **sparse_attn_kwargs
                 )
@@ -185,6 +192,7 @@ class Transformer(Module):
                     dim = dim,
                     dim_head = dim_head,
                     heads = heads,
+                    causal = causal,
                     kv_heads = kv_heads
                 )
 
@@ -275,12 +283,12 @@ class Transformer(Module):
 
         if not disable_flex and self.use_flex_sliding_window:
             attn_kwargs.update(
-                sliding_window_flex_mask = create_sliding_mask(seq_len, self.attn_sliding_window_size)
+                sliding_window_flex_mask = create_sliding_mask(seq_len, self.attn_sliding_window_size, causal = self.causal)
             )
 
         if not disable_flex and self.use_flex_fine_selection:
             attn_kwargs.update(
-                fine_selection_flex_mask = create_fine_mask(seq_len, self.attn_fine_block_size)
+                fine_selection_flex_mask = create_fine_mask(seq_len, self.attn_fine_block_size, causal = self.causal)
             )
 
         # cache
