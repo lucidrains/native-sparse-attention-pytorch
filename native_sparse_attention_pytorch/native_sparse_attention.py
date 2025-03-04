@@ -41,19 +41,27 @@ except ImportError:
 
 # flex attn sliding attention mask
 
-def create_sliding_mask(seq_len, window_size):
+def create_sliding_mask(seq_len, window_size, causal = True):
     def sliding_mask(_, __, q_idx, kv_idx):
-        causal_mask = q_idx >= kv_idx
 
-        sliding_mask = (q_idx - kv_idx) <= window_size
-        causal_mask = causal_mask & sliding_mask
+        distance = q_idx - kv_idx
+        mask = distance <= window_size
 
-        return causal_mask
+        if causal:
+            mask = mask & q_idx >= kv_idx
+        else:
+            mask = mask & (distance >= -window_size)
+
+        return mask
 
     block_mask = create_block_mask(sliding_mask, B = None, H = None, Q_LEN = seq_len, KV_LEN = seq_len, _compile = True)
     return block_mask
 
-def create_compress_mask(seq_len, kv_seq_len, compress_block_size, mem_kv_len = 0):
+def create_compress_mask(seq_len, kv_seq_len, compress_block_size, mem_kv_len = 0, causal = True):
+
+    if not causal:
+        return None
+
     # cannot be used as using attention logits for importance score
     # but just to show the immense potential of flex attention
 
@@ -69,7 +77,7 @@ def create_compress_mask(seq_len, kv_seq_len, compress_block_size, mem_kv_len = 
     block_mask = create_block_mask(compress_mask, B = None, H = None, Q_LEN = seq_len, KV_LEN = kv_seq_len + mem_kv_len, _compile = True)
     return block_mask
 
-def create_fine_mask(seq_len, fine_block_size):
+def create_fine_mask(seq_len, fine_block_size, causal = True):
 
     def inner(selected_block_indices: Tensor, num_grouped_queries = 1):
         device = selected_block_indices.device
@@ -85,6 +93,9 @@ def create_fine_mask(seq_len, fine_block_size):
             kv_head_idx = h_idx // num_grouped_queries
 
             is_selected = one_hot_selected_block_indices[b_idx, kv_head_idx, q_idx, compressed_kv_idx]
+
+            if not causal:
+                return is_selected
 
             causal_mask = q_idx >= kv_idx
             block_diagonal = compressed_q_idx == compressed_kv_idx
@@ -189,6 +200,7 @@ class SparseAttention(Module):
         num_selected_blocks,
         kv_heads = None,
         num_compressed_mem_kv = 1,
+        causal = False,
         norm = True,
         use_diff_topk = False,
         use_triton_kernel = False,
@@ -219,6 +231,10 @@ class SparseAttention(Module):
 
         self.norm = nn.RMSNorm(dim) if norm else nn.Identity()
 
+        # autoregressive or not - will extend this work for long context video / genomics use-cases
+
+        self.causal = causal
+
         # rotary
 
         self.rotary_emb = RotaryEmbedding(dim_head)
@@ -236,7 +252,7 @@ class SparseAttention(Module):
         self.sliding_window = LocalAttention(
             dim = dim_head,
             window_size = sliding_window_size,
-            causal = True,
+            causal = causal,
             exact_windowsize = True,
             autopad = True,
             use_rotary_pos_emb = False
@@ -322,6 +338,8 @@ class SparseAttention(Module):
         cache,
         return_cache = True
     ):
+        assert self.causal, 'inference only relevant for autoregressive'
+
         # destruct cache
 
         (
@@ -515,6 +533,8 @@ class SparseAttention(Module):
             assert inp.shape[1] == 1, 'input must be single tokens if inferencing with cache key values'
             return self.forward_inference(inp, cache, return_cache = return_cache)
 
+        assert not (self.causal and return_cache)
+
         batch, seq_len, scale, heads, device = *inp.shape[:2], self.scale, self.heads, inp.device
 
         compress_divisible_seq_len = round_down_mult(seq_len, self.compress_block_size)
@@ -560,11 +580,16 @@ class SparseAttention(Module):
         ck = cat((mem_ck, ck), dim = -2)
         cv = cat((mem_cv, cv), dim = -2)
 
-        cq_seq = arange(seq_len, device = device)
-        ck_seq = ((arange(num_compress_blocks, device = device) + 1) * self.compress_block_size) - 1
-        ck_seq = F.pad(ck_seq, (num_mem_compress_kv, 0), value = -1)
+        # compressed masking
 
-        cmask = einx.less('j, i -> i j', ck_seq, cq_seq)
+        cmask = None
+
+        if self.causal:
+            cq_seq = arange(seq_len, device = device)
+            ck_seq = ((arange(num_compress_blocks, device = device) + 1) * self.compress_block_size) - 1
+            ck_seq = F.pad(ck_seq, (num_mem_compress_kv, 0), value = -1)
+
+            cmask = einx.less('j, i -> i j', ck_seq, cq_seq)
 
         compressed_attn_out, csim = attend(cq, ck, cv, mask = cmask, return_sim = True)
 
@@ -657,7 +682,8 @@ class SparseAttention(Module):
                     self.selection_block_size,
                     selected_block_indices,
                     fmask,
-                    sel_scale = gates
+                    sel_scale = gates,
+                    include_block_diagonal = self.causal
                 )
 
             elif exists(fine_selection_flex_mask):
@@ -685,19 +711,20 @@ class SparseAttention(Module):
                     if exists(gates):
                         gates = pad_at_dim(gates, (0, remainder), value = 0, dim = -2)
 
-                # handle block causal diagonal in the diagram, but run experiments without to see
+                if not self.causal:
+                    # handle block causal diagonal in the diagram, but run experiments without to see
 
-                fine_window_seq = arange(fine_divisible_seq_len, device = device) // self.selection_block_size
-                fine_window_seq = repeat(fine_window_seq, 'n -> b h n 1', b = batch, h = selected_block_indices.shape[1])
-                selected_block_indices = cat((selected_block_indices, fine_window_seq), dim = -1) # for the block causal diagonal in fig2
+                    fine_window_seq = arange(fine_divisible_seq_len, device = device) // self.selection_block_size
+                    fine_window_seq = repeat(fine_window_seq, 'n -> b h n 1', b = batch, h = selected_block_indices.shape[1])
+                    selected_block_indices = cat((selected_block_indices, fine_window_seq), dim = -1) # for the block causal diagonal in fig2
 
-                fmask = repeat(fmask, 'b h i w -> b h i w j', j = self.selection_block_size)
+                    fmask = repeat(fmask, 'b h i w -> b h i w j', j = self.selection_block_size)
 
-                causal_mask = torch.ones((self.selection_block_size,) * 2, device = device, dtype = torch.bool).tril()
-                causal_mask = repeat(causal_mask, 'i j -> b h (w i) 1 j', w = num_fine_blocks, b = batch, h = fmask.shape[1])
+                    causal_mask = torch.ones((self.selection_block_size,) * 2, device = device, dtype = torch.bool).tril()
+                    causal_mask = repeat(causal_mask, 'i j -> b h (w i) 1 j', w = num_fine_blocks, b = batch, h = fmask.shape[1])
 
-                fmask = cat((fmask, causal_mask), dim = -2)
-                fmask = rearrange(fmask, 'b h i w j -> b h i (w j)')
+                    fmask = cat((fmask, causal_mask), dim = -2)
+                    fmask = rearrange(fmask, 'b h i w j -> b h i (w j)')
 
                 # select out the spatial crops of keys / values for fine attention
 
@@ -752,7 +779,10 @@ class SparseAttention(Module):
             # if only first block, just do a simple block causal
 
             seq_len = fk.shape[-2]
-            fmask = causal_mask = torch.ones((seq_len, seq_len), device = device, dtype = torch.bool).tril()
+            fmask = None
+
+            if self.causal:
+                fmask = causal_mask = torch.ones((seq_len, seq_len), device = device, dtype = torch.bool).tril()
 
             fine_attn_out = attend(fq, fk, fv, mask = fmask)
 
