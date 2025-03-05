@@ -401,7 +401,7 @@ def forward_kernel_causal_and_sparse(
     # write back lse
 
     lse_i = lse_i.reshape(BLOCK, QUERY_HEAD_GROUPS)
-    tl.store(lse_ptrs, lse_i, mask = offs_m[:, None] < seqlen_q)
+    tl.store(lse_ptrs, lse_i)
 
     # write to output
 
@@ -1362,12 +1362,12 @@ def backward_kernel(
 
     D += (
         off_b * stride_D_b +
-        off_h * QUERY_HEAD_GROUPS * seqlen_q_rounded
+        off_qh * seqlen_q_rounded
     )
 
     LSE += (
         off_b * stride_lse_b +
-        off_h * QUERY_HEAD_GROUPS * seqlen_q_rounded
+        off_qh * seqlen_q_rounded
     )
 
     num_block_n = tl.cdiv(seqlen_k, BLOCK)
@@ -1719,5 +1719,5 @@ def native_sparse_attend(
 
     if not return_lse:
         return out
-
+    
     return out, lse[..., :seq_len]
