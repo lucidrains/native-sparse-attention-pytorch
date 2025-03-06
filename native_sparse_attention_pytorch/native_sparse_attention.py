@@ -454,6 +454,8 @@ class SparseAttention(Module):
 
         # select out the sparse kv segments as defined by compressed attention map as importance score
 
+        fmask = None
+
         if has_selected_kv_for_fine_attn:
             if self.query_heads_share_selected_kv:
                 importance_scores = reduce(importance_scores, 'b (h grouped_queries) ... -> b h ...', 'mean', grouped_queries = self.num_grouped_queries)
@@ -493,7 +495,8 @@ class SparseAttention(Module):
 
         fsim = einsum(fq, fk, 'b h gh i d, b h j d -> b h gh i j') * scale
 
-        fsim = einx.where('b h i j, b h gh i j, -> b h gh i j', fmask, fsim, max_neg_value(fsim))
+        if exists(fmask):
+            fsim = einx.where('b h i j, b h gh i j, -> b h gh i j', fmask, fsim, max_neg_value(fsim))
 
         fattn = fsim.softmax(dim = -1)
 
