@@ -171,7 +171,7 @@ def attend(
     mask_value = max_neg_value(sim)
 
     if exists(mask):
-        sim = sim.masked_fill(~mask, mask_value)
+        sim = sim.masked_fill(~mask, mask_value // 10)
 
     attn = sim.softmax(dim = -1)
 
@@ -425,13 +425,25 @@ class SparseAttention(Module):
 
         # 2. fine attention inference (todo - compress and fine diff block sizes)
 
-        assert self.compress_block_size == self.selection_block_size
-
         importance_scores = csim[..., self.num_mem_compress_kv:]
-        importance_scores += torch.randn_like(importance_scores) * 100
 
         num_compress_blocks = importance_scores.shape[-1]
-        num_selected = min(self.num_selected_blocks, num_compress_blocks)
+
+        if self.compress_block_size != self.selection_block_size:
+            compress_seq_len = num_compress_blocks * self.compress_block_size
+
+            if self.interpolated_importance_score:
+                importance_scores = interpolate_1d(importance_scores, compress_seq_len)
+            else:
+                importance_scores = repeat(importance_scores, '... j -> ... (bsz j)', bsz = self.compress_block_size)
+
+            fine_seq_len = round_down_mult(compress_seq_len, self.selection_block_size)
+
+            importance_scores = importance_scores[..., :fine_seq_len]
+            importance_scores = reduce(importance_scores, '... (bsz j) -> ... j', 'mean', bsz = self.selection_block_size)
+
+        num_fine_blocks = importance_scores.shape[-1]
+        num_selected = min(self.num_selected_blocks, num_fine_blocks)
         has_selected_kv_for_fine_attn = num_selected > 0
 
         # block causal diagonal

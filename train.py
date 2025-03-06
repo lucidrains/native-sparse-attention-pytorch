@@ -39,7 +39,7 @@ QUERY_HEADS_SHARE_SELECTION = True    # if set to False, each query head can loo
 # sparse attention related
 
 SLIDING_WINDOW_SIZE = 64
-COMPRESS_BLOCK_SIZE = 16
+COMPRESS_BLOCK_SIZE = 8
 
 FINE_BLOCK_SIZE = 16
 NUM_FINE_SELECTED = 4

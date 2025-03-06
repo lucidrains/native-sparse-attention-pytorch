@@ -1707,6 +1707,8 @@ def native_sparse_attend(
     assert divisible_by(q_heads, kv_heads)
     assert sel_heads in (q_heads, kv_heads)
 
+    assert block_size >= 16, 'fine selection block size must be 16 or greater for now'
+
     # query heads within each group to attend to different segments
 
     if kv_heads != sel_heads:
