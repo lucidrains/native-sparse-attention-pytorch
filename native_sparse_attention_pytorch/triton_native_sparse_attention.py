@@ -431,11 +431,12 @@ def forward_kernel_causal_and_sparse(
             )
 
 @triton.heuristics(
-    {
-        "EVEN_M": lambda args: divisible_by(args["seqlen_q"], args["BLOCK"]),
-        "EVEN_N": lambda args: divisible_by(args["seqlen_k"], args["BLOCK"]),
-        "EVEN_HEADDIM": lambda args: args["headdim"] == args["BLOCK_HEADDIM"],
-    }
+    dict(
+        EVEN_M = lambda args: divisible_by(args["seqlen_q"], args["BLOCK"]),
+        EVEN_N = lambda args: divisible_by(args["seqlen_k"], args["BLOCK"]),
+        EVEN_HEADDIM = lambda args: args["headdim"] == args["BLOCK_HEADDIM"],
+        QUERY_EXPAND_DIM = lambda args: 16 // args['QUERY_HEAD_GROUPS']
+    )
 )
 @triton.jit
 def forward_kernel(
@@ -599,7 +600,6 @@ def native_sparse_attn_forward(
         BLOCK_HEADDIM,
         BLOCK = block_size,
         QUERY_HEAD_GROUPS = head_groups,
-        QUERY_EXPAND_DIM = 16 // head_groups,
         NUM_SEL_KV_BLOCKS = num_selected_fine_blocks,
         INCLUDE_BLOCK_CAUSAL = include_block_causal,
         SLIDING = False,
@@ -1275,6 +1275,11 @@ def backward_kernel_one_col_block_causal(
         EVEN_HEADDIM = EVEN_HEADDIM,
     )
 
+@triton.heuristics(
+    dict(
+        QUERY_EXPAND_DIM = lambda args: 16 // args['QUERY_HEAD_GROUPS']
+    )
+)
 @triton.jit
 def backward_kernel(
     Q,
@@ -1576,7 +1581,6 @@ def native_sparse_attn_backward(
         BLOCK_HEADDIM,
         BLOCK = block_size,
         QUERY_HEAD_GROUPS = head_groups,
-        QUERY_EXPAND_DIM = 16 // head_groups,
         EVEN_M = divisible_by(seqlen_q, block_size),
         EVEN_N = divisible_by(seqlen_k, block_size),
         EVEN_HEADDIM = BLOCK_HEADDIM == dim,
