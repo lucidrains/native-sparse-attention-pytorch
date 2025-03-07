@@ -640,9 +640,16 @@ def backward_preprocess_do_o_dot(
     # load
 
     o = tl.load(
-        Out + off_b * stride_ob + off_h * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :],
-        mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
-        other=0.0,
+        Out +
+        off_b * stride_ob +
+        off_h * stride_oh +
+        offs_m[:, None] * stride_om +
+        offs_d[None, :],
+        mask = (
+            (offs_m[:, None] < seqlen_q) &
+            (offs_d[None, :] < headdim)
+        ),
+        other = 0.0,
     ).to(tl.float32)
 
     do = tl.load(
@@ -651,7 +658,10 @@ def backward_preprocess_do_o_dot(
         + off_h * stride_doh
         + offs_m[:, None] * stride_dom
         + offs_d[None, :],
-        mask = (offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+        mask = (
+            offs_m[:, None] < seqlen_q) &
+            (offs_d[None, :] < headdim
+        ),
         other = 0.0,
     ).to(tl.float32)
 
@@ -1189,8 +1199,8 @@ def backward_kernel_one_col_block_causal(
         # [2022-11-01] TD: Triton bug, there's a race condition if we just use m_mask and not d_mask.
         do = tl.load(
             do_ptrs,
-            mask=(offs_m[None, :, None] < seqlen_q) & (offs_d[None, None, :] < headdim),
-            other=0.0,
+            mask = (offs_m[None, :, None] < seqlen_q) & (offs_d[None, None, :] < headdim),
+            other = 0.0,
         )
 
     do = do.reshape(QUERY_HEAD_GROUPS * BLOCK, BLOCK_HEADDIM)
