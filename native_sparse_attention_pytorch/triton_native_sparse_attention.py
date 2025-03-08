@@ -928,7 +928,7 @@ def backward_kernel_one_col_block_sparse(
 
     # take care of block dv
 
-    if not BLOCK_DV_USE_DOT:
+    if BLOCK_DV_USE_DOT:
         p_expanded = p.to(do.dtype)
         p_expanded = tl.expand_dims(p_expanded, 2)
         p_expanded = tl.broadcast_to(p_expanded, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK))
@@ -984,11 +984,8 @@ def backward_kernel_one_col_block_sparse(
     # block dk
 
     if BLOCK_DK_USE_DOT:
-        q_expanded = tl.expand_dims(q, 2)
-        q_expanded = tl.broadcast_to(q_expanded, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK_HEADDIM))
-        q_expanded = q_expanded.reshape(BLOCK, 16, BLOCK_HEADDIM)
-
-        block_dk = tl.dot(tl.permute(ds_expanded, (0, 2, 1)), q_expanded.to(ds.dtype)) / QUERY_EXPAND_DIM
+        ds_permuted = tl.permute(ds_expanded, (0, 2, 1))
+        block_dk = tl.dot(ds_permuted.to(q_expanded.dtype), q_expanded) / QUERY_EXPAND_DIM
     else:
         block_dk = ds[:, :, :, None] * q[:, :, None, :].to(ds.dtype)
         block_dk = tl.sum(block_dk, 1)
@@ -1002,8 +999,7 @@ def backward_kernel_one_col_block_sparse(
 
     # block dq
 
-    ds_expanded = ds_expanded.to(block_k.dtype)
-    block_dq = tl.dot(ds_expanded, block_k)
+    block_dq = tl.dot(ds_expanded.to(block_k.dtype), block_k)
 
     block_dq = block_dq.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK_HEADDIM)
     block_dq = tl.sum(block_dq, 2) / QUERY_EXPAND_DIM

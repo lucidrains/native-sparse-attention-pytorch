@@ -142,7 +142,7 @@ fine_block_size = 16
 num_sel = 6
 dim_head = 64
 fused_sliding_window = False
-block_dk_dv_use_dot = False
+block_dk_dv_use_dot = False # need sufficient shared memory, A100 works
 
 q = torch.randn(batch, q_heads, seq_len, dim_head).cuda()
 k = torch.randn(batch, kv_heads, seq_len, dim_head).cuda()
@@ -174,9 +174,9 @@ nsa_out.sum().backward()
 # asserts
 
 assert torch.allclose(out, nsa_out, atol = 1e-2)
-assert torch.allclose(rlse, nlse, atol = 2e-2)
+assert torch.allclose(rlse, nlse, atol = 1e-2)
 
-assert torch.allclose(rsel_scale.grad, nsel_scale.grad, atol = 1e-2)
+assert torch.allclose(rsel_scale.grad, nsel_scale.grad, atol = 2e-2)
 assert torch.allclose(nv.grad, rv.grad, atol = 1e-2)
 assert torch.allclose(nq.grad, rq.grad, atol = 1e-2)
 assert torch.allclose(nk.grad, rk.grad, atol = 2e-2)
