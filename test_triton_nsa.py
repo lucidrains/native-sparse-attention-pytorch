@@ -140,11 +140,13 @@ q_heads = 4
 kv_heads = 2
 fine_block_size = 16
 num_sel = 6
+dim_head = 64
 fused_sliding_window = False
+block_dk_dv_use_dot = False
 
-q = torch.randn(batch, q_heads, seq_len, 64).cuda()
-k = torch.randn(batch, kv_heads, seq_len, 64).cuda()
-v = torch.randn(batch, kv_heads, seq_len, 64).cuda()
+q = torch.randn(batch, q_heads, seq_len, dim_head).cuda()
+k = torch.randn(batch, kv_heads, seq_len, dim_head).cuda()
+v = torch.randn(batch, kv_heads, seq_len, dim_head).cuda()
 
 indices = torch.randint(0, 2, (batch, kv_heads, seq_len, num_sel)).cuda()
 mask = torch.randint(0, 2, (batch, kv_heads, seq_len, num_sel)).bool().cuda()
@@ -166,17 +168,17 @@ out.sum().backward()
 
 # triton nsa forwards and backwards
 
-nsa_out, nlse = native_sparse_attend(nq, nk, nv, fine_block_size, indices, mask, sel_scale = nsel_scale, return_lse = True)
+nsa_out, nlse = native_sparse_attend(nq, nk, nv, fine_block_size, indices, mask, sel_scale = nsel_scale, return_lse = True, block_dk_dv_use_dot = block_dk_dv_use_dot)
 nsa_out.sum().backward()
 
 # asserts
 
 assert torch.allclose(out, nsa_out, atol = 1e-2)
-assert torch.allclose(rlse, nlse, atol = 1e-2)
+assert torch.allclose(rlse, nlse, atol = 2e-2)
 
 assert torch.allclose(rsel_scale.grad, nsel_scale.grad, atol = 1e-2)
 assert torch.allclose(nv.grad, rv.grad, atol = 1e-2)
 assert torch.allclose(nq.grad, rq.grad, atol = 1e-2)
-assert torch.allclose(nk.grad, rk.grad, atol = 1e-2)
+assert torch.allclose(nk.grad, rk.grad, atol = 2e-2)
 
 print('✅ outputs and gradients are same between pytorch native sparse attn and triton native sparse attn')

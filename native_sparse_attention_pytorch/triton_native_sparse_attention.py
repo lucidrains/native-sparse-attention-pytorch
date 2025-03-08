@@ -742,7 +742,9 @@ def backward_kernel_one_col_block_sparse(
     QUERY_HEAD_GROUPS: tl.constexpr,
     QUERY_EXPAND_DIM: tl.constexpr,
     RETURN_SEL_GRADS: tl.constexpr,
-    OFF_SEL_KV_BLOCKS: tl.constexpr
+    OFF_SEL_KV_BLOCKS: tl.constexpr,
+    BLOCK_DV_USE_DOT: tl.constexpr,
+    BLOCK_DK_USE_DOT: tl.constexpr,
 ):
     # We need to make sure begin_m is a multiple of BLOCK_M (not BLOCK_N)
 
@@ -918,23 +920,33 @@ def backward_kernel_one_col_block_sparse(
 
     p = tl.exp(masked_qk * softmax_scale - lse_i[:, :, None])
 
+    # prepare do
+
+    do_expanded = tl.expand_dims(do, 2)
+    do_expanded = tl.broadcast_to(do_expanded, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK_HEADDIM))
+    do_expanded = do_expanded.reshape(BLOCK, 16, BLOCK_HEADDIM)
+
     # take care of block dv
 
-    block_dv = p.to(do.dtype)[:, :, :, None] * do[:, :, None, :]
+    if not BLOCK_DV_USE_DOT:
+        p_expanded = p.to(do.dtype)
+        p_expanded = tl.expand_dims(p_expanded, 2)
+        p_expanded = tl.broadcast_to(p_expanded, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK))
+        p_expanded = p_expanded.reshape(BLOCK, QUERY_HEAD_GROUPS * QUERY_EXPAND_DIM, BLOCK)
+        p_expanded = tl.permute(p_expanded, (0, 2, 1))
 
-    block_dv = tl.sum(block_dv, 1)
+        block_dv = tl.dot(p_expanded, do_expanded) / QUERY_EXPAND_DIM
+    else:
+        block_dv = p.to(do.dtype)[:, :, :, None] * do[:, :, None, :]
+        block_dv = tl.sum(block_dv, 1)
 
     tl.atomic_add(block_dv_ptrs, block_dv, mask = block_masks[:, None, None], sem = 'relaxed')
 
     # get dp
 
-    do = tl.expand_dims(do, 2)
-    do = tl.broadcast_to(do, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK_HEADDIM))
-    do = do.reshape(BLOCK, 16, BLOCK_HEADDIM)
-
     block_v = tl.permute(block_v, (0, 2, 1))
 
-    dp = tl.dot(do, block_v)
+    dp = tl.dot(do_expanded, block_v)
 
     dp = dp.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK)
     dp = tl.sum(dp, 2) / QUERY_EXPAND_DIM
@@ -963,10 +975,23 @@ def backward_kernel_one_col_block_sparse(
             sem = 'relaxed'
         )
 
+    # ds
+
+    ds_expanded = tl.expand_dims(ds, 2)
+    ds_expanded = tl.broadcast_to(ds_expanded, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK))
+    ds_expanded = ds_expanded.reshape(BLOCK, 16, BLOCK)
+
     # block dk
 
-    block_dk = ds[:, :, :, None] * q[:, :, None, :].to(ds.dtype)
-    block_dk = tl.sum(block_dk, 1)
+    if BLOCK_DK_USE_DOT:
+        q_expanded = tl.expand_dims(q, 2)
+        q_expanded = tl.broadcast_to(q_expanded, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK_HEADDIM))
+        q_expanded = q_expanded.reshape(BLOCK, 16, BLOCK_HEADDIM)
+
+        block_dk = tl.dot(tl.permute(ds_expanded, (0, 2, 1)), q_expanded.to(ds.dtype)) / QUERY_EXPAND_DIM
+    else:
+        block_dk = ds[:, :, :, None] * q[:, :, None, :].to(ds.dtype)
+        block_dk = tl.sum(block_dk, 1)
 
     tl.atomic_add(
         block_dk_ptrs,
@@ -977,11 +1002,7 @@ def backward_kernel_one_col_block_sparse(
 
     # block dq
 
-    ds_expanded = tl.expand_dims(ds, 2)
-    ds_expanded = tl.broadcast_to(ds_expanded, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK))
-    ds_expanded = ds_expanded.reshape(BLOCK, 16, BLOCK)
     ds_expanded = ds_expanded.to(block_k.dtype)
-
     block_dq = tl.dot(ds_expanded, block_k)
 
     block_dq = block_dq.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK_HEADDIM)
@@ -1348,6 +1369,8 @@ def backward_kernel(
     RETURN_SEL_GRADS: tl.constexpr,
     INCLUDE_BLOCK_CAUSAL: tl.constexpr,
     SLIDING: tl.constexpr,
+    BLOCK_DV_USE_DOT: tl.constexpr,
+    BLOCK_DK_USE_DOT: tl.constexpr,
 ):
     off_hb = tl.program_id(1)
     off_b = off_hb // kv_heads
@@ -1467,7 +1490,9 @@ def backward_kernel(
                 QUERY_HEAD_GROUPS = QUERY_HEAD_GROUPS,
                 QUERY_EXPAND_DIM = QUERY_EXPAND_DIM,
                 RETURN_SEL_GRADS = RETURN_SEL_GRADS,
-                OFF_SEL_KV_BLOCKS = OFF_SEL_KV_BLOCKS
+                OFF_SEL_KV_BLOCKS = OFF_SEL_KV_BLOCKS,
+                BLOCK_DV_USE_DOT = BLOCK_DV_USE_DOT,
+                BLOCK_DK_USE_DOT = BLOCK_DK_USE_DOT,
             )
 
 def native_sparse_attn_backward(
@@ -1482,7 +1507,8 @@ def native_sparse_attn_backward(
     block_size = 128,
     include_block_causal = True,
     return_sel_grads = False,
-    sliding = False
+    sliding = False,
+    block_dk_dv_use_dot = None
 ):
     device = do.device
 
@@ -1596,7 +1622,9 @@ def native_sparse_attn_backward(
         EVEN_HEADDIM = BLOCK_HEADDIM == dim,
         RETURN_SEL_GRADS = return_sel_grads,
         INCLUDE_BLOCK_CAUSAL = include_block_causal,
-        SLIDING = sliding
+        SLIDING = sliding,
+        BLOCK_DV_USE_DOT = default(block_dk_dv_use_dot, head_groups > 1),
+        BLOCK_DK_USE_DOT = default(block_dk_dv_use_dot, head_groups > 1)
         # BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
         # num_warps=num_warps,
         # num_stages=1,
@@ -1619,7 +1647,8 @@ class NSA(Function):
         selected_block_indices,
         fmask,
         sel_scale,
-        include_block_causal
+        include_block_causal,
+        block_dk_dv_use_dot
     ):
         dtype = fq.dtype
 
@@ -1649,6 +1678,7 @@ class NSA(Function):
             head_groups,
             return_sel_grads,
             include_block_causal,
+            block_dk_dv_use_dot
         )
 
         return out.type(dtype), lse
@@ -1663,7 +1693,8 @@ class NSA(Function):
             block_size,
             head_groups,
             return_sel_grads,
-            include_block_causal
+            include_block_causal,
+            block_dk_dv_use_dot
         ) = ctx._saved_variables
 
         do = do.half()
@@ -1679,7 +1710,8 @@ class NSA(Function):
             out, lse, dq, dk, dv,
             block_size = block_size,
             include_block_causal = include_block_causal,
-            return_sel_grads = return_sel_grads
+            return_sel_grads = return_sel_grads,
+            block_dk_dv_use_dot = block_dk_dv_use_dot
         )
     
         ret_sel_grads = None
@@ -1687,7 +1719,7 @@ class NSA(Function):
         if return_sel_grads:
             ret_sel_grads = sel_grads
 
-        return dq, dk, dv, None, None, None, ret_sel_grads, None
+        return dq, dk, dv, None, None, None, ret_sel_grads, None, None
 
 _native_sparse_attend = NSA.apply
 
@@ -1709,7 +1741,8 @@ def native_sparse_attend(
     fmask: Bool['b qh n sel'] | Bool['b kh n sel'],
     sel_scale: Float['b kh n sel'] | Float['b qh n sel'] | None = None,
     include_block_causal = True,
-    return_lse = False
+    return_lse = False,
+    block_dk_dv_use_dot = False
 ):
     seq_len = fq.shape[-2]
     q_heads, kv_heads, sel_heads = fq.shape[1], fk.shape[1], selected_block_indices.shape[1]
@@ -1730,7 +1763,8 @@ def native_sparse_attend(
         selected_block_indices,
         fmask,
         sel_scale,
-        include_block_causal
+        include_block_causal,
+        block_dk_dv_use_dot
     )
 
     if not return_lse:
