@@ -66,6 +66,10 @@ from triton.language.extra import libdevice
 # kernels
 
 @triton.jit
+def reduce_avg(x, y):
+    return (x + y) / 2
+
+@triton.jit
 def forward_kernel_causal_and_sparse(
     Q,
     K,
@@ -353,7 +357,7 @@ def forward_kernel_causal_and_sparse(
 
         block_qk += tl.dot(q, k_block)
         block_qk = block_qk.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK)
-        block_qk = tl.sum(block_qk, 2) / QUERY_EXPAND_DIM
+        block_qk = tl.reduce(block_qk, 2, reduce_avg)
 
         qk += block_qk
         qk += tl.where(block_masks[:, None, None], 0, float("-inf"))
@@ -383,7 +387,7 @@ def forward_kernel_causal_and_sparse(
 
         block_acc_o = tl.dot(p_expanded, v_block)
         block_acc_o = block_acc_o.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK_HEADDIM)
-        block_acc_o = tl.sum(block_acc_o, 2) / QUERY_EXPAND_DIM
+        block_acc_o = tl.reduce(block_acc_o, 2, reduce_avg)
 
         acc_o += block_acc_o
 
@@ -914,7 +918,7 @@ def backward_kernel_one_col_block_sparse(
     block_qk = tl.dot(q_expanded, block_k_permuted)
 
     block_qk = block_qk.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK)
-    qk = tl.sum(block_qk, 2) / QUERY_EXPAND_DIM
+    qk = tl.reduce(block_qk, 2, reduce_avg)
 
     masked_qk = qk + tl.where(block_masks[:, None, None], 0, float("-inf"))
 
@@ -949,7 +953,7 @@ def backward_kernel_one_col_block_sparse(
     dp = tl.dot(do_expanded, block_v)
 
     dp = dp.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK)
-    dp = tl.sum(dp, 2) / QUERY_EXPAND_DIM
+    dp = tl.reduce(dp, 2, reduce_avg)
 
     # ds
 
@@ -1002,7 +1006,7 @@ def backward_kernel_one_col_block_sparse(
     block_dq = tl.dot(ds_expanded.to(block_k.dtype), block_k)
 
     block_dq = block_dq.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK_HEADDIM)
-    block_dq = tl.sum(block_dq, 2) / QUERY_EXPAND_DIM
+    block_dq = tl.reduce(block_dq, 2, reduce_avg)
 
     dq += block_dq
 
