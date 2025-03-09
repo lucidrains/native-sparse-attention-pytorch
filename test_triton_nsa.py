@@ -141,7 +141,7 @@ kv_heads = 2
 fine_block_size = 16
 num_sel = 6
 dim_head = 64
-fused_sliding_window = False
+fused_sliding_window = True
 block_dk_dv_use_dot = False # need sufficient shared memory, A100 works
 
 q = torch.randn(batch, q_heads, seq_len, dim_head).cuda()

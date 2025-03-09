@@ -452,6 +452,7 @@ def forward_kernel(
     Out,
     SlidingOut,
     Lse,
+    SlidingLse,
     softmax_scale,
     stride_qb,
     stride_qh,
@@ -490,9 +491,13 @@ def forward_kernel(
     if RETURN_SLIDING_OUT:
         sliding = tl.program_id(2) == 0
         out_ptr = SlidingOut if sliding else Out
+        lse_ptr = SlidingLse if sliding else Lse
+        num_sel_kv_blocks = 0 if sliding else NUM_SEL_KV_BLOCKS
     else:
         sliding = False
         out_ptr = Out
+        lse_ptr = Lse
+        num_sel_kv_blocks = NUM_SEL_KV_BLOCKS
 
     forward_kernel_causal_and_sparse(
         Q,
@@ -533,7 +538,7 @@ def forward_kernel(
         BLOCK,
         QUERY_HEAD_GROUPS,
         QUERY_EXPAND_DIM,
-        NUM_SEL_KV_BLOCKS,
+        num_sel_kv_blocks,
         INCLUDE_BLOCK_CAUSAL,
         sliding
     )
@@ -570,6 +575,7 @@ def native_sparse_attn_forward(
     seqlen_q_rounded = round_up_multiple(seqlen_q, TRITON_BLOCK_SIZE)
 
     lse = torch.empty((batch, nheads, seqlen_q_rounded), device = device, dtype = torch.float32)
+    sliding_lse = torch.empty((batch, nheads, seqlen_q_rounded), device = device, dtype = torch.float32)
 
     o = torch.empty_like(q)
     slide_o = torch.empty_like(q)
@@ -592,6 +598,7 @@ def native_sparse_attn_forward(
         o,
         slide_o,
         lse,
+        sliding_lse,
         softmax_scale,
         q.stride(0),
         q.stride(1),
