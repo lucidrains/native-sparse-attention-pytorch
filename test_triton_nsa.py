@@ -162,16 +162,29 @@ nq, nk, nv, nsel_scale = tuple(t.clone().requires_grad_() for t in (q, k, v, sel
 out, rlse = regular_attend(rq, rk, rv, indices, mask, block_size = fine_block_size, sel_scale = rsel_scale, return_lse = True, return_sliding_window_out = fused_sliding_window)
 
 if fused_sliding_window:
-    out = sum(out)
+    loss = sum(out).sum()
+else:
+    loss = out.sum()
 
-out.sum().backward()
+loss.backward()
 
 # triton nsa forwards and backwards
 
-nsa_out, nlse = native_sparse_attend(nq, nk, nv, fine_block_size, indices, mask, sel_scale = nsel_scale, return_lse = True, block_dk_dv_use_dot = block_dk_dv_use_dot)
-nsa_out.sum().backward()
+nsa_out, nlse = native_sparse_attend(nq, nk, nv, fine_block_size, indices, mask, sel_scale = nsel_scale, return_lse = True, block_dk_dv_use_dot = block_dk_dv_use_dot, return_sliding_window_out = fused_sliding_window)
+
+if fused_sliding_window:
+    nsa_loss = sum(nsa_out).sum()
+else:
+    nsa_loss = nsa_out.sum()
+
+nsa_loss.backward()
 
 # asserts
+
+if fused_sliding_window:
+    out, sliding_out = out
+    nsa_out, sliding_nsa_out = nsa_out
+    assert torch.allclose(sliding_out, sliding_nsa_out, atol = 1e-2)
 
 assert torch.allclose(out, nsa_out, atol = 1e-2)
 assert torch.allclose(rlse, nlse, atol = 1e-2)

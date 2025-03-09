@@ -450,6 +450,7 @@ def forward_kernel(
     kv_block_indices,
     kv_block_mask,
     Out,
+    SlidingOut,
     Lse,
     softmax_scale,
     stride_qb,
@@ -484,15 +485,22 @@ def forward_kernel(
     QUERY_EXPAND_DIM: tl.constexpr,
     NUM_SEL_KV_BLOCKS: tl.constexpr,
     INCLUDE_BLOCK_CAUSAL: tl.constexpr,
-    SLIDING: tl.constexpr
+    RETURN_SLIDING_OUT: tl.constexpr
 ):
+    if RETURN_SLIDING_OUT:
+        sliding = tl.program_id(2) == 0
+        out_ptr = SlidingOut if sliding else Out
+    else:
+        sliding = False
+        out_ptr = Out
+
     forward_kernel_causal_and_sparse(
         Q,
         K,
         V,
         kv_block_indices,
         kv_block_mask,
-        Out,
+        out_ptr,
         Lse,
         softmax_scale,
         stride_qb,
@@ -527,7 +535,7 @@ def forward_kernel(
         QUERY_EXPAND_DIM,
         NUM_SEL_KV_BLOCKS,
         INCLUDE_BLOCK_CAUSAL,
-        SLIDING
+        sliding
     )
 
 def native_sparse_attn_forward(
@@ -537,7 +545,8 @@ def native_sparse_attn_forward(
     kv_block_indices,
     kv_block_mask,
     block_size = 128,
-    include_block_causal = True
+    include_block_causal = True,
+    return_sliding_window_out = False
 ):
     q, k, v, kv_block_indices = [x if is_contiguous(x) else x.contiguous() for x in (q, k, v, kv_block_indices)]
 
@@ -563,11 +572,16 @@ def native_sparse_attn_forward(
     lse = torch.empty((batch, nheads, seqlen_q_rounded), device = device, dtype = torch.float32)
 
     o = torch.empty_like(q)
+    slide_o = torch.empty_like(q)
 
     BLOCK_HEADDIM = max(triton.next_power_of_2(dim), 16)
     num_warps = 4 if dim <= 64 else 8
 
-    grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK"]), batch * kv_heads) # kv heads here, as grouped query heads all loaded, following the paper
+    grid = lambda META: (
+        triton.cdiv(seqlen_q, META["BLOCK"]),
+        batch * kv_heads,
+        (2 if return_sliding_window_out else 1)
+    ) # kv heads here, as grouped query heads all loaded, following the paper
 
     forward_kernel[grid](
         q,
@@ -576,6 +590,7 @@ def native_sparse_attn_forward(
         kv_block_indices,
         kv_block_mask,
         o,
+        slide_o,
         lse,
         softmax_scale,
         q.stride(0),
@@ -606,12 +621,12 @@ def native_sparse_attn_forward(
         QUERY_HEAD_GROUPS = head_groups,
         NUM_SEL_KV_BLOCKS = num_selected_fine_blocks,
         INCLUDE_BLOCK_CAUSAL = include_block_causal,
-        SLIDING = False,
+        RETURN_SLIDING_OUT = False,
         num_warps = num_warps,
         num_stages = 1,
     )
 
-    return o, lse
+    return o, slide_o, lse
 
 @triton.jit
 def backward_preprocess_do_o_dot(
@@ -1648,7 +1663,8 @@ class NSA(Function):
         fmask,
         sel_scale,
         include_block_causal,
-        block_dk_dv_use_dot
+        block_dk_dv_use_dot,
+        return_sliding_window_out
     ):
         dtype = fq.dtype
 
@@ -1658,15 +1674,16 @@ class NSA(Function):
 
         fq, fk, fv = tuple(t.half() for t in (fq, fk, fv))
 
-        out, lse = native_sparse_attn_forward(
+        out, slide_out, lse = native_sparse_attn_forward(
             fq, fk, fv,
             selected_block_indices,
             fmask,
             block_size = block_size,
             include_block_causal = include_block_causal,
+            return_sliding_window_out = return_sliding_window_out
         )
 
-        ctx.save_for_backward(fq, fk, fv, selected_block_indices, fmask, out, lse)
+        ctx.save_for_backward(fq, fk, fv, selected_block_indices, fmask, out, slide_out, lse)
 
         return_sel_grads = exists(sel_scale)
 
@@ -1678,23 +1695,32 @@ class NSA(Function):
             head_groups,
             return_sel_grads,
             include_block_causal,
-            block_dk_dv_use_dot
+            block_dk_dv_use_dot,
+            return_sliding_window_out
         )
 
-        return out.type(dtype), lse
+        return out.type(dtype), slide_out.type(dtype), lse
 
     @classmethod
-    def backward(self, ctx, do, _):
+    def backward(self, ctx, do, do_sliding, _):
         device = do.device
 
-        q, k, v, sel_block_indices, mask, out, lse = ctx.saved_tensors
+        (
+            q, k, v,
+            sel_block_indices,
+            mask,
+            out,
+            slide_out,
+            lse
+        ) = ctx.saved_tensors
 
         (
             block_size,
             head_groups,
             return_sel_grads,
             include_block_causal,
-            block_dk_dv_use_dot
+            block_dk_dv_use_dot,
+            return_sliding_window_out
         ) = ctx._saved_variables
 
         do = do.half()
@@ -1719,7 +1745,7 @@ class NSA(Function):
         if return_sel_grads:
             ret_sel_grads = sel_grads
 
-        return dq, dk, dv, None, None, None, ret_sel_grads, None, None
+        return dq, dk, dv, None, None, None, ret_sel_grads, None, None, None
 
 _native_sparse_attend = NSA.apply
 
@@ -1742,7 +1768,8 @@ def native_sparse_attend(
     sel_scale: Float['b kh n sel'] | Float['b qh n sel'] | None = None,
     include_block_causal = True,
     return_lse = False,
-    block_dk_dv_use_dot = False
+    block_dk_dv_use_dot = False,
+    return_sliding_window_out = False
 ):
     seq_len = fq.shape[-2]
     q_heads, kv_heads, sel_heads = fq.shape[1], fk.shape[1], selected_block_indices.shape[1]
@@ -1757,15 +1784,19 @@ def native_sparse_attend(
     if kv_heads != sel_heads:
         fk, fv = tuple(repeat(t, 'b h ... -> b (h gh) ...', gh = q_heads // kv_heads) for t in (fk, fv))
 
-    out, lse = _native_sparse_attend(
+    out, sliding_out, lse = _native_sparse_attend(
         fq, fk, fv,
         block_size,
         selected_block_indices,
         fmask,
         sel_scale,
         include_block_causal,
-        block_dk_dv_use_dot
+        block_dk_dv_use_dot,
+        return_sliding_window_out
     )
+
+    if return_sliding_window_out:
+        out = (out, out)
 
     if not return_lse:
         return out
