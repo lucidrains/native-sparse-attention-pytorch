@@ -322,8 +322,17 @@ def forward_kernel_causal_and_sparse(
     q = q.reshape(BLOCK, 16, BLOCK_HEADDIM)
 
     for off_sel_kv_block in range(NUM_SEL_KV_BLOCKS):
-        block_indices = tl.load(kv_block_indices_ptrs + off_sel_kv_block)
-        block_masks = tl.load(kv_block_mask_ptrs + off_sel_kv_block)
+        block_indices = tl.load(
+            kv_block_indices_ptrs + off_sel_kv_block,
+            mask = offs_m < seqlen_q,
+            other = 0
+        )
+
+        block_masks = tl.load(
+            kv_block_mask_ptrs + off_sel_kv_block,
+            mask = offs_m < seqlen_q,
+            other = False
+        )
 
         blocks_offs_n = block_indices[:, None] * BLOCK + tl.arange(0, BLOCK)[None, :]
 
@@ -345,7 +354,11 @@ def forward_kernel_causal_and_sparse(
 
         # load k of shape (m, n, d), sparsely selected by each query
 
-        k_block = tl.load(block_k_ptrs)
+        k_block = tl.load(
+            block_k_ptrs,
+            mask = blocks_offs_n[:, :, None] < seqlen_k,
+            other = 0.
+        )
 
         # similarities
 
@@ -376,7 +389,12 @@ def forward_kernel_causal_and_sparse(
 
         # aggregate values
 
-        v_block = tl.load(block_v_ptrs)
+        v_block = tl.load(
+            block_v_ptrs,
+            mask = blocks_offs_n[:, :, None] < seqlen_k,
+            other = 0.
+        )
+
         v_block = tl.reshape(v_block, (BLOCK, BLOCK, BLOCK_HEADDIM))
 
         block_p = block_p.to(v_block.dtype)
@@ -628,7 +646,7 @@ def native_sparse_attn_forward(
         QUERY_HEAD_GROUPS = head_groups,
         NUM_SEL_KV_BLOCKS = num_selected_fine_blocks,
         INCLUDE_BLOCK_CAUSAL = include_block_causal,
-        RETURN_SLIDING_OUT = False,
+        RETURN_SLIDING_OUT = return_sliding_window_out,
         num_warps = num_warps,
         num_stages = 1,
     )
