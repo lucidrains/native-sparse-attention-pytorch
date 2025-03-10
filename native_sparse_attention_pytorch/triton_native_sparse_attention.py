@@ -9,9 +9,10 @@ import math
 from math import ceil
 
 import torch
-from torch import Tensor
+from torch import Tensor, arange
 import torch.nn.functional as F
 
+import einx
 from einops import repeat, rearrange, reduce
 
 def exists(v):
@@ -107,6 +108,7 @@ def forward_kernel_causal_and_sparse(
     EVEN_N: tl.constexpr,
     EVEN_HEADDIM: tl.constexpr,
     BLOCK: tl.constexpr,
+    SEL_BLOCK: tl.constexpr,
     QUERY_HEAD_GROUPS: tl.constexpr,
     QUERY_EXPAND_DIM: tl.constexpr,
     NUM_SEL_KV_BLOCKS: tl.constexpr,
@@ -195,7 +197,7 @@ def forward_kernel_causal_and_sparse(
             num_kv_blocks = 1
             offset = 0
 
-        offs_n = start_m * BLOCK + tl.arange(0, BLOCK) + offset
+        offs_n = start_m * BLOCK + tl.arange(0, SEL_BLOCK) - (SEL_BLOCK - BLOCK)
 
         for _ in range(num_kv_blocks):
 
@@ -234,11 +236,19 @@ def forward_kernel_causal_and_sparse(
                         other = 0.0,
                     )
 
-            qk = tl.zeros([BLOCK * QUERY_HEAD_GROUPS, BLOCK], dtype=tl.float32)
+            qk = tl.zeros([BLOCK * QUERY_HEAD_GROUPS, SEL_BLOCK], dtype=tl.float32)
 
             qk += tl.dot(q, tl.trans(k))
 
-            qk = qk.reshape(BLOCK, QUERY_HEAD_GROUPS, BLOCK)
+            qk = qk.reshape(BLOCK, QUERY_HEAD_GROUPS, SEL_BLOCK)
+
+            if BLOCK != SEL_BLOCK:
+                block_diagonal_mask = (
+                    (offs_n[None, None, :] >= 0.) &
+                    ((offs_n[None, None, :] // SEL_BLOCK) == (offs_m[:, None, None] // SEL_BLOCK))
+                )
+
+                qk += tl.where(block_diagonal_mask, 0, float('-inf'))
 
             if not EVEN_N:
                 within_range_mask = offs_n[None, :] < seqlen_k
@@ -246,14 +256,14 @@ def forward_kernel_causal_and_sparse(
                 if SLIDING:
                     within_range_mask &= offs_n[None, :] >= 0.
 
-                qk += tl.where(within_range_mask, 0, float("-inf"))
+                qk += tl.where(within_range_mask, 0, float('-inf'))
 
-            qk = qk.reshape(BLOCK, QUERY_HEAD_GROUPS, BLOCK)
+            qk = qk.reshape(BLOCK, QUERY_HEAD_GROUPS, SEL_BLOCK)
 
             causal_mask = offs_m[:, None, None] >= offs_n[None, None, :]
 
             if SLIDING:
-                causal_mask &= (offs_n[None, None, :] - offs_m[:, None, None]) <= BLOCK
+                causal_mask &= (offs_n[None, None, :] - offs_m[:, None, None]) <= SEL_BLOCK
 
             qk += tl.where(causal_mask, 0, float("-inf"))
 
@@ -288,7 +298,7 @@ def forward_kernel_causal_and_sparse(
                         other = 0.0,
                     )
 
-            p = p.reshape(BLOCK * QUERY_HEAD_GROUPS, BLOCK).to(v.dtype)
+            p = p.reshape(BLOCK * QUERY_HEAD_GROUPS, SEL_BLOCK).to(v.dtype)
 
             causal_o = tl.dot(p, v)
 
@@ -500,6 +510,7 @@ def forward_kernel(
     EVEN_N: tl.constexpr,
     EVEN_HEADDIM: tl.constexpr,
     BLOCK: tl.constexpr,
+    SEL_BLOCK: tl.constexpr,
     QUERY_HEAD_GROUPS: tl.constexpr,
     QUERY_EXPAND_DIM: tl.constexpr,
     NUM_SEL_KV_BLOCKS: tl.constexpr,
@@ -554,6 +565,7 @@ def forward_kernel(
         EVEN_N,
         EVEN_HEADDIM,
         BLOCK,
+        SEL_BLOCK,
         QUERY_HEAD_GROUPS,
         QUERY_EXPAND_DIM,
         num_sel_kv_blocks,
@@ -577,6 +589,13 @@ def native_sparse_attn_forward(
     _, kv_heads, seqlen_k, _ = k.shape
     assert divisible_by(nheads, kv_heads)
     head_groups = nheads // kv_heads
+
+    assert divisible_by(block_size, 16)
+
+    num_blocks_per_sel = block_size // 16
+    if num_blocks_per_sel > 1:
+        kv_block_indices = einx.add('... sel, r -> ... (sel r)', kv_block_indices * num_blocks_per_sel, arange(num_blocks_per_sel, device = device))
+        kv_block_mask = repeat(kv_block_mask, '... sel -> ... (sel r)', r = num_blocks_per_sel)
 
     num_selected_fine_blocks = kv_block_indices.shape[-1]
     assert kv_block_indices.shape == kv_block_mask.shape
@@ -642,7 +661,8 @@ def native_sparse_attn_forward(
         seqlen_q // 32,
         seqlen_k // 32,
         BLOCK_HEADDIM,
-        BLOCK = block_size,
+        BLOCK = 16,
+        SEL_BLOCK = block_size,
         QUERY_HEAD_GROUPS = head_groups,
         NUM_SEL_KV_BLOCKS = num_selected_fine_blocks,
         INCLUDE_BLOCK_CAUSAL = include_block_causal,
@@ -1029,7 +1049,7 @@ def backward_kernel_one_col_block_sparse(
         tl.atomic_add(
             kv_block_grads_ptrs + OFF_SEL_KV_BLOCKS,
             sel_grads,
-            mask = offs_m < seqlen_q,
+            mask = (offs_m < seqlen_q),
             sem = 'relaxed'
         )
 
@@ -1121,6 +1141,7 @@ def backward_kernel_one_col_block_causal(
     EVEN_N: tl.constexpr,
     EVEN_HEADDIM: tl.constexpr,
     BLOCK: tl.constexpr,
+    SEL_BLOCK: tl.constexpr,
     QUERY_HEAD_GROUPS: tl.constexpr,
     QUERY_EXPAND_DIM: tl.constexpr,
     SLIDING: tl.constexpr
@@ -1132,7 +1153,7 @@ def backward_kernel_one_col_block_causal(
     # initialize row/col offsets
 
     offs_qm = begin_m + tl.arange(0, BLOCK)
-    offs_n = start_n * BLOCK + tl.arange(0, BLOCK)
+    offs_n = start_n * BLOCK + tl.arange(0, SEL_BLOCK) - (SEL_BLOCK - BLOCK)
     offs_m = start_n * BLOCK + tl.arange(0, BLOCK)
     offs_d = tl.arange(0, BLOCK_HEADDIM)
 
@@ -1168,8 +1189,8 @@ def backward_kernel_one_col_block_causal(
 
     # initialize dv and dk
 
-    dv = tl.zeros([BLOCK, BLOCK_HEADDIM], dtype=tl.float32)
-    dk = tl.zeros([BLOCK, BLOCK_HEADDIM], dtype=tl.float32)
+    dv = tl.zeros([SEL_BLOCK, BLOCK_HEADDIM], dtype=tl.float32)
+    dk = tl.zeros([SEL_BLOCK, BLOCK_HEADDIM], dtype=tl.float32)
 
     # There seems to be some problem with Triton pipelining that makes results wrong for
     # headdim=64, seqlen=(113, 255), bias_type='matrix'. In this case the for loop
@@ -1237,20 +1258,28 @@ def backward_kernel_one_col_block_causal(
 
     qk = tl.dot(q, tl.trans(k))
 
-    qk = qk.reshape(QUERY_HEAD_GROUPS, BLOCK, BLOCK)
+    qk = qk.reshape(QUERY_HEAD_GROUPS, BLOCK, SEL_BLOCK)
 
     mask = offs_m[:, None] >= offs_n[None, :]
+
+    if BLOCK != SEL_BLOCK:
+        block_diagonal_mask = (
+            (offs_n[None, :] >= 0.) &
+            ((offs_n[None, :] // SEL_BLOCK) == (offs_m[:, None] // SEL_BLOCK))
+        )
+
+        mask &= block_diagonal_mask
 
     # Trying to combine the two masks seem to make the result wrong
     if not EVEN_N:  # Need to mask out otherwise the softmax is wrong
         mask &= offs_n[None, :] < seqlen_k
 
     if SLIDING:
-        mask &= (offs_n[None, :] - offs_m[:, None]) < BLOCK
+        mask &= (offs_n[None, :] - offs_m[:, None]) < SEL_BLOCK
 
     qk = tl.where(mask, qk, float("-inf"))
 
-    qk = qk.reshape(QUERY_HEAD_GROUPS * BLOCK, BLOCK)
+    qk = qk.reshape(QUERY_HEAD_GROUPS * BLOCK, SEL_BLOCK)
 
     # There seems to be a race condition when headdim=48/96, and dq, dk, dv are wrong.
     # Also wrong for headdim=64.
@@ -1418,6 +1447,7 @@ def backward_kernel(
     EVEN_N: tl.constexpr,
     EVEN_HEADDIM: tl.constexpr,
     BLOCK: tl.constexpr,
+    SEL_BLOCK: tl.constexpr,
     QUERY_HEAD_GROUPS: tl.constexpr,
     QUERY_EXPAND_DIM: tl.constexpr,
     RETURN_SEL_GRADS: tl.constexpr,
@@ -1500,6 +1530,7 @@ def backward_kernel(
                 EVEN_N = EVEN_N,
                 EVEN_HEADDIM = EVEN_HEADDIM,
                 BLOCK = BLOCK,
+                SEL_BLOCK = SEL_BLOCK,
                 QUERY_HEAD_GROUPS = QUERY_HEAD_GROUPS,
                 QUERY_EXPAND_DIM = QUERY_EXPAND_DIM,
                 SLIDING = SLIDING
@@ -1576,6 +1607,17 @@ def native_sparse_attn_backward(
     assert divisible_by(q_heads, kv_heads)
     head_groups = q_heads // kv_heads
     assert divisible_by(16, head_groups)
+
+    assert divisible_by(block_size, 16)
+
+    num_blocks_per_sel = block_size // 16
+
+    orig_kv_block_grads = kv_block_grads
+
+    if num_blocks_per_sel > 1:
+        kv_block_indices = einx.add('... sel, r -> ... (sel r)', kv_block_indices * num_blocks_per_sel, arange(num_blocks_per_sel, device = device))
+        kv_block_mask = repeat(kv_block_mask, '... sel -> ... (sel r)', r = num_blocks_per_sel)
+        kv_block_grads = repeat(kv_block_grads, '... sel -> ... (sel r)', r = num_blocks_per_sel)
 
     num_sel_fine_blocks = kv_block_indices.shape[-1]
     assert kv_block_indices.shape == kv_block_mask.shape
@@ -1669,7 +1711,8 @@ def native_sparse_attn_backward(
         # Can't use kwargs here because triton autotune expects key to be args, not kwargs
         # IS_CAUSAL=causal, BLOCK_HEADDIM=d,
         BLOCK_HEADDIM,
-        BLOCK = block_size,
+        BLOCK = 16,
+        SEL_BLOCK = block_size,
         QUERY_HEAD_GROUPS = head_groups,
         EVEN_M = divisible_by(seqlen_q, block_size),
         EVEN_N = divisible_by(seqlen_k, block_size),
@@ -1683,6 +1726,9 @@ def native_sparse_attn_backward(
         # num_warps=num_warps,
         # num_stages=1,
     )
+
+    if num_blocks_per_sel > 1:
+        orig_kv_block_grads.copy_(reduce(kv_block_grads, '... (sel r) -> ... sel', 'sum', r = num_blocks_per_sel))
 
     return delta
 
@@ -1835,7 +1881,7 @@ def native_sparse_attend(
     )
 
     if return_sliding_window_out:
-        out = (out, out)
+        out = (out, sliding_out)
 
     if not return_lse:
         return out
