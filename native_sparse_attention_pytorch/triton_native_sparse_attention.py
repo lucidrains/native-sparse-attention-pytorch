@@ -947,8 +947,17 @@ def backward_kernel_one_col_block_sparse(
         offs_d[None, None, :]
     )
 
-    block_k = tl.load(block_k_ptrs)
-    block_v = tl.load(block_v_ptrs)
+    block_k = tl.load(
+        block_k_ptrs,
+        mask = blocks_offs_n[:, :, None] < seqlen_k,
+        other = 0.
+    )
+
+    block_v = tl.load(
+        block_v_ptrs,
+        mask = blocks_offs_n[:, :, None] < seqlen_k,
+        other = 0.
+    )
 
     q_expanded = tl.expand_dims(q, 2)
     q_expanded = tl.broadcast_to(q_expanded, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK_HEADDIM))
@@ -984,7 +993,11 @@ def backward_kernel_one_col_block_sparse(
         block_dv = p.to(do.dtype)[:, :, :, None] * do[:, :, None, :]
         block_dv = tl.sum(block_dv, 1)
 
-    tl.atomic_add(block_dv_ptrs, block_dv, mask = block_masks[:, None, None], sem = 'relaxed')
+    tl.atomic_add(
+        block_dv_ptrs, block_dv,
+        mask = block_masks[:, None, None] & blocks_offs_n[:, :, None] < seqlen_k,
+        sem = 'relaxed'
+    )
 
     # get dp
 
@@ -1016,6 +1029,7 @@ def backward_kernel_one_col_block_sparse(
         tl.atomic_add(
             kv_block_grads_ptrs + OFF_SEL_KV_BLOCKS,
             sel_grads,
+            mask = offs_m < seqlen_q,
             sem = 'relaxed'
         )
 
@@ -1037,7 +1051,7 @@ def backward_kernel_one_col_block_sparse(
     tl.atomic_add(
         block_dk_ptrs,
         block_dk,
-        mask = block_masks[:, None, None] & (blocks_offs_n[:, :, None] < seqlen_k),
+        mask = block_masks[:, None, None] & blocks_offs_n[:, :, None] < seqlen_k,
         sem = 'relaxed'
     )
 
