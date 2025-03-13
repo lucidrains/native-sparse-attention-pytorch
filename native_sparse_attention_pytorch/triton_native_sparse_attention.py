@@ -219,20 +219,28 @@ def forward_kernel_causal_and_sparse(
 
             if EVEN_N & EVEN_M:
                 if EVEN_HEADDIM:
-                    k = tl.load(k_ptrs)
+                    k = tl.load(
+                        k_ptrs,
+                        mask = (offs_n[:, None] >= 0),
+                        other = 0.
+                    )
                 else:
-                    k = tl.load(k_ptrs, mask=offs_d[None, :] < headdim, other=0.0)
+                    k = tl.load(
+                        k_ptrs,
+                        mask = (offs_n[:, None] >= 0) & (offs_d[None, :] < headdim),
+                        other = 0.0
+                    )
             else:
                 if EVEN_HEADDIM:
                     k = tl.load(
                         k_ptrs,
-                        mask = offs_n[:, None] < seqlen_k,
+                        mask = (offs_n[:, None] >= 0) & (offs_n[:, None] < seqlen_k),
                         other = 0.0,
                     )
                 else:
                     k = tl.load(
                         k_ptrs,
-                        mask = (offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
+                        mask = (offs_n[:, None] >= 0) & (offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
                         other = 0.0,
                     )
 
@@ -1229,19 +1237,36 @@ def backward_kernel_one_col_block_causal(
     # if we just call tl.load(k_ptrs), we get the wrong output!
     if EVEN_N & EVEN_M:
         if EVEN_HEADDIM:
-            k = tl.load(k_ptrs)
+            k = tl.load(
+                k_ptrs,
+                mask = (offs_n[:, None] >= 0),
+                other = 0.
+            )
             v = tl.load(v_ptrs)
         else:
-            k = tl.load(k_ptrs, mask=offs_d[None, :] < headdim, other=0.0)
+            k = tl.load(
+                k_ptrs,
+                mask = (offs_n[:, None] >= 0) & (offs_d[None, :] < headdim),
+                other = 0.0
+            )
+
             v = tl.load(v_ptrs, mask=offs_d[None, :] < headdim, other=0.0)
     else:
         if EVEN_HEADDIM:
-            k = tl.load(k_ptrs, mask=offs_n[:, None] < seqlen_k, other=0.0)
+            k = tl.load(
+                k_ptrs,
+                mask = (offs_n[:, None] >= 0) & (offs_n[:, None] < seqlen_k),
+                other = 0.0
+            )
+
             v = tl.load(v_ptrs, mask=offs_n[:, None] < seqlen_k, other=0.0)
         else:
             k = tl.load(
-                k_ptrs, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim), other=0.0
+                k_ptrs,
+                mask= (offs_n[:, None] >= 0) & (offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
+                other = 0.0
             )
+
             v = tl.load(
                 v_ptrs, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim), other=0.0
             )
@@ -1273,7 +1298,7 @@ def backward_kernel_one_col_block_causal(
 
     if BLOCK != SEL_BLOCK:
         block_diagonal_mask = (
-            (offs_n[None, :] >= 0.) &
+            (offs_n[None, :] >= 0) &
             ((offs_n[None, :] // SEL_BLOCK) == (offs_m[:, None] // SEL_BLOCK))
         )
 

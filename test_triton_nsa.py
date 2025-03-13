@@ -136,10 +136,10 @@ def regular_attend(
 
 batch = 4
 seq_len = 507
-q_heads = 4
+q_heads = 8
 kv_heads = 2
 fine_block_size = 32
-num_sel = 6
+num_sel = 2
 dim_head = 64
 fused_sliding_window = False
 block_dk_dv_use_dot = False # need sufficient shared memory, A100 works
