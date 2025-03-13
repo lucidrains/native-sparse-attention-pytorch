@@ -935,8 +935,17 @@ def backward_kernel_one_col_block_sparse(
         offs_m * stride_kvbl_m
     )
 
-    block_indices = tl.load(kv_block_indices_ptrs + OFF_SEL_KV_BLOCKS)
-    block_masks = tl.load(kv_block_mask_ptrs + OFF_SEL_KV_BLOCKS)
+    block_indices = tl.load(
+        kv_block_indices_ptrs + OFF_SEL_KV_BLOCKS,
+        mask = offs_m < seqlen_q,
+        other = 0.
+    )
+
+    block_masks = tl.load(
+        kv_block_mask_ptrs + OFF_SEL_KV_BLOCKS,
+        mask = offs_m < seqlen_q,
+        other = 0.
+    )
 
     blocks_offs_n = (
         block_indices[:, None] * BLOCK +
