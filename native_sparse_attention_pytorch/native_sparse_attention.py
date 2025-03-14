@@ -621,7 +621,7 @@ class SparseAttention(Module):
 
         importance_scores = csim[..., num_mem_compress_kv:]
 
-        num_selected = min(self.num_selected_blocks, num_compress_blocks)
+        num_selected = min(self.num_selected_blocks, num_compress_blocks, importance_scores.shape[-1])
         has_selected_kv_for_fine_attn = num_selected > 0
 
         # maybe average the compressed attention across each grouped queries (per key / values)
