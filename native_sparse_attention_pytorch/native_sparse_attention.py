@@ -419,8 +419,17 @@ class SparseAttention(Module):
         ck = cache_ck
         cv = cache_cv
 
-        repeated_ck = repeat(ck, 'b h ... -> b (h gh) ...', gh = self.num_grouped_queries)
-        repeated_cv = repeat(cv, 'b h ... -> b (h gh) ...', gh = self.num_grouped_queries)
+        ck_for_attn = cache_ck
+        cv_for_attn = cache_cv
+
+        if not is_empty(ck):
+            mem_ck, mem_cv = repeat(self.compress_mem_kv, 'kv ... -> kv b ...', b = batch)
+
+            ck_for_attn = cat((mem_ck, ck_for_attn), dim = -2)
+            cv_for_attn = cat((mem_cv, cv_for_attn), dim = -2)
+
+        repeated_ck = repeat(ck_for_attn, 'b h ... -> b (h gh) ...', gh = self.num_grouped_queries)
+        repeated_cv = repeat(cv_for_attn, 'b h ... -> b (h gh) ...', gh = self.num_grouped_queries)
 
         csim = einsum(q, repeated_ck, 'b h i d, b h j d -> b h i j') * scale
         cattn = csim.softmax(dim = -1)
