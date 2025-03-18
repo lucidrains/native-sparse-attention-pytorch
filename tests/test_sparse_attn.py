@@ -49,3 +49,32 @@ def test_sparse_attn(
     attended = attn(tokens)
 
     assert tokens.shape == attended.shape
+
+@pytest.mark.parametrize('seq_len', (8,))
+def test_inference(seq_len):
+
+    attn = SparseAttention(
+        dim = 512,
+        dim_head = 64,
+        heads = 8,
+        causal = True,
+        sliding_window_size = 2,
+        compress_block_size = 5,
+        selection_block_size = 10,
+        num_selected_blocks = 2
+    )
+
+    tokens = torch.randn(2, seq_len, 512)
+
+    parallel_out = attn(tokens)
+
+    cache = None
+    sequential_out = []
+
+    for i in range(seq_len):
+      one_out, cache = attn(tokens[:, i:(i + 1)], cache = cache, return_cache = True)
+      sequential_out.append(one_out)
+
+    sequential_out = torch.cat(sequential_out, dim = 1)
+
+    assert torch.allclose(parallel_out, sequential_out, atol = 1e-5)
