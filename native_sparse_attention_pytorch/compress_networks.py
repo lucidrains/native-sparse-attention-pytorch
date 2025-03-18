@@ -25,11 +25,11 @@ class ConvLinearCompress(Module):
         self,
         heads,
         dim_head,
-        compress_block_size
+        compress_window_size
     ):
         super().__init__()
         self.heads = heads
-        self.conv = nn.Conv1d(heads * dim_head, heads * dim_head, compress_block_size, stride = compress_block_size, groups = heads)
+        self.conv = nn.Conv1d(heads * dim_head, heads * dim_head, compress_window_size, stride = compress_window_size, groups = heads)
 
     def forward(
         self,
@@ -48,7 +48,7 @@ class AttentionPool(Module):
     def __init__(
         self,
         dim_head,
-        compress_block_size
+        compress_window_size
     ):
         super().__init__()
         self.to_attn_logits = nn.Linear(dim_head, dim_head, bias = False)
@@ -73,13 +73,13 @@ class GroupedMLP(Module):
     def __init__(
         self,
         dim_head,
-        compress_block_size,
+        compress_window_size,
         heads,
         expand_factor = 1.,
     ):
         super().__init__()
 
-        dim = dim_head * compress_block_size
+        dim = dim_head * compress_window_size
         dim_hidden = int(dim * expand_factor)
         dim_out = dim_head
 

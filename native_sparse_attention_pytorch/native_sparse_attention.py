@@ -124,6 +124,9 @@ def round_up_mult(n, mult):
 def divisible_by(num, den):
     return (num % den) == 0
 
+def is_empty(t):
+    return t.numel() == 0
+
 def max_neg_value(t):
     return -torch.finfo(t.dtype).max
 
@@ -198,6 +201,7 @@ class SparseAttention(Module):
         compress_block_size,
         selection_block_size,
         num_selected_blocks,
+        compress_block_overlap_len = 0, # the amount of overlap of a given compression block to the previous block
         kv_heads = None,
         num_compressed_mem_kv = 1,
         causal = False,
@@ -219,6 +223,7 @@ class SparseAttention(Module):
         assert kv_heads <= heads and divisible_by(heads, kv_heads)
 
         self.heads = heads
+        self.dim_head = dim_head
         self.kv_heads = kv_heads
         self.num_grouped_queries = heads // kv_heads
 
@@ -266,16 +271,34 @@ class SparseAttention(Module):
 
         assert num_compressed_mem_kv > 0
 
-        self.split_compress_window = Rearrange('b h (w n) d -> b h w n d', n = compress_block_size)
+        # the function for splitting out the compression windows for the mlp
+
+        compress_block_has_overlap = compress_block_overlap_len > 0
+        compress_window_size = compress_block_size + compress_block_overlap_len
+
+        if not compress_block_has_overlap:
+            split_compress_window_fn = Rearrange('b h (w n) d -> b h w n d', n = compress_block_size)
+        else:
+            split_compress_window_fn = nn.Sequential(
+                Rearrange('b h n d -> (b h) d 1 n'),
+                nn.ZeroPad2d((compress_block_overlap_len, 0, 0, 0)),
+                nn.Unfold(kernel_size = (1, compress_window_size), stride = (1, compress_block_size)),
+                Rearrange('(b h) (d n) w -> b h w n d', d = dim_head, h = kv_heads)
+            )
+
+        self.split_compress_window = split_compress_window_fn
+        self.compress_window_size = compress_window_size
+
+        # compression attention related parameters
 
         self.num_mem_compress_kv = num_compressed_mem_kv
         self.compress_mem_kv = nn.Parameter(torch.zeros(2, kv_heads, num_compressed_mem_kv, dim_head))
         
-        self.k_intrablock_positions = nn.Parameter(torch.zeros(kv_heads, compress_block_size, dim_head))
-        self.v_intrablock_positions = nn.Parameter(torch.zeros(kv_heads, compress_block_size, dim_head))
+        self.k_intrablock_positions = nn.Parameter(torch.zeros(kv_heads, compress_window_size, dim_head))
+        self.v_intrablock_positions = nn.Parameter(torch.zeros(kv_heads, compress_window_size, dim_head))
 
         if not exists(compress_mlp):
-            compress_dim = compress_block_size * dim_head
+            compress_dim = compress_window_size * dim_head
             compress_mlp_dim_hidden = int(compress_mlp_expand_factor * compress_dim)
 
             compress_mlp = nn.Sequential(
@@ -408,8 +431,11 @@ class SparseAttention(Module):
 
         if divisible_by(running_compress_seq_len, self.compress_block_size):
 
-            k_compress_input = self.split_compress_window(run_k + self.k_intrablock_positions)
-            v_compress_input = self.split_compress_window(run_v + self.v_intrablock_positions)
+            k_compress_input = self.split_compress_window(run_k)
+            v_compress_input = self.split_compress_window(run_v)
+
+            k_compress_input = einx.add('b h w n d, h n d', k_compress_input, self.k_intrablock_positions)
+            v_compress_input = einx.add('b h w n d, h n d', v_compress_input, self.v_intrablock_positions)
 
             next_ck = self.k_compress(k_compress_input)
             next_cv = self.v_compress(v_compress_input)
@@ -550,7 +576,7 @@ class SparseAttention(Module):
 
         assert not (not self.causal and return_cache)
 
-        batch, seq_len, scale, heads, device = *inp.shape[:2], self.scale, self.heads, inp.device
+        batch, seq_len, scale, heads, kv_heads, device = *inp.shape[:2], self.scale, self.heads, self.kv_heads, inp.device
 
         compress_divisible_seq_len = round_down_mult(seq_len, self.compress_block_size)
         num_compress_blocks = compress_divisible_seq_len // self.compress_block_size
@@ -570,11 +596,19 @@ class SparseAttention(Module):
 
         # compressed key / values - variables prepended with `c` stands for compressed
 
-        k_pos = repeat(self.k_intrablock_positions, 'h n d -> h (r n) d', r = num_compress_blocks)
-        v_pos = repeat(self.v_intrablock_positions, 'h n d -> h (r n) d', r = num_compress_blocks)
+        k_compress_input, v_compress_input = k[..., :compress_divisible_seq_len, :], v[..., :compress_divisible_seq_len, :]
 
-        k_compress_input = self.split_compress_window(k[..., :compress_divisible_seq_len, :] + k_pos)
-        v_compress_input = self.split_compress_window(v[..., :compress_divisible_seq_len, :] + v_pos)
+        if not is_empty(k_compress_input):
+            k_compress_input = self.split_compress_window(k_compress_input)
+            v_compress_input = self.split_compress_window(v_compress_input)
+        else:
+            k_compress_input, v_compress_input = tuple(t.reshape(batch, kv_heads, 0, self.compress_window_size, self.dim_head) for t in (k_compress_input, v_compress_input))
+
+        # add the intra block positions
+
+        if not is_empty(k_compress_input):
+            k_compress_input = einx.add('b h w n d, h n d', k_compress_input, self.k_intrablock_positions)
+            v_compress_input = einx.add('b h w n d, h n d', v_compress_input, self.v_intrablock_positions)
 
         run_k = k[..., compress_divisible_seq_len:, :]
         run_v = v[..., compress_divisible_seq_len:, :]

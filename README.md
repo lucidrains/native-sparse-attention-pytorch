@@ -12,6 +12,8 @@ This will be my last open sourced project under Meta
 
 - [Flex Attention](https://pytorch.org/blog/flexattention/) for allowing for rapid prototyping
 
+- <a href="https://github.com/Mr-Grin">@Mr-Grin</a> for the code review and pointing out a few inaccuracies in the implementation
+
 ## Install
 
 ```bash

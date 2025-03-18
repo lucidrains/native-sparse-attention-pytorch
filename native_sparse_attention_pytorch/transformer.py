@@ -156,6 +156,7 @@ class Transformer(Module):
         sparse_attn_kwargs: dict = dict(
             sliding_window_size = 32,
             compress_block_size = 4,
+            compress_block_overlap_len = 0,
             selection_block_size = 4,
             num_selected_blocks = 4,
         )

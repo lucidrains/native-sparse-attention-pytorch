@@ -11,6 +11,8 @@ from native_sparse_attention_pytorch import SparseAttention
 @pytest.mark.parametrize('seq_len', (1, 4, 31, 32, 120))
 @pytest.mark.parametrize('kv_heads', (8, 4))
 @pytest.mark.parametrize('selection_block_size', (8, 4, 2))
+@pytest.mark.parametrize('compress_block_size', (8, 4))
+@pytest.mark.parametrize('compress_block_overlap_len', (0, 2))
 @pytest.mark.parametrize('num_selected_block', (0, 2))
 @pytest.mark.parametrize('query_heads_share_selected_kv', (False, True))
 @pytest.mark.parametrize('interpolated_importance_score', (False, True))
@@ -20,6 +22,8 @@ def test_sparse_attn(
     seq_len,
     kv_heads,
     selection_block_size,
+    compress_block_size,
+    compress_block_overlap_len,
     num_selected_block,
     query_heads_share_selected_kv,
     interpolated_importance_score
@@ -31,8 +35,9 @@ def test_sparse_attn(
         kv_heads = kv_heads,
         causal = causal,
         sliding_window_size = 2,
-        compress_block_size = 4,
         selection_block_size = selection_block_size,
+        compress_block_size = compress_block_size,
+        compress_block_overlap_len = compress_block_overlap_len,
         num_selected_blocks = num_selected_block,
         use_diff_topk = use_diff_topk,
         query_heads_share_selected_kv = query_heads_share_selected_kv,
