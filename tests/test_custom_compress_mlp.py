@@ -77,3 +77,24 @@ def test_group_mlp():
     attended = attn(tokens)
 
     assert tokens.shape == attended.shape
+
+@pytest.mark.parametrize('grouped', (False, True))
+def test_single_projection_mlp(grouped):
+    from native_sparse_attention_pytorch.compress_networks import SingleProjection
+
+    attn = SparseAttention(
+        dim = 512,
+        dim_head = 64,
+        heads = 8,
+        sliding_window_size = 2,
+        compress_block_size = 4,
+        selection_block_size = 4,
+        num_selected_blocks = 2,
+        compress_mlp = SingleProjection(64, 4, 8 if grouped else 1)
+    )
+
+    tokens = torch.randn(2, 31, 512)
+
+    attended = attn(tokens)
+
+    assert tokens.shape == attended.shape

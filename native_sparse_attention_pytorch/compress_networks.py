@@ -3,7 +3,7 @@ from torch import nn
 from torch.nn import Module, ModuleList
 
 from einops import einsum, rearrange
-from einops.layers.torch import EinMix as Mix
+from einops.layers.torch import EinMix as Mix, Rearrange
 
 # helpers
 
@@ -98,3 +98,38 @@ class GroupedMLP(Module):
         compressed = self.net(kv)
 
         return compressed
+
+# single projection "mlp"
+
+class SingleProjection(Module):
+    def __init__(
+        self,
+        dim_head,
+        compress_window_size,
+        heads = 1
+    ):
+        super().__init__()
+        dim = dim_head * compress_window_size
+        dim_out = dim_head
+
+        is_grouped = heads > 1
+
+        if not is_grouped:
+            self.compress = nn.Sequential(
+                Rearrange('b h w n d -> b h w (n d)'),
+                nn.Linear(dim, dim_out, bias = False)
+            )
+        else:
+            self.compress = Mix(
+                'b h w n i -> b h w o',
+                weight_shape = 'h i o',
+                h = heads,
+                i = dim_head,
+                o = dim_head
+            )
+
+    def forward(
+        self,
+        kv
+    ):
+        return self.compress(kv)
