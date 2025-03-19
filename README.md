@@ -1,6 +1,6 @@
 <img src="./fig2.png" width="450px"></img>
 
-## Native Sparse Attention (wip)
+## Native Sparse Attention
 
 Implementation of the sparse attention pattern proposed by the Deepseek team in their [Native Sparse Attention](https://arxiv.org/abs/2502.11089) paper
 
