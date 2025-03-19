@@ -42,7 +42,8 @@ examples = [
     "wandb"
 ]
 test = [
-    "pytest"
+    "pytest",
+    "tqdm",
 ]
 
 [tool.pytest.ini_options]

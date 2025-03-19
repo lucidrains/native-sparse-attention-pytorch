@@ -90,7 +90,14 @@ def test_transformer_inference():
         num_tokens = 256,
         dim = 512,
         depth = 2,
-        use_sparse_attn = True
+        causal = True,
+        use_sparse_attn = True,
+        sparse_attn_kwargs = dict(
+            sliding_window_size = 16,
+            compress_block_size = 4,
+            selection_block_size = 16,
+            num_selected_blocks = 1
+        )
     )
 
     prompt = torch.randint(0, 256, (1, 1))
