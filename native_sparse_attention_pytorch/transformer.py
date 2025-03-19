@@ -218,6 +218,7 @@ class Transformer(Module):
         filter_thres = 0.9,
         use_cache_kv = False
     ):
+        is_greedy = temperature <= 0.
         prompt_seq_len, out = prompt.shape[-1], prompt.clone()
         sample_num_times = max(0, seq_len - prompt_seq_len)
 
@@ -238,19 +239,16 @@ class Transformer(Module):
                 cache = next_cache
 
             logits = logits[:, -1]
-            logits = top_k(logits, thres = filter_thres)
-            sample = gumbel_sample(logits, temperature = temperature, dim = -1)
+
+            if is_greedy:
+                sample = logits.argmax(dim = -1, keepdim = True)
+            else:
+                logits = top_k(logits, thres = filter_thres)
+                sample = gumbel_sample(logits, temperature = temperature, dim = -1)
 
             out = torch.cat((out, sample), dim = -1)
 
         return out[..., prompt_seq_len:]
-
-    def forward_inference(
-        self,
-        ids,
-        cache = None
-    ):
-        return ids
 
     def forward(
         self,
