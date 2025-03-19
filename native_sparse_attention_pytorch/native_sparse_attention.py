@@ -496,6 +496,8 @@ class SparseAttention(Module):
             if self.query_heads_share_selected_kv:
                 importance_scores = reduce(importance_scores, 'b (h grouped_queries) ... -> b h ...', 'mean', grouped_queries = self.num_grouped_queries)
 
+            importance_scores = importance_scores.softmax(dim = -1)
+
             sel_scores, sel_indices = importance_scores.topk(num_selected, dim = -1)
     
             fine_divisible_seq_len = round_up_mult(seq_len, self.selection_block_size)
