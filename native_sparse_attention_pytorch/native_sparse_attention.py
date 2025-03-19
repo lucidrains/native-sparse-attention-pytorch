@@ -290,6 +290,9 @@ class SparseAttention(Module):
         self.split_compress_window = split_compress_window_fn
         self.compress_window_size = compress_window_size
 
+        assert compress_block_overlap_len < compress_block_size
+        self.compress_block_overlap_len = compress_block_overlap_len
+
         # compression attention related parameters
 
         self.num_mem_compress_kv = num_compressed_mem_kv
@@ -382,6 +385,7 @@ class SparseAttention(Module):
 
         sliding_window = self.sliding_window_size
         compress_divisible_seq_len = round_down_mult(seq_len, self.compress_block_size)
+        compress_overlap_len = self.compress_block_overlap_len
 
         fine_divisible_seq_len = round_up_mult(seq_len, self.selection_block_size)
         num_fine_blocks = fine_divisible_seq_len // self.selection_block_size
@@ -439,10 +443,9 @@ class SparseAttention(Module):
 
         running_compress_seq_len = run_k.shape[-2]
 
-        if divisible_by(running_compress_seq_len, self.compress_block_size):
-
-            k_compress_input = self.split_compress_window(run_k)
-            v_compress_input = self.split_compress_window(run_v)
+        if divisible_by(running_compress_seq_len, self.compress_block_size + compress_overlap_len):
+            k_compress_input = rearrange(run_k, 'b h n d -> b h 1 n d')
+            v_compress_input = rearrange(run_v, 'b h n d -> b h 1 n d')
 
             k_compress_input = einx.add('b h w n d, h n d', k_compress_input, self.k_intrablock_positions)
             v_compress_input = einx.add('b h w n d, h n d', v_compress_input, self.v_intrablock_positions)
@@ -450,8 +453,10 @@ class SparseAttention(Module):
             next_ck = self.k_compress(k_compress_input)
             next_cv = self.v_compress(v_compress_input)
 
-            run_k = run_k[..., 0:0, :]
-            run_v = run_v[..., 0:0, :]
+            run_kv_slice = slice(-compress_overlap_len, None) if compress_overlap_len > 0 else slice(0, 0)
+
+            run_k = run_k[..., run_kv_slice, :]
+            run_v = run_v[..., run_kv_slice, :]
 
             ck = cat((ck, next_ck), dim = -2)
             cv = cat((cv, next_cv), dim = -2)
@@ -593,6 +598,8 @@ class SparseAttention(Module):
         compress_divisible_seq_len = round_down_mult(seq_len, self.compress_block_size)
         num_compress_blocks = compress_divisible_seq_len // self.compress_block_size
 
+        compress_overlap_len = self.compress_block_overlap_len
+
         fine_divisible_seq_len = round_up_mult(seq_len, self.selection_block_size)
         num_fine_blocks = fine_divisible_seq_len // self.selection_block_size
 
@@ -622,8 +629,14 @@ class SparseAttention(Module):
             k_compress_input = einx.add('b h w n d, h n d', k_compress_input, self.k_intrablock_positions)
             v_compress_input = einx.add('b h w n d, h n d', v_compress_input, self.v_intrablock_positions)
 
-        run_k = k[..., compress_divisible_seq_len:, :]
-        run_v = v[..., compress_divisible_seq_len:, :]
+        run_k, run_v = k, v
+
+        if return_cache and compress_overlap_len > 0:
+            run_k = F.pad(run_k, (0, 0, compress_overlap_len, 0), value = 0.)
+            run_v = F.pad(run_v, (0, 0, compress_overlap_len, 0), value = 0.)
+
+        run_k = run_k[..., compress_divisible_seq_len:, :]
+        run_v = run_v[..., compress_divisible_seq_len:, :]
 
         cq = q
         ck = self.k_compress(k_compress_input)   # Equation (7) of the Native Sparse Attention paper

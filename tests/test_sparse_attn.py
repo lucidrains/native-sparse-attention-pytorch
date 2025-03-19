@@ -52,9 +52,11 @@ def test_sparse_attn(
 
 @pytest.mark.parametrize('seq_len', (2, 8, 16))
 @pytest.mark.parametrize('num_selected_blocks', (0, 2))
+@pytest.mark.parametrize('compress_block_overlap_len', (0, 2))
 def test_inference(
     seq_len,
-    num_selected_blocks
+    num_selected_blocks,
+    compress_block_overlap_len
 ):
 
     attn = SparseAttention(
@@ -65,7 +67,8 @@ def test_inference(
         sliding_window_size = 2,
         compress_block_size = 5,
         selection_block_size = 10,
-        num_selected_blocks = num_selected_blocks
+        num_selected_blocks = num_selected_blocks,
+        compress_block_overlap_len = compress_block_overlap_len
     )
 
     tokens = torch.randn(2, seq_len, 512)
