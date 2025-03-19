@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from math import ceil
+from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -483,7 +484,7 @@ class SparseAttention(Module):
 
         # block causal diagonal
 
-        fine_sliding_window = (seq_len % self.selection_block_size) + 1
+        fine_sliding_window = ((seq_len - 1) % self.selection_block_size) + 1
         fk = k[..., -fine_sliding_window:, :]
         fv = v[..., -fine_sliding_window:, :]
 
@@ -721,6 +722,9 @@ class SparseAttention(Module):
         num_selected = min(num_selected, importance_scores.shape[-1])
         has_selected_kv_for_fine_attn = num_selected > 0
 
+        remainder = fine_divisible_seq_len - seq_len
+        pad_to_multiple = partial(pad_at_dim, pad = (0, remainder), dim = -2)
+
         if has_selected_kv_for_fine_attn:
 
             # get the top-n kv segments for fine attention
@@ -760,10 +764,9 @@ class SparseAttention(Module):
                 fmask = selected_importance_values > 1e-10
 
                 if seq_len < fine_divisible_seq_len:
-                    remainder = fine_divisible_seq_len - seq_len
-                    fk = pad_at_dim(fk, (0, remainder), value = 0., dim = -2)
-                    fv = pad_at_dim(fv, (0, remainder), value = 0., dim = -2)
-                    fq = pad_at_dim(fq, (0, remainder), value = 0., dim = -2)
+                    fk = pad_to_multiple(fk)
+                    fv = pad_to_multiple(fv)
+                    fq = pad_to_multiple(fq)
 
                     fmask = pad_at_dim(fmask, (0, remainder), value = False, dim = -2)
 
@@ -845,10 +848,19 @@ class SparseAttention(Module):
             seq_len = fk.shape[-2]
             fmask = None
 
+            fk = pad_to_multiple(fk)
+            fv = pad_to_multiple(fv)
+            fq = pad_to_multiple(fq)
+
+            fq, fk, fv = tuple(rearrange(t, 'b h (w n) d -> (b w) h n d', n = self.selection_block_size) for t in (fq, fk, fv))
+
             if self.causal:
-                fmask = causal_mask = torch.ones((seq_len, seq_len), device = device, dtype = torch.bool).tril()
+                fmask = causal_mask = torch.ones((self.selection_block_size, self.selection_block_size), device = device, dtype = torch.bool).tril()
 
             fine_attn_out = attend(fq, fk, fv, mask = fmask)
+
+            fine_attn_out = rearrange(fine_attn_out, '(b w) h n d -> b h (w n) d', b = batch)
+            fine_attn_out = fine_attn_out[..., :seq_len, :]
 
         # 3. overlapping sliding window, this is unsurprising and expected - `s` for sliding
 

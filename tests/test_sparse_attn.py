@@ -50,7 +50,7 @@ def test_sparse_attn(
 
     assert tokens.shape == attended.shape
 
-@pytest.mark.parametrize('seq_len', (8,))
+@pytest.mark.parametrize('seq_len', (2, 8, 16))
 def test_inference(seq_len):
 
     attn = SparseAttention(
@@ -61,7 +61,7 @@ def test_inference(seq_len):
         sliding_window_size = 2,
         compress_block_size = 5,
         selection_block_size = 10,
-        num_selected_blocks = 2
+        num_selected_blocks = 0
     )
 
     tokens = torch.randn(2, seq_len, 512)
