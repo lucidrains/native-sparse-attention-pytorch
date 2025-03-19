@@ -82,3 +82,20 @@ def test_inference(
     sequential_out = torch.cat(sequential_out, dim = 1)
 
     assert torch.allclose(parallel_out, sequential_out, atol = 1e-5)
+
+def test_transformer_inference():
+    from native_sparse_attention_pytorch.transformer import Transformer
+
+    model = Transformer(
+        num_tokens = 256,
+        dim = 512,
+        depth = 2,
+        use_sparse_attn = True
+    )
+
+    prompt = torch.randint(0, 256, (1, 1))
+
+    sampled = model.sample(prompt, 25, temperature = 0., use_cache_kv = False)
+    sampled_cached = model.sample(prompt, 25, temperature = 0., use_cache_kv = True)
+
+    assert torch.allclose(sampled, sampled_cached)

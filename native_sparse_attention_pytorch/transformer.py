@@ -75,10 +75,11 @@ class Attention(Module):
         self.norm = RMSNorm(dim)
 
         self.heads = heads
-        self.kv_heads = default(kv_heads, heads)
+        kv_heads = default(kv_heads, heads)
         dim_inner = heads * dim_head
         dim_kv_inner = kv_heads * dim_head
 
+        self.kv_heads = kv_heads
         self.causal = causal
 
         self.rotary_embed = RotaryEmbedding(dim_head)
