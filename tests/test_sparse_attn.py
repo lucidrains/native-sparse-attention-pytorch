@@ -50,10 +50,12 @@ def test_sparse_attn(
 @pytest.mark.parametrize('seq_len', (2, 8, 16))
 @pytest.mark.parametrize('num_selected_blocks', (0, 2))
 @pytest.mark.parametrize('compress_block_overlap_len', (0, 2))
+@pytest.mark.parametrize('selection_block_size', (5, 10, 15))
 def test_inference(
     seq_len,
     num_selected_blocks,
-    compress_block_overlap_len
+    compress_block_overlap_len,
+    selection_block_size
 ):
 
     attn = SparseAttention(
@@ -63,7 +65,7 @@ def test_inference(
         causal = True,
         sliding_window_size = 2,
         compress_block_size = 5,
-        selection_block_size = 10,
+        selection_block_size = selection_block_size,
         num_selected_blocks = num_selected_blocks,
         compress_block_overlap_len = compress_block_overlap_len
     )

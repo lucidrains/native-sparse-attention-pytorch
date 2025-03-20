@@ -461,16 +461,12 @@ class SparseAttention(Module):
         importance_scores = csim[..., self.num_mem_compress_kv:]
 
         num_compress_blocks = importance_scores.shape[-1]
+        num_compress_per_fine = self.selection_block_size // self.compress_block_size
 
         if self.compress_block_size != self.selection_block_size:
-            compress_seq_len = num_compress_blocks * self.compress_block_size
-
-            importance_scores = repeat(importance_scores, '... j -> ... (bsz j)', bsz = self.compress_block_size)
-
-            fine_seq_len = round_down_mult(compress_seq_len, self.selection_block_size)
-
-            importance_scores = importance_scores[..., :fine_seq_len]
-            importance_scores = reduce(importance_scores, '... (bsz j) -> ... j', 'mean', bsz = self.selection_block_size)
+            compress_seq_len = round_down_mult(num_compress_blocks, num_compress_per_fine)
+            importance_scores = importance_scores[..., :compress_seq_len]
+            importance_scores = reduce(importance_scores, '... (j num_compress_per_fine) -> ... j', 'mean', num_compress_per_fine = num_compress_per_fine)
 
         num_fine_blocks = importance_scores.shape[-1]
         num_selected = min(self.num_selected_blocks, num_fine_blocks)
@@ -490,7 +486,9 @@ class SparseAttention(Module):
             if self.query_heads_share_selected_kv:
                 importance_scores = reduce(importance_scores, 'b (h grouped_queries) ... -> b h ...', 'mean', grouped_queries = self.num_grouped_queries)
 
+            importance_scores = F.pad(importance_scores, (1, 0), value = -1e3)
             importance_scores = importance_scores.softmax(dim = -1)
+            importance_scores = importance_scores[..., 1:]
 
             sel_scores, sel_indices = importance_scores.topk(num_selected, dim = -1)
     
@@ -689,26 +687,24 @@ class SparseAttention(Module):
 
             if self.compress_block_size != self.selection_block_size:
 
-                compress_seq_len = num_compress_blocks * self.compress_block_size
+                num_compress_per_fine = self.selection_block_size // self.compress_block_size
 
-                importance_scores = repeat(importance_scores, '... j -> ... (j block_size)', block_size = self.compress_block_size)
+                round_down_score_len = round_down_mult(importance_scores.shape[-1], num_compress_per_fine)
+                importance_scores = importance_scores[..., :round_down_score_len]
 
-                padding = fine_divisible_seq_len - compress_seq_len
+                if not is_empty(importance_scores):
+                    importance_scores = reduce(importance_scores, '... (j num_compress_per_fine) -> ... j', 'mean', num_compress_per_fine = num_compress_per_fine)
 
-                fine_query_seq_len = importance_scores.shape[-2]
-                fine_query_padding = fine_divisible_seq_len - importance_scores.shape[-2]
+                    i, j = importance_scores.shape[-2:]
 
-                importance_scores = F.pad(importance_scores, (0, padding))
+                    # mask out block diagonal
 
-                # mask out the diagonal since block causal is included by default for fine attending
+                    q_seq = arange(i, device = device) // self.selection_block_size
+                    k_seq = arange(j, device = device)
 
-                block_causal_mask = torch.ones((num_fine_blocks,) * 2, device = device, dtype = torch.bool).tril(-1)
-                block_causal_mask = repeat(block_causal_mask, 'i j -> (i n1) (j n2)', n1 = self.selection_block_size, n2 = self.selection_block_size)
-                block_causal_mask = block_causal_mask[:fine_query_seq_len]
+                    block_diagonal_mask = einx.equal('i, j -> i j', q_seq, k_seq)
 
-                importance_scores = importance_scores.masked_fill(~block_causal_mask, max_neg_value(csim))
-
-                importance_scores = reduce(importance_scores, '... (j block_size) -> ... j', 'mean', block_size = self.selection_block_size)
+                    importance_scores = importance_scores.masked_fill(block_diagonal_mask, max_neg_value(csim))
 
             importance_scores = F.pad(importance_scores, (1, 0), value = -1e3)
             importance_scores = importance_scores.softmax(dim = -1)
