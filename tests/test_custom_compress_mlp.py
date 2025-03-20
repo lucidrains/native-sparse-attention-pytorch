@@ -98,3 +98,31 @@ def test_single_projection_mlp(grouped):
     attended = attn(tokens)
 
     assert tokens.shape == attended.shape
+
+def test_compress_transformer():
+    from native_sparse_attention_pytorch.compress_networks import CompressTransformer
+
+    dim_head = 64
+    num_kv_heads = 2
+
+    compress_transformer = CompressTransformer(
+        num_layers=2,
+        dim=dim_head * num_kv_heads,
+        num_heads=num_kv_heads,
+    )
+
+    attn = SparseAttention(
+        dim=512,
+        dim_head=dim_head,
+        heads=8,
+        sliding_window_size=64,
+        compress_block_size=16,
+        selection_block_size=16,
+        num_selected_blocks=2,
+        compress_mlp=compress_transformer,
+    )
+
+    tokens = torch.randn(2, 31, 512)
+    attended = attn(tokens)
+
+    assert attended.shape == tokens.shape
