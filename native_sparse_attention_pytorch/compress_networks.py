@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 from torch.nn import Module, ModuleList
+import torch.nn.functional as F
 
 from einops import einsum, rearrange
 from einops.layers.torch import EinMix as Mix, Rearrange
@@ -133,3 +134,113 @@ class SingleProjection(Module):
         kv
     ):
         return self.compress(kv)
+
+
+class SimpleMultiheadSelfAttention(nn.Module):
+    def __init__(self, dim, num_heads, dropout=0.0):
+        super().__init__()
+        assert dim % num_heads == 0, "Hidden dimension must be divisible by number of heads"
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
+        self.attn_dropout_p = dropout
+
+    def forward(self, x):
+        B, L, D = x.shape 
+        q = self.q_proj(x)  # (B, L, D)
+        k = self.k_proj(x)  # (B, L, D)
+        v = self.v_proj(x)  # (B, L, D)
+        q = q.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)  # -> (B, num_heads, L, head_dim)
+        k = k.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)  # -> (B, num_heads, L, head_dim)
+        v = v.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)  # -> (B, num_heads, L, head_dim)
+
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=self.attn_dropout_p if self.training else 0.0,
+            is_causal=False
+        )
+        attn_out = attn_out.transpose(1, 2).reshape(B, L, D)
+        return self.out_proj(attn_out)
+
+class SimpleTransformerFeedForward(nn.Module):
+    def __init__(self, dim, hidden_dim, dropout=0.0):
+        """Two-layer feed-forward network with GELU activation."""
+        super().__init__()
+        self.fc1 = nn.Linear(dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, dim)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        out = self.act(self.fc1(x))
+        out = self.dropout(out)
+        out = self.fc2(out)
+        out = self.dropout(out)
+        return out
+
+class SimpleTransformerLayer(nn.Module):
+    def __init__(self, dim, num_heads, ff_hidden_dim=None, dropout=0.0):
+        """Single Transformer layer: RMSNorm + Multi-head attention + RMSNorm + FeedForward."""
+        super().__init__()
+        if ff_hidden_dim is None:
+            ff_hidden_dim = dim * 4
+        self.norm1 = nn.RMSNorm(dim)
+        self.norm2 = nn.RMSNorm(dim)
+        self.attn = SimpleMultiheadSelfAttention(dim, num_heads, dropout=dropout)
+        self.ff   = SimpleTransformerFeedForward(dim, ff_hidden_dim, dropout=dropout)
+
+    def forward(self, x):
+        a = self.attn(self.norm1(x))
+        x = x + a
+        f = self.ff(self.norm2(x))
+        x = x + f
+        return x
+
+class CompressTransformer(nn.Module):
+    def __init__(self, num_layers, dim, num_heads, ff_hidden_dim=None, dropout=0.0):
+        """
+        Stacked Transformer encoder layers.
+        Args:
+          num_layers: number of TransformerLayer to stack.
+          dim: hidden dimension of the model (and input embeddings).
+          num_heads: number of attention heads.
+          ff_hidden_dim: hidden size of feed-forward network (defaults to 4*dim).
+          dropout: dropout rate for attention weights and feed-forward (if any).
+        """
+        super().__init__()
+        self.layers = nn.ModuleList([
+            SimpleTransformerLayer(dim, num_heads, ff_hidden_dim, dropout) for _ in range(num_layers)
+        ])
+        self.num_layers = num_layers
+
+    def forward(self, x):
+        # x shape: [b, h, w, n, d]
+        b, h, w, n, d = x.shape
+
+        # Flatten so each window is treated like a batch element: [b*w, n, h*d]
+        inp = x.permute(0, 2, 3, 1, 4).contiguous()
+        inp = inp.view(b*w, n, h*d)
+
+        for i in range(self.num_layers - 1):
+            inp = self.layers[i](inp)
+
+        last_layer = self.layers[-1]
+
+        a = last_layer.attn(last_layer.norm1(inp))
+        inp = inp + a
+
+        # Extract the last token along the 'n' dimension
+        last_token = inp[:, -1].unsqueeze(1)  # (bw, 1, hd)
+
+        normed = last_layer.norm2(last_token)
+        ff_out = last_layer.ff(normed)
+        last_token = last_token + ff_out
+
+        last_token = last_token.squeeze(1).view(b, w, h, d).permute(0, 2, 1, 3)
+
+        return last_token
