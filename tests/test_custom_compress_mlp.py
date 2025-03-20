@@ -119,6 +119,7 @@ def test_compress_transformer():
         compress_block_size=16,
         selection_block_size=16,
         num_selected_blocks=2,
+        kv_heads=num_kv_heads,
         compress_mlp=compress_transformer,
     )
 
