@@ -135,8 +135,9 @@ class SingleProjection(Module):
     ):
         return self.compress(kv)
 
+# simple transformer compressor, pull requested by Eric Pasewark
 
-class SimpleMultiheadSelfAttention(nn.Module):
+class SimpleMultiheadSelfAttention(Module):
     def __init__(self, dim, num_heads, dropout=0.0):
         super().__init__()
         assert dim % num_heads == 0, "Hidden dimension must be divisible by number of heads"
@@ -167,7 +168,7 @@ class SimpleMultiheadSelfAttention(nn.Module):
         attn_out = attn_out.transpose(1, 2).reshape(B, L, D)
         return self.out_proj(attn_out)
 
-class SimpleTransformerFeedForward(nn.Module):
+class SimpleTransformerFeedForward(Module):
     def __init__(self, dim, hidden_dim, dropout=0.0):
         """Two-layer feed-forward network with GELU activation."""
         super().__init__()
@@ -183,7 +184,7 @@ class SimpleTransformerFeedForward(nn.Module):
         out = self.dropout(out)
         return out
 
-class SimpleTransformerLayer(nn.Module):
+class SimpleTransformerLayer(Module):
     def __init__(self, dim, num_heads, ff_hidden_dim=None, dropout=0.0):
         """Single Transformer layer: RMSNorm + Multi-head attention + RMSNorm + FeedForward."""
         super().__init__()
@@ -201,7 +202,7 @@ class SimpleTransformerLayer(nn.Module):
         x = x + f
         return x
 
-class CompressTransformer(nn.Module):
+class CompressTransformer(Module):
     def __init__(self, num_layers, dim, num_heads, ff_hidden_dim=None, dropout=0.0):
         """
         Stacked Transformer encoder layers.

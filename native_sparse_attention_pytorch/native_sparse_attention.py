@@ -145,13 +145,6 @@ def pad_at_dim(t, pad, dim = -1, value = 0.):
     zeros = ((0, 0) * dims_from_right)
     return F.pad(t, (*zeros, *pad), value = value)
 
-def interpolate_1d(x, length, mode = 'bilinear'):
-    x, inverse_pack = pack_one_with_inverse(x, '* n')
-    x = rearrange(x, 'b n -> b 1 n 1')
-    x = F.interpolate(x, (length, 1), mode = mode)
-    x = rearrange(x, 'b 1 n 1 -> b n')
-    return inverse_pack(x)
-
 def straight_through(t, target):
     return t + (target - t).detach()
 
@@ -209,7 +202,6 @@ class SparseAttention(Module):
         norm = True,
         use_diff_topk = False,
         use_triton_kernel = False,
-        interpolated_importance_score = False,
         query_heads_share_selected_kv = True, # if set to True, importance score is averaged across query heads to select top-n buckets of kv per kv head - but can be set to False for each query head within a group to look at different sets of kv buckets. will be more memory and compute of course
         compress_mlp: Module | None = None,
         compress_mlp_expand_factor = 1.,
@@ -319,9 +311,9 @@ class SparseAttention(Module):
 
         self.use_diff_topk = use_diff_topk
 
-        self.interpolated_importance_score = interpolated_importance_score # in the case fine block size < compressed block size, will weigh space better when selecting
-
         self.query_heads_share_selected_kv = query_heads_share_selected_kv
+
+        assert divisible_by(selection_block_size, compress_block_size), f'selection block size {selection_block_size} must be greater than or equal to compress block size {compress_block_size}, as well as divisible by the compress block size'
 
         self.selection_block_size = selection_block_size
 
@@ -473,10 +465,7 @@ class SparseAttention(Module):
         if self.compress_block_size != self.selection_block_size:
             compress_seq_len = num_compress_blocks * self.compress_block_size
 
-            if self.interpolated_importance_score:
-                importance_scores = interpolate_1d(importance_scores, compress_seq_len)
-            else:
-                importance_scores = repeat(importance_scores, '... j -> ... (bsz j)', bsz = self.compress_block_size)
+            importance_scores = repeat(importance_scores, '... j -> ... (bsz j)', bsz = self.compress_block_size)
 
             fine_seq_len = round_down_mult(compress_seq_len, self.selection_block_size)
 
@@ -702,10 +691,7 @@ class SparseAttention(Module):
 
                 compress_seq_len = num_compress_blocks * self.compress_block_size
 
-                if self.interpolated_importance_score:
-                    importance_scores = interpolate_1d(importance_scores, compress_seq_len)
-                else:
-                    importance_scores = repeat(importance_scores, '... j -> ... (j block_size)', block_size = self.compress_block_size)
+                importance_scores = repeat(importance_scores, '... j -> ... (j block_size)', block_size = self.compress_block_size)
 
                 padding = fine_divisible_seq_len - compress_seq_len
 

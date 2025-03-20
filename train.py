@@ -45,7 +45,6 @@ COMPRESS_BLOCK_OVERLAP_LEN = 2
 FINE_BLOCK_SIZE = 16
 NUM_FINE_SELECTED = 4
 
-INTERPOLATED_IMPORTANCE_SCORE = False
 USE_DIFF_TOPK = True
 
 USE_EFFICIENT_INFERENCE = True # needs validation still
@@ -106,7 +105,6 @@ model = Transformer(
         selection_block_size = FINE_BLOCK_SIZE,
         num_selected_blocks = NUM_FINE_SELECTED,
         use_diff_topk = USE_DIFF_TOPK,
-        interpolated_importance_score = INTERPOLATED_IMPORTANCE_SCORE,
         query_heads_share_selected_kv = QUERY_HEADS_SHARE_SELECTION
     )
 ).cuda()
