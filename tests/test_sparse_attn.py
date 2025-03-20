@@ -85,7 +85,10 @@ def test_inference(
 
     assert torch.allclose(parallel_out, sequential_out, atol = 1e-5)
 
-def test_transformer_inference():
+@pytest.mark.parametrize('selection_block_size', (4, 8))
+def test_transformer_inference(
+    selection_block_size
+):
     from native_sparse_attention_pytorch.transformer import Transformer
 
     model = Transformer(
@@ -97,14 +100,14 @@ def test_transformer_inference():
         sparse_attn_kwargs = dict(
             sliding_window_size = 16,
             compress_block_size = 4,
-            selection_block_size = 16,
-            num_selected_blocks = 1
+            selection_block_size = selection_block_size,
+            num_selected_blocks = 2
         )
     )
 
     prompt = torch.randint(0, 256, (1, 1))
 
-    sampled = model.sample(prompt, 25, temperature = 0., use_cache_kv = False)
-    sampled_cached = model.sample(prompt, 25, temperature = 0., use_cache_kv = True)
+    sampled = model.sample(prompt, 128, temperature = 0., use_cache_kv = False)
+    sampled_cached = model.sample(prompt, 128, temperature = 0., use_cache_kv = True)
 
     assert torch.allclose(sampled, sampled_cached)
