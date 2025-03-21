@@ -190,131 +190,139 @@ def forward_kernel_causal_and_sparse(
 
     if INCLUDE_BLOCK_CAUSAL:
 
-        offs_n = (
+        start_offs_n = (
             start_m * BLOCK +
             tl.arange(0, SEL_BLOCK) - (SEL_BLOCK - BLOCK)
         )
 
-        k_ptrs = (
-            K +
-            off_b * stride_kb +
-            off_h * stride_kh +
-            offs_n[:, None] * stride_kn +
-            offs_d[None, :]
-        )
-
-        v_ptrs = (
-            V +
-            off_b * stride_vb +
-            off_h * stride_vh +
-            offs_n[:, None] * stride_vn +
-            offs_d[None, :]
-        )
-
-        if EVEN_N & EVEN_M:
-            if EVEN_HEADDIM:
-                k = tl.load(
-                    k_ptrs,
-                    mask = (offs_n[:, None] >= 0),
-                    other = 0.
-                )
-            else:
-                k = tl.load(
-                    k_ptrs,
-                    mask = (offs_n[:, None] >= 0) & (offs_d[None, :] < headdim),
-                    other = 0.0
-                )
+        if SLIDING:
+            num_kv_blocks = 2
         else:
-            if EVEN_HEADDIM:
-                k = tl.load(
-                    k_ptrs,
-                    mask = (offs_n[:, None] >= 0) & (offs_n[:, None] < seqlen_k),
-                    other = 0.0,
-                )
-            else:
-                k = tl.load(
-                    k_ptrs,
-                    mask = (offs_n[:, None] >= 0) & (offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
-                    other = 0.0,
-                )
+            num_kv_blocks = 1
 
-        qk = tl.zeros([BLOCK * QUERY_HEAD_GROUPS, SEL_BLOCK], dtype=tl.float32)
+        for kv_block_offset_ind in range(num_kv_blocks):
+            offset = kv_block_offset_ind * -SEL_BLOCK
 
-        qk += tl.dot(q, tl.trans(k))
+            offs_n = start_offs_n + offset
 
-        qk = qk.reshape(BLOCK, QUERY_HEAD_GROUPS, SEL_BLOCK)
-
-        if BLOCK != SEL_BLOCK:
-            block_diagonal_mask = (
-                (offs_n[None, None, :] >= 0.) &
-                ((offs_n[None, None, :] // SEL_BLOCK) == (offs_m[:, None, None] // SEL_BLOCK))
+            k_ptrs = (
+                K +
+                off_b * stride_kb +
+                off_h * stride_kh +
+                offs_n[:, None] * stride_kn +
+                offs_d[None, :]
             )
 
-            qk += tl.where(block_diagonal_mask, 0, float('-inf'))
+            v_ptrs = (
+                V +
+                off_b * stride_vb +
+                off_h * stride_vh +
+                offs_n[:, None] * stride_vn +
+                offs_d[None, :]
+            )
 
-        if not EVEN_N:
-            within_range_mask = offs_n[None, :] < seqlen_k
+            if EVEN_N & EVEN_M:
+                if EVEN_HEADDIM:
+                    k = tl.load(
+                        k_ptrs,
+                        mask = (offs_n[:, None] >= 0),
+                        other = 0.
+                    )
+                else:
+                    k = tl.load(
+                        k_ptrs,
+                        mask = (offs_n[:, None] >= 0) & (offs_d[None, :] < headdim),
+                        other = 0.0
+                    )
+            else:
+                if EVEN_HEADDIM:
+                    k = tl.load(
+                        k_ptrs,
+                        mask = (offs_n[:, None] >= 0) & (offs_n[:, None] < seqlen_k),
+                        other = 0.0,
+                    )
+                else:
+                    k = tl.load(
+                        k_ptrs,
+                        mask = (offs_n[:, None] >= 0) & (offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
+                        other = 0.0,
+                    )
+
+            qk = tl.zeros([BLOCK * QUERY_HEAD_GROUPS, SEL_BLOCK], dtype=tl.float32)
+
+            qk += tl.dot(q, tl.trans(k))
+
+            qk = qk.reshape(BLOCK, QUERY_HEAD_GROUPS, SEL_BLOCK)
+
+            if BLOCK != SEL_BLOCK and not SLIDING:
+                block_diagonal_mask = (
+                    (offs_n[None, None, :] >= 0.) &
+                    ((offs_n[None, None, :] // SEL_BLOCK) == (offs_m[:, None, None] // SEL_BLOCK))
+                )
+
+                qk += tl.where(block_diagonal_mask, 0, float('-inf'))
+
+            if not EVEN_N:
+                qk += tl.where(offs_n[None, :] < seqlen_k, 0, float('-inf'))
+
+            qk = qk.reshape(BLOCK, QUERY_HEAD_GROUPS, SEL_BLOCK)
+
+            causal_mask = offs_m[:, None, None] >= offs_n[None, None, :]
 
             if SLIDING:
-                within_range_mask &= offs_n[None, :] >= 0.
-
-            qk += tl.where(within_range_mask, 0, float('-inf'))
-
-        qk = qk.reshape(BLOCK, QUERY_HEAD_GROUPS, SEL_BLOCK)
-
-        causal_mask = offs_m[:, None, None] >= offs_n[None, None, :]
-
-        if SLIDING:
-            causal_mask &= (offs_n[None, None, :] - offs_m[:, None, None]) <= SEL_BLOCK
-
-        qk += tl.where(causal_mask, 0, float("-inf"))
-
-        m_ij = tl.maximum(tl.max(qk, 2) * softmax_scale, lse_i)
-        p = tl.exp(qk * softmax_scale - m_ij[:, :, None])
-
-        l_ij = tl.sum(p, 2)
-
-        acc_o_scale = tl.exp(m_i - m_ij)
-        acc_o *= acc_o_scale[:, :, None]
-
-        if EVEN_N & EVEN_M:
-            if EVEN_HEADDIM:
-                v = tl.load(
-                    v_ptrs,
-                    mask = (offs_n[:, None] >= 0),
-                    other = 0.
+                causal_mask &= (
+                    (offs_n[None, None, :] >= 0.) &
+                    ((offs_m[:, None, None] - offs_n[None, None, :]) <= SEL_BLOCK)
                 )
+
+            qk += tl.where(causal_mask, 0, float("-inf"))
+
+            m_ij = tl.maximum(tl.max(qk, 2) * softmax_scale, lse_i)
+            p = tl.exp(qk * softmax_scale - m_ij[:, :, None])
+
+            l_ij = tl.sum(p, 2)
+
+            acc_o_scale = tl.exp(m_i - m_ij)
+            acc_o *= acc_o_scale[:, :, None]
+
+            if EVEN_N & EVEN_M:
+                if EVEN_HEADDIM:
+                    v = tl.load(
+                        v_ptrs,
+                        mask = (offs_n[:, None] >= 0),
+                        other = 0.
+                    )
+                else:
+                    v = tl.load(
+                        v_ptrs,
+                        mask = (offs_n[:, None] >= 0) & (offs_d[None, :] < headdim),
+                        other = 0.0
+                    )
             else:
-                v = tl.load(
-                    v_ptrs,
-                    mask = (offs_n[:, None] >= 0) & (offs_d[None, :] < headdim),
-                    other = 0.0
-                )
-        else:
-            if EVEN_HEADDIM:
-                v = tl.load(
-                    v_ptrs,
-                    mask = (offs_n[:, None] >= 0) & (offs_n[:, None] < seqlen_k),
-                    other = 0.0,
-                )
-            else:
-                v = tl.load(
-                    v_ptrs,
-                    mask = (offs_n[:, None] >= 0) & (offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
-                    other = 0.0,
-                )
+                if EVEN_HEADDIM:
+                    v = tl.load(
+                        v_ptrs,
+                        mask = (offs_n[:, None] >= 0) & (offs_n[:, None] < seqlen_k),
+                        other = 0.0,
+                    )
+                else:
+                    v = tl.load(
+                        v_ptrs,
+                        mask = (offs_n[:, None] >= 0) & (offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
+                        other = 0.0,
+                    )
 
-        p = p.reshape(BLOCK * QUERY_HEAD_GROUPS, SEL_BLOCK).to(v.dtype)
+            p = p.reshape(BLOCK * QUERY_HEAD_GROUPS, SEL_BLOCK).to(v.dtype)
 
-        causal_o = tl.dot(p, v)
+            causal_o = tl.dot(p, v)
 
-        acc_o += causal_o.reshape(BLOCK, QUERY_HEAD_GROUPS, BLOCK_HEADDIM)
+            acc_o += causal_o.reshape(BLOCK, QUERY_HEAD_GROUPS, BLOCK_HEADDIM)
 
-        # -- update statistics
+            # -- update statistics
 
-        m_i = m_ij
-        l_i_new = tl.exp(lse_i - m_ij) + l_ij
-        lse_i = m_ij + tl.log(l_i_new)
+            m_i = m_ij
+            l_i_new = tl.exp(lse_i - m_ij) + l_ij
+            lse_i = m_ij + tl.log(l_i_new)
 
     # # take care of the selected kv blocks
 
@@ -393,7 +401,7 @@ def forward_kernel_causal_and_sparse(
 
         # attention
 
-        m_ij = tl.maximum(tl.max(qk, 2) * softmax_scale, lse_i)
+        m_ij = tl.maximum(tl.max(sel_qk, 2) * softmax_scale, lse_i)
         block_p = tl.exp(sel_qk * softmax_scale - m_ij[:, :, None])
 
         l_ij = tl.sum(block_p, 2)
@@ -541,7 +549,7 @@ def forward_kernel(
         kv_block_indices,
         kv_block_mask,
         out_ptr,
-        Lse,
+        lse_ptr,
         softmax_scale,
         stride_qb,
         stride_qh,
@@ -1308,7 +1316,7 @@ def backward_kernel_one_col_block_causal(
 
     mask = offs_m[:, None] >= offs_n[None, :]
 
-    if BLOCK != SEL_BLOCK:
+    if BLOCK != SEL_BLOCK and not SLIDING:
         block_diagonal_mask = (
             (offs_n[None, :] >= 0) &
             ((offs_n[None, :] // SEL_BLOCK) == (offs_m[:, None] // SEL_BLOCK))
@@ -1321,7 +1329,10 @@ def backward_kernel_one_col_block_causal(
         mask &= offs_n[None, :] < seqlen_k
 
     if SLIDING:
-        mask &= (offs_n[None, :] - offs_m[:, None]) < SEL_BLOCK
+        mask &= (
+            (offs_n[None, :] >= 0.) &
+            (offs_m[:, None] - offs_n[None, :]) <= SEL_BLOCK
+        )
 
     qk = tl.where(mask, qk, float("-inf"))
 
