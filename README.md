@@ -14,6 +14,8 @@ This will be my last open sourced project under Meta
 
 - <a href="https://github.com/Mr-Grin">@Mr-Grin</a> for the code review and pointing out an inaccuracy with the implementation
 
+- <a href="https://github.com/Pasewark">Eric Pasewark</a> for submitting a simple transformer based compression network
+
 ## Install
 
 ```bash
