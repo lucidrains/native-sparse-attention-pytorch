@@ -1465,6 +1465,10 @@ def backward_kernel(
     DV,
     LSE,
     D,
+    SLIDE_O,
+    SLIDE_DO,
+    SLIDE_LSE,
+    SLIDE_D,
     softmax_scale,
     stride_qb,
     stride_qh,
@@ -1644,6 +1648,9 @@ def native_sparse_attn_backward(
     o,
     lse,
     dq, dk, dv,
+    do_slide = None,
+    slide_out = None,
+    slide_lse = None,
     block_size = 128,
     include_block_causal = True,
     return_sel_grads = False,
@@ -1691,6 +1698,8 @@ def native_sparse_attn_backward(
     BLOCK_HEADDIM = max(triton.next_power_of_2(dim), 16)
 
     delta = torch.empty_like(lse)
+    slide_delta = torch.empty_like(slide_lse)
+
     grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK"]), batch * q_heads)
 
     backward_preprocess_do_o_dot[grid](
@@ -1711,6 +1720,25 @@ def native_sparse_attn_backward(
         BLOCK_HEADDIM = BLOCK_HEADDIM,
     )
 
+    if sliding:
+        backward_preprocess_do_o_dot[grid](
+            slide_out,
+            do_slide,
+            slide_delta,
+            slide_out.stride(0),
+            slide_out.stride(1),
+            slide_out.stride(2),
+            do_slide.stride(0),
+            do_slide.stride(1),
+            do_slide.stride(2),
+            q_heads,
+            seqlen_q,
+            seqlen_q_rounded,
+            dim,
+            BLOCK = block_size,
+            BLOCK_HEADDIM = BLOCK_HEADDIM,
+        )
+
     grid = lambda META: (
         num_sel_fine_blocks + int(include_block_causal),
         batch * kv_heads,
@@ -1730,6 +1758,10 @@ def native_sparse_attn_backward(
         dv,
         lse,
         delta,
+        slide_out,
+        do_slide,
+        slide_lse,
+        slide_delta,
         softmax_scale,
         q.stride(0),
         q.stride(1),
@@ -1843,7 +1875,7 @@ class NSA(Function):
         return out.type(dtype), slide_out.type(dtype), lse, slide_lse
 
     @classmethod
-    def backward(self, ctx, do, do_sliding, _, __):
+    def backward(self, ctx, do, do_slide, _, __):
         device = do.device
 
         (
@@ -1876,6 +1908,9 @@ class NSA(Function):
             do, q, k, v,
             sel_block_indices, mask, sel_grads,
             out, lse, dq, dk, dv,
+            do_slide = do_slide,
+            slide_out = slide_out,
+            slide_lse = slide_lse,
             block_size = block_size,
             include_block_causal = include_block_causal,
             return_sel_grads = return_sel_grads,

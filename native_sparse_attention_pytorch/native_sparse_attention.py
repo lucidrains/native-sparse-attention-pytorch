@@ -586,6 +586,7 @@ class SparseAttention(Module):
         num_compress_blocks = compress_divisible_seq_len // self.compress_block_size
 
         compress_overlap_len = self.compress_block_overlap_len
+        has_compress_overlap = compress_overlap_len > 0
 
         fine_divisible_seq_len = round_up_mult(seq_len, self.selection_block_size)
         num_fine_blocks = fine_divisible_seq_len // self.selection_block_size
@@ -618,9 +619,9 @@ class SparseAttention(Module):
 
         run_k, run_v = k, v
 
-        if return_cache and compress_overlap_len > 0:
-            run_k = F.pad(run_k, (0, 0, compress_overlap_len, 0), value = 0.)
-            run_v = F.pad(run_v, (0, 0, compress_overlap_len, 0), value = 0.)
+        if return_cache and has_compress_overlap:
+            run_k = pad_at_dim(run_k, (compress_overlap_len, 0), value = 0., dim = -2)
+            run_v = pad_at_dim(run_v, (compress_overlap_len, 0), value = 0., dim = -2)
 
         run_k = run_k[..., compress_divisible_seq_len:, :]
         run_v = run_v[..., compress_divisible_seq_len:, :]
