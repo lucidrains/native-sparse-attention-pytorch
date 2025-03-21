@@ -1465,7 +1465,6 @@ def backward_kernel(
     DV,
     LSE,
     D,
-    SLIDE_O,
     SLIDE_DO,
     SLIDE_LSE,
     SLIDE_D,
@@ -1522,18 +1521,43 @@ def backward_kernel(
     off_h = off_hb % kv_heads
     off_qh = off_h * QUERY_HEAD_GROUPS
 
-    OFF_SEL_KV_BLOCKS = tl.program_id(0) - int(INCLUDE_BLOCK_CAUSAL)
-    IS_CAUSAL = INCLUDE_BLOCK_CAUSAL and tl.program_id(0) == 0
+    # determine whether block causal diagonal, sliding, or selected fine kv blocks
+
+    block_id = tl.program_id(0)
+
+    IS_CAUSAL = False
+    IS_SLIDING = False
+
+    do = DO
+    lse = LSE
+    delta = D
+
+    if INCLUDE_BLOCK_CAUSAL:
+        IS_CAUSAL = block_id == 0
+        block_id -= 1
+
+    if SLIDING:
+        IS_SLIDING = block_id == 0
+        block_id -= 1
+
+    if IS_SLIDING:
+        do = SLIDE_DO
+        lse = SLIDE_LSE
+        delta = SLIDE_D
+
+    OFF_SEL_KV_BLOCKS = block_id
 
     # offset pointers for batch/head
 
     Q += off_b * stride_qb + off_qh * stride_qh
     K += off_b * stride_kb + off_h * stride_kh
     V += off_b * stride_vb + off_h * stride_vh
-    DO += off_b * stride_dob + off_qh * stride_doh
+
     DQ += off_b * stride_dqb + off_qh * stride_dqh
     DK += off_b * stride_dkb + off_h * stride_dkh
     DV += off_b * stride_dvb + off_h * stride_dvh
+
+    do += off_b * stride_dob + off_qh * stride_doh
 
     # offset pointers for batch/head for selected kv block related
 
@@ -1543,19 +1567,19 @@ def backward_kernel(
 
     # pointer to row-wise quantities in value-like data
 
-    D += (
+    delta += (
         off_b * stride_D_b +
         off_qh * seqlen_q_rounded
     )
 
-    LSE += (
+    lse += (
         off_b * stride_lse_b +
         off_qh * seqlen_q_rounded
     )
 
     start_n = tl.program_id(2)
 
-    if IS_CAUSAL:
+    if IS_CAUSAL or IS_SLIDING:
         backward_kernel_one_col_block_causal(
             start_n,
             Q,
@@ -1563,12 +1587,12 @@ def backward_kernel(
             V,
             kv_block_indices,
             kv_block_mask,
-            DO,
+            do,
             DQ,
             DK,
             DV,
-            LSE,
-            D,
+            lse,
+            delta,
             softmax_scale,
             stride_qm,
             stride_kn,
@@ -1593,7 +1617,7 @@ def backward_kernel(
             SEL_BLOCK = SEL_BLOCK,
             QUERY_HEAD_GROUPS = QUERY_HEAD_GROUPS,
             QUERY_EXPAND_DIM = QUERY_EXPAND_DIM,
-            SLIDING = SLIDING
+            SLIDING = IS_SLIDING
         )
     else:
         backward_kernel_one_col_block_sparse(
@@ -1604,12 +1628,12 @@ def backward_kernel(
             kv_block_indices,
             kv_block_mask,
             kv_block_grads,
-            DO,
+            do,
             DQ,
             DK,
             DV,
-            LSE,
-            D,
+            lse,
+            delta,
             softmax_scale,
             stride_qm,
             stride_kn,
@@ -1662,6 +1686,9 @@ def native_sparse_attn_backward(
     # Make sure that the last dimension is contiguous
     if not is_contiguous(do):
         do = do.contiguous()
+
+    if not is_contiguous(do_slide):
+        do_slide = do_slide.contiguous()
 
     batch, q_heads, seqlen_q, dim = q.shape
 
@@ -1740,7 +1767,7 @@ def native_sparse_attn_backward(
         )
 
     grid = lambda META: (
-        num_sel_fine_blocks + int(include_block_causal),
+        int(include_block_causal) + int(sliding) + num_sel_fine_blocks,
         batch * kv_heads,
         triton.cdiv(seqlen_k, META['BLOCK'])
     )
@@ -1758,7 +1785,6 @@ def native_sparse_attn_backward(
         dv,
         lse,
         delta,
-        slide_out,
         do_slide,
         slide_lse,
         slide_delta,
@@ -1898,6 +1924,8 @@ class NSA(Function):
         ) = ctx._saved_variables
 
         do = do.half()
+        do_slide = do_slide.half()
+
         dq = torch.zeros(q.shape, dtype = torch.float32, device = device)
         dk = torch.zeros(k.shape, dtype = torch.float32, device = device)
         dv = torch.zeros(v.shape, dtype = torch.float32, device = device)
@@ -1914,7 +1942,8 @@ class NSA(Function):
             block_size = block_size,
             include_block_causal = include_block_causal,
             return_sel_grads = return_sel_grads,
-            block_dk_dv_use_dot = block_dk_dv_use_dot
+            block_dk_dv_use_dot = block_dk_dv_use_dot,
+            sliding = return_sliding_window_out
         )
     
         ret_sel_grads = None
