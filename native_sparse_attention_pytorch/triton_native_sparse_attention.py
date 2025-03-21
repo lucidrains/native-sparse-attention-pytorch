@@ -626,7 +626,7 @@ def native_sparse_attn_forward(
     seqlen_q_rounded = round_up_multiple(seqlen_q, TRITON_BLOCK_SIZE)
 
     lse = torch.empty((batch, nheads, seqlen_q_rounded), device = device, dtype = torch.float32)
-    sliding_lse = torch.empty((batch, nheads, seqlen_q_rounded), device = device, dtype = torch.float32)
+    slide_lse = torch.empty((batch, nheads, seqlen_q_rounded), device = device, dtype = torch.float32)
 
     o = torch.empty_like(q)
     slide_o = torch.empty_like(q)
@@ -649,7 +649,7 @@ def native_sparse_attn_forward(
         o,
         slide_o,
         lse,
-        sliding_lse,
+        slide_lse,
         softmax_scale,
         q.stride(0),
         q.stride(1),
@@ -685,7 +685,7 @@ def native_sparse_attn_forward(
         num_stages = 1,
     )
 
-    return o, slide_o, lse
+    return o, slide_o, lse, slide_lse
 
 @triton.jit
 def backward_preprocess_do_o_dot(
@@ -1815,7 +1815,7 @@ class NSA(Function):
 
         fq, fk, fv = tuple(t.half() for t in (fq, fk, fv))
 
-        out, slide_out, lse = native_sparse_attn_forward(
+        out, slide_out, lse, slide_lse = native_sparse_attn_forward(
             fq, fk, fv,
             selected_block_indices,
             fmask,
@@ -1824,7 +1824,7 @@ class NSA(Function):
             return_sliding_window_out = return_sliding_window_out
         )
 
-        ctx.save_for_backward(fq, fk, fv, selected_block_indices, fmask, out, slide_out, lse)
+        ctx.save_for_backward(fq, fk, fv, selected_block_indices, fmask, out, slide_out, lse, slide_lse)
 
         return_sel_grads = exists(sel_scale)
 
@@ -1840,10 +1840,10 @@ class NSA(Function):
             return_sliding_window_out
         )
 
-        return out.type(dtype), slide_out.type(dtype), lse
+        return out.type(dtype), slide_out.type(dtype), lse, slide_lse
 
     @classmethod
-    def backward(self, ctx, do, do_sliding, _):
+    def backward(self, ctx, do, do_sliding, _, __):
         device = do.device
 
         (
@@ -1852,7 +1852,8 @@ class NSA(Function):
             mask,
             out,
             slide_out,
-            lse
+            lse,
+            slide_lse
         ) = ctx.saved_tensors
 
         (
@@ -1925,7 +1926,7 @@ def native_sparse_attend(
     if kv_heads != sel_heads:
         fk, fv = tuple(repeat(t, 'b h ... -> b (h gh) ...', gh = q_heads // kv_heads) for t in (fk, fv))
 
-    out, sliding_out, lse = _native_sparse_attend(
+    out, sliding_out, lse, sliding_lse = _native_sparse_attend(
         fq, fk, fv,
         block_size,
         selected_block_indices,
@@ -1941,5 +1942,11 @@ def native_sparse_attend(
 
     if not return_lse:
         return out
-    
-    return out, lse[..., :seq_len]
+
+    lse = lse[..., :seq_len]
+    sliding_lse = sliding_lse[..., :seq_len]
+
+    if return_sliding_window_out:
+        lse = (lse, sliding_lse)
+
+    return out, lse
