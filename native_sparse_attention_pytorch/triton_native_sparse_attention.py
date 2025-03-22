@@ -112,6 +112,7 @@ def forward_kernel_causal_and_sparse(
     QUERY_HEAD_GROUPS: tl.constexpr,
     QUERY_EXPAND_DIM: tl.constexpr,
     NUM_SEL_KV_BLOCKS: tl.constexpr,
+    NUM_BLOCKS_PER_SEL: tl.constexpr,
     INCLUDE_BLOCK_CAUSAL: tl.constexpr,
     SLIDING: tl.constexpr
 ):
@@ -346,6 +347,7 @@ def forward_kernel_causal_and_sparse(
     q = q.reshape(BLOCK, 16, BLOCK_HEADDIM)
 
     for off_sel_kv_block in range(NUM_SEL_KV_BLOCKS):
+
         block_indices = tl.load(
             kv_block_indices_ptrs + off_sel_kv_block,
             mask = offs_m < seqlen_q,
@@ -358,86 +360,91 @@ def forward_kernel_causal_and_sparse(
             other = False
         )
 
-        blocks_offs_n = block_indices[:, None] * BLOCK + tl.arange(0, BLOCK)[None, :]
+        for off_blocks_per_sel in range(NUM_BLOCKS_PER_SEL):
 
-        block_k_ptrs = (
-            K +
-            off_b * stride_kb +
-            off_h * stride_kh +
-            blocks_offs_n[:, :, None] * stride_kn +
-            offs_d[None, None, :]
-        )
+            blocks_offs_n = (
+                block_indices[:, None] * (BLOCK * NUM_BLOCKS_PER_SEL) +
+                tl.arange(0, BLOCK)[None, :] + (off_blocks_per_sel * BLOCK)
+            )
 
-        block_v_ptrs = (
-            V +
-            off_b * stride_vb +
-            off_h * stride_vh + 
-            blocks_offs_n[:, :, None] * stride_vn +
-            offs_d[None, None, :]
-        )
+            block_k_ptrs = (
+                K +
+                off_b * stride_kb +
+                off_h * stride_kh +
+                blocks_offs_n[:, :, None] * stride_kn +
+                offs_d[None, None, :]
+            )
 
-        # load k of shape (m, n, d), sparsely selected by each query
+            block_v_ptrs = (
+                V +
+                off_b * stride_vb +
+                off_h * stride_vh + 
+                blocks_offs_n[:, :, None] * stride_vn +
+                offs_d[None, None, :]
+            )
 
-        k_block = tl.load(
-            block_k_ptrs,
-            mask = blocks_offs_n[:, :, None] < seqlen_k,
-            other = 0.
-        )
+            # load k of shape (m, n, d), sparsely selected by each query
 
-        # similarities
+            k_block = tl.load(
+                block_k_ptrs,
+                mask = blocks_offs_n[:, :, None] < seqlen_k,
+                other = 0.
+            )
 
-        block_qk = tl.zeros([BLOCK, 16, BLOCK], dtype = tl.float32)
-        sel_qk = tl.zeros([BLOCK, QUERY_HEAD_GROUPS, BLOCK], dtype = tl.float32)
+            # similarities
 
-        k_block = k_block.reshape(BLOCK, BLOCK, BLOCK_HEADDIM)
-        k_block = k_block.permute(0, 2, 1)
+            block_qk = tl.zeros([BLOCK, 16, BLOCK], dtype = tl.float32)
+            sel_qk = tl.zeros([BLOCK, QUERY_HEAD_GROUPS, BLOCK], dtype = tl.float32)
 
-        block_qk += tl.dot(q, k_block)
-        block_qk = block_qk.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK)
-        block_qk = tl.reduce(block_qk, 2, reduce_avg)
+            k_block = k_block.reshape(BLOCK, BLOCK, BLOCK_HEADDIM)
+            k_block = k_block.permute(0, 2, 1)
 
-        sel_qk += block_qk
-        sel_qk += tl.where(block_masks[:, None, None], 0, float("-inf"))
+            block_qk += tl.dot(q, k_block)
+            block_qk = block_qk.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK)
+            block_qk = tl.reduce(block_qk, 2, reduce_avg)
 
-        # attention
+            sel_qk += block_qk
+            sel_qk += tl.where(block_masks[:, None, None], 0, float("-inf"))
 
-        m_ij = tl.maximum(tl.max(sel_qk, 2) * softmax_scale, lse_i)
-        block_p = tl.exp(sel_qk * softmax_scale - m_ij[:, :, None])
+            # attention
 
-        l_ij = tl.sum(block_p, 2)
+            m_ij = tl.maximum(tl.max(sel_qk, 2) * softmax_scale, lse_i)
+            block_p = tl.exp(sel_qk * softmax_scale - m_ij[:, :, None])
 
-        # renormalize the running output
+            l_ij = tl.sum(block_p, 2)
 
-        acc_o_scale = tl.exp(m_i - m_ij)
-        acc_o = acc_o * acc_o_scale[:, :, None]
+            # renormalize the running output
 
-        # aggregate values
+            acc_o_scale = tl.exp(m_i - m_ij)
+            acc_o = acc_o * acc_o_scale[:, :, None]
 
-        v_block = tl.load(
-            block_v_ptrs,
-            mask = blocks_offs_n[:, :, None] < seqlen_k,
-            other = 0.
-        )
+            # aggregate values
 
-        v_block = tl.reshape(v_block, (BLOCK, BLOCK, BLOCK_HEADDIM))
+            v_block = tl.load(
+                block_v_ptrs,
+                mask = blocks_offs_n[:, :, None] < seqlen_k,
+                other = 0.
+            )
 
-        block_p = block_p.to(v_block.dtype)
-        p_expanded = block_p.reshape(BLOCK, QUERY_HEAD_GROUPS, BLOCK)
-        p_expanded = tl.expand_dims(p_expanded, 2)
-        p_expanded = tl.broadcast_to(p_expanded, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK))
-        p_expanded = p_expanded.reshape(BLOCK, 16, BLOCK)
+            v_block = tl.reshape(v_block, (BLOCK, BLOCK, BLOCK_HEADDIM))
 
-        block_acc_o = tl.dot(p_expanded, v_block)
-        block_acc_o = block_acc_o.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK_HEADDIM)
-        block_acc_o = tl.reduce(block_acc_o, 2, reduce_avg)
+            block_p = block_p.to(v_block.dtype)
+            p_expanded = block_p.reshape(BLOCK, QUERY_HEAD_GROUPS, BLOCK)
+            p_expanded = tl.expand_dims(p_expanded, 2)
+            p_expanded = tl.broadcast_to(p_expanded, (BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK))
+            p_expanded = p_expanded.reshape(BLOCK, 16, BLOCK)
 
-        acc_o += block_acc_o
+            block_acc_o = tl.dot(p_expanded, v_block)
+            block_acc_o = block_acc_o.reshape(BLOCK, QUERY_HEAD_GROUPS, QUERY_EXPAND_DIM, BLOCK_HEADDIM)
+            block_acc_o = tl.reduce(block_acc_o, 2, reduce_avg)
 
-        # -- update statistics
+            acc_o += block_acc_o
 
-        m_i = m_ij
-        l_i_new = tl.exp(lse_i - m_ij) + l_ij
-        lse_i = m_ij + tl.log(l_i_new)
+            # -- update statistics
+
+            m_i = m_ij
+            l_i_new = tl.exp(lse_i - m_ij) + l_ij
+            lse_i = m_ij + tl.log(l_i_new)
 
     # normalize accumulated out
 
@@ -528,6 +535,7 @@ def forward_kernel(
     QUERY_HEAD_GROUPS: tl.constexpr,
     QUERY_EXPAND_DIM: tl.constexpr,
     NUM_SEL_KV_BLOCKS: tl.constexpr,
+    NUM_BLOCKS_PER_SEL: tl.constexpr,
     INCLUDE_BLOCK_CAUSAL: tl.constexpr,
     RETURN_SLIDING_OUT: tl.constexpr
 ):
@@ -583,6 +591,7 @@ def forward_kernel(
         QUERY_HEAD_GROUPS,
         QUERY_EXPAND_DIM,
         num_sel_kv_blocks,
+        NUM_BLOCKS_PER_SEL,
         INCLUDE_BLOCK_CAUSAL,
         sliding
     )
@@ -607,10 +616,6 @@ def native_sparse_attn_forward(
     assert divisible_by(block_size, 16)
 
     num_blocks_per_sel = block_size // 16
-    if num_blocks_per_sel > 1:
-        kv_block_indices = einx.add('... sel, r -> ... (sel r)', kv_block_indices * num_blocks_per_sel, arange(num_blocks_per_sel, device = device))
-        kv_block_mask = repeat(kv_block_mask, '... sel -> ... (sel r)', r = num_blocks_per_sel)
-
     num_selected_fine_blocks = kv_block_indices.shape[-1]
     assert kv_block_indices.shape == kv_block_mask.shape
 
@@ -679,6 +684,7 @@ def native_sparse_attn_forward(
         SEL_BLOCK = block_size,
         QUERY_HEAD_GROUPS = head_groups,
         NUM_SEL_KV_BLOCKS = num_selected_fine_blocks,
+        NUM_BLOCKS_PER_SEL = num_blocks_per_sel,
         INCLUDE_BLOCK_CAUSAL = include_block_causal,
         RETURN_SLIDING_OUT = return_sliding_window_out,
         num_warps = num_warps,
@@ -821,6 +827,8 @@ def backward_kernel_one_col_block_sparse(
     QUERY_EXPAND_DIM: tl.constexpr,
     RETURN_SEL_GRADS: tl.constexpr,
     OFF_SEL_KV_BLOCKS: tl.constexpr,
+    NUM_BLOCKS_PER_SEL: tl.constexpr,
+    OFF_BLOCK_PER_SEL: tl.constexpr,
     BLOCK_DV_USE_DOT: tl.constexpr,
     BLOCK_DK_USE_DOT: tl.constexpr,
 ):
@@ -962,8 +970,8 @@ def backward_kernel_one_col_block_sparse(
     )
 
     blocks_offs_n = (
-        block_indices[:, None] * BLOCK +
-        tl.arange(0, BLOCK)[None, :]
+        block_indices[:, None] * (BLOCK * NUM_BLOCKS_PER_SEL) +
+        tl.arange(0, BLOCK)[None, :] + (OFF_BLOCK_PER_SEL * BLOCK)
     )
 
     block_k_ptrs = (
@@ -1135,8 +1143,6 @@ def backward_kernel_one_col_block_causal(
     Q,
     K,
     V,
-    kv_block_indices,
-    kv_block_mask,
     DO,
     DQ,
     DK,
@@ -1513,6 +1519,7 @@ def backward_kernel(
     RETURN_SEL_GRADS: tl.constexpr,
     INCLUDE_BLOCK_CAUSAL: tl.constexpr,
     SLIDING: tl.constexpr,
+    NUM_BLOCKS_PER_SEL: tl.constexpr,
     BLOCK_DV_USE_DOT: tl.constexpr,
     BLOCK_DK_USE_DOT: tl.constexpr,
 ):
@@ -1545,7 +1552,8 @@ def backward_kernel(
         lse = SLIDE_LSE
         delta = SLIDE_D
 
-    OFF_SEL_KV_BLOCKS = block_id
+    OFF_SEL_KV_BLOCKS = block_id // NUM_BLOCKS_PER_SEL
+    OFF_BLOCK_PER_SEL = block_id % NUM_BLOCKS_PER_SEL
 
     # offset pointers for batch/head
 
@@ -1585,8 +1593,6 @@ def backward_kernel(
             Q,
             K,
             V,
-            kv_block_indices,
-            kv_block_mask,
             do,
             DQ,
             DK,
@@ -1659,6 +1665,8 @@ def backward_kernel(
             QUERY_EXPAND_DIM = QUERY_EXPAND_DIM,
             RETURN_SEL_GRADS = RETURN_SEL_GRADS,
             OFF_SEL_KV_BLOCKS = OFF_SEL_KV_BLOCKS,
+            NUM_BLOCKS_PER_SEL = NUM_BLOCKS_PER_SEL,
+            OFF_BLOCK_PER_SEL = OFF_BLOCK_PER_SEL,
             BLOCK_DV_USE_DOT = BLOCK_DV_USE_DOT,
             BLOCK_DK_USE_DOT = BLOCK_DK_USE_DOT,
         )
@@ -1702,11 +1710,6 @@ def native_sparse_attn_backward(
     num_blocks_per_sel = block_size // 16
 
     orig_kv_block_grads = kv_block_grads
-
-    if num_blocks_per_sel > 1:
-        kv_block_indices = einx.add('... sel, r -> ... (sel r)', kv_block_indices * num_blocks_per_sel, arange(num_blocks_per_sel, device = device))
-        kv_block_mask = repeat(kv_block_mask, '... sel -> ... (sel r)', r = num_blocks_per_sel)
-        kv_block_grads = repeat(kv_block_grads, '... sel -> ... (sel r)', r = num_blocks_per_sel)
 
     num_sel_fine_blocks = kv_block_indices.shape[-1]
     assert kv_block_indices.shape == kv_block_mask.shape
@@ -1767,7 +1770,7 @@ def native_sparse_attn_backward(
         )
 
     grid = lambda META: (
-        int(include_block_causal) + int(sliding) + num_sel_fine_blocks,
+        int(include_block_causal) + int(sliding) + (num_sel_fine_blocks * num_blocks_per_sel),
         batch * kv_heads,
         triton.cdiv(seqlen_k, META['BLOCK'])
     )
@@ -1834,6 +1837,7 @@ def native_sparse_attn_backward(
         RETURN_SEL_GRADS = return_sel_grads,
         INCLUDE_BLOCK_CAUSAL = include_block_causal,
         SLIDING = sliding,
+        NUM_BLOCKS_PER_SEL = num_blocks_per_sel,
         BLOCK_DV_USE_DOT = default(block_dk_dv_use_dot, head_groups > 1),
         BLOCK_DK_USE_DOT = default(block_dk_dv_use_dot, head_groups > 1)
         # BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
@@ -1841,10 +1845,7 @@ def native_sparse_attn_backward(
         # num_stages=1,
     )
 
-    if num_blocks_per_sel > 1:
-        orig_kv_block_grads.copy_(reduce(kv_block_grads, '... (sel r) -> ... sel', 'sum', r = num_blocks_per_sel))
-
-    return delta
+    return delta, slide_delta
 
 # native sparse attention function
 
