@@ -870,14 +870,6 @@ def backward_kernel_one_col_block_sparse(
         offs_d[None, None, :]
     )
 
-    # There seems to be some problem with Triton pipelining that makes results wrong for
-    # headdim=64, seqlen=(113, 255), bias_type='matrix'. In this case the for loop
-    # may have zero step, and pipelining with the bias matrix could screw it up.
-    # So we just exit early.
-
-    if begin_m >= seqlen_q:
-        return
-
     # same block for block causal diagonal
 
     # load q, k, v, do on-chip
@@ -1221,29 +1213,6 @@ def backward_kernel_one_col_block_causal(
     dv = tl.zeros([SEL_BLOCK, BLOCK_HEADDIM], dtype=tl.float32)
     dk = tl.zeros([SEL_BLOCK, BLOCK_HEADDIM], dtype=tl.float32)
 
-    # There seems to be some problem with Triton pipelining that makes results wrong for
-    # headdim=64, seqlen=(113, 255), bias_type='matrix'. In this case the for loop
-    # may have zero step, and pipelining with the bias matrix could screw it up.
-    # So we just exit early.
-
-    if begin_m >= seqlen_q:
-        dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_d[None, :])
-        dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_d[None, :])
-
-        backward_store_dk_dv(
-            dk_ptrs,
-            dv_ptrs,
-            dk,
-            dv,
-            offs_n,
-            offs_d,
-            seqlen_k,
-            headdim,
-            EVEN_M=EVEN_M,
-            EVEN_N=EVEN_N,
-            EVEN_HEADDIM=EVEN_HEADDIM,
-        )
-        return
     # k and v stay in SRAM throughout
     # [2022-10-30] TD: Same bug as the fwd. In the case of EVEN_N=True and EVEN_M=False,
     # if we just call tl.load(k_ptrs), we get the wrong output!
