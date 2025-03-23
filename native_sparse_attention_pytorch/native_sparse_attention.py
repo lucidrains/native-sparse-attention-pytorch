@@ -282,7 +282,7 @@ class SparseAttention(Module):
         self.split_compress_window = split_compress_window_fn
         self.compress_window_size = compress_window_size
 
-        assert compress_block_overlap_len < compress_block_size
+        assert compress_block_overlap_len <= compress_block_size
         self.compress_block_overlap_len = compress_block_overlap_len
 
         # compression attention related parameters
