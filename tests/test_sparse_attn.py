@@ -6,13 +6,15 @@ from einops.layers.torch import Rearrange
 
 from native_sparse_attention_pytorch import SparseAttention
 
+device = 'cuda:4'
+
 @pytest.mark.parametrize('use_diff_topk', (False, True))
 @pytest.mark.parametrize('causal', (False, True))
 @pytest.mark.parametrize('seq_len', (1, 4, 31, 32, 120))
 @pytest.mark.parametrize('kv_heads', (8, 4))
 @pytest.mark.parametrize('selection_block_size', (8, 16, 32))
 @pytest.mark.parametrize('compress_block_size', (8, 4))
-@pytest.mark.parametrize('compress_block_overlap_len', (0, 2))
+@pytest.mark.parametrize('compress_block_sliding_stride', (2, 4))
 @pytest.mark.parametrize('num_selected_block', (0, 2))
 @pytest.mark.parametrize('query_heads_share_selected_kv', (False, True))
 def test_sparse_attn(
@@ -22,7 +24,7 @@ def test_sparse_attn(
     kv_heads,
     selection_block_size,
     compress_block_size,
-    compress_block_overlap_len,
+    compress_block_sliding_stride,
     num_selected_block,
     query_heads_share_selected_kv,
 ):
@@ -35,13 +37,13 @@ def test_sparse_attn(
         sliding_window_size = 2,
         selection_block_size = selection_block_size,
         compress_block_size = compress_block_size,
-        compress_block_overlap_len = compress_block_overlap_len,
+        compress_block_sliding_stride = compress_block_sliding_stride,
         num_selected_blocks = num_selected_block,
         use_diff_topk = use_diff_topk,
         query_heads_share_selected_kv = query_heads_share_selected_kv,
-    )
+    ).to(device)
 
-    tokens = torch.randn(2, seq_len, 512)
+    tokens = torch.randn(2, seq_len, 512).to(device)
 
     attended = attn(tokens)
 
@@ -49,12 +51,12 @@ def test_sparse_attn(
 
 @pytest.mark.parametrize('seq_len', (2, 8, 16))
 @pytest.mark.parametrize('num_selected_blocks', (0, 2))
-@pytest.mark.parametrize('compress_block_overlap_len', (0, 2))
-@pytest.mark.parametrize('selection_block_size', (5, 10, 15))
+@pytest.mark.parametrize('compress_block_sliding_stride', (2, 4))
+@pytest.mark.parametrize('selection_block_size', (8, 16, 20))
 def test_inference(
     seq_len,
     num_selected_blocks,
-    compress_block_overlap_len,
+    compress_block_sliding_stride,
     selection_block_size
 ):
 
@@ -67,10 +69,10 @@ def test_inference(
         compress_block_size = 5,
         selection_block_size = selection_block_size,
         num_selected_blocks = num_selected_blocks,
-        compress_block_overlap_len = compress_block_overlap_len
-    )
+        compress_block_sliding_stride = compress_block_sliding_stride
+    ).to(device)
 
-    tokens = torch.randn(2, seq_len, 512)
+    tokens = torch.randn(2, seq_len, 512).to(device)
 
     parallel_out = attn(tokens)
 
@@ -100,12 +102,13 @@ def test_transformer_inference(
         sparse_attn_kwargs = dict(
             sliding_window_size = 16,
             compress_block_size = 4,
+            compress_block_sliding_stride = 2,
             selection_block_size = selection_block_size,
             num_selected_blocks = 2
         )
-    )
+    ).to(device)
 
-    prompt = torch.randint(0, 256, (1, 1))
+    prompt = torch.randint(0, 256, (1, 1)).to(device)
 
     sampled = model.sample(prompt, 128, temperature = 0., use_cache_kv = False)
     sampled_cached = model.sample(prompt, 128, temperature = 0., use_cache_kv = True)
