@@ -273,7 +273,10 @@ class Transformer(Module):
 
         # token embedding
 
-        tokens = self.token_emb(ids)
+        if is_inferencing:
+            tokens = self.token_emb(ids[:, -1:])
+        else:
+            tokens = self.token_emb(ids)
 
         # prepare maybe flex attention masks
 
@@ -297,9 +300,6 @@ class Transformer(Module):
         iter_cache = iter(cache)
 
         next_cache = []
-
-        if is_inferencing:
-            tokens = tokens[:, -1:]
 
         # layers
 
