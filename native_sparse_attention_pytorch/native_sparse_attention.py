@@ -58,7 +58,7 @@ def create_sliding_mask(seq_len, window_size, causal = True):
     block_mask = create_block_mask(sliding_mask, B = None, H = None, Q_LEN = seq_len, KV_LEN = seq_len, _compile = True)
     return block_mask
 
-def create_compress_mask(seq_len, kv_seq_len, compress_block_size, mem_kv_len = 0, causal = True):
+def create_compress_mask(seq_len, kv_seq_len, compress_block_sliding_stride, mem_kv_len = 0, causal = True):
 
     if not causal:
         return None
@@ -70,7 +70,7 @@ def create_compress_mask(seq_len, kv_seq_len, compress_block_size, mem_kv_len = 
         is_mem_kv = kv_idx < mem_kv_len
 
         kv_without_mem = kv_idx - mem_kv_len
-        compress_kv_idx = (kv_without_mem * compress_block_size) + (compress_block_size - 1)
+        compress_kv_idx = (kv_without_mem * compress_block_sliding_stride) + (compress_block_sliding_stride - 1)
 
         causal_mask = q_idx > compress_kv_idx
         return causal_mask | is_mem_kv
@@ -193,9 +193,9 @@ class SparseAttention(Module):
         heads,
         sliding_window_size,
         compress_block_size,
+        compress_block_sliding_stride,
         selection_block_size,
         num_selected_blocks,
-        compress_block_overlap_len = 0, # the amount of overlap of a given compression block to the previous block
         kv_heads = None,
         num_compressed_mem_kv = 1,
         causal = False,
@@ -261,40 +261,28 @@ class SparseAttention(Module):
         # compress strategy
 
         self.compress_block_size = compress_block_size
+        self.compress_block_sliding_stride = compress_block_sliding_stride
+        assert self.compress_block_size >= self.compress_block_sliding_stride, 'compress_block_size must be >= compress_block_sliding_stride'
+        assert self.compress_block_sliding_stride > 0, 'compress_block_sliding_stride must be greater than 0'
+        assert divisible_by(selection_block_size, self.compress_block_sliding_stride), f'selection_block_size {selection_block_size} must be divisible by compress_block_sliding_stride {self.compress_block_sliding_stride}'
+
+        # Compression window splitting
+        self.split_compress_window = nn.Sequential(
+            Rearrange('b h n d -> (b h) d 1 n'),
+            nn.ZeroPad2d(((compress_block_size - compress_block_sliding_stride), 0, 0, 0)),
+            nn.Unfold(kernel_size=(1, self.compress_block_size), stride=(1, self.compress_block_sliding_stride)),
+            Rearrange('(b h) (d n) w -> b h w n d', d=dim_head, h=kv_heads, n=self.compress_block_size)
+        )
 
         assert num_compressed_mem_kv > 0
-
-        # the function for splitting out the compression windows for the mlp
-
-        compress_block_has_overlap = compress_block_overlap_len > 0
-        compress_window_size = compress_block_size + compress_block_overlap_len
-
-        if not compress_block_has_overlap:
-            split_compress_window_fn = Rearrange('b h (w n) d -> b h w n d', n = compress_block_size)
-        else:
-            split_compress_window_fn = nn.Sequential(
-                Rearrange('b h n d -> (b h) d 1 n'),
-                nn.ZeroPad2d((compress_block_overlap_len, 0, 0, 0)),
-                nn.Unfold(kernel_size = (1, compress_window_size), stride = (1, compress_block_size)),
-                Rearrange('(b h) (d n) w -> b h w n d', d = dim_head, h = kv_heads)
-            )
-
-        self.split_compress_window = split_compress_window_fn
-        self.compress_window_size = compress_window_size
-
-        assert compress_block_overlap_len <= compress_block_size
-        self.compress_block_overlap_len = compress_block_overlap_len
-
-        # compression attention related parameters
-
         self.num_mem_compress_kv = num_compressed_mem_kv
         self.compress_mem_kv = nn.Parameter(torch.zeros(2, kv_heads, num_compressed_mem_kv, dim_head))
         
-        self.k_intrablock_positions = nn.Parameter(torch.zeros(kv_heads, compress_window_size, dim_head))
-        self.v_intrablock_positions = nn.Parameter(torch.zeros(kv_heads, compress_window_size, dim_head))
+        self.k_intrablock_positions = nn.Parameter(torch.zeros(kv_heads, self.compress_block_size, dim_head))
+        self.v_intrablock_positions = nn.Parameter(torch.zeros(kv_heads, self.compress_block_size, dim_head))
 
         if not exists(compress_mlp):
-            compress_dim = compress_window_size * dim_head
+            compress_dim = self.compress_block_size * dim_head
             compress_mlp_dim_hidden = int(compress_mlp_expand_factor * compress_dim)
 
             compress_mlp = nn.Sequential(
@@ -310,11 +298,7 @@ class SparseAttention(Module):
         # selection related
 
         self.use_diff_topk = use_diff_topk
-
         self.query_heads_share_selected_kv = query_heads_share_selected_kv
-
-        assert divisible_by(selection_block_size, compress_block_size), f'selection block size {selection_block_size} must be greater than or equal to compress block size {compress_block_size}, as well as divisible by the compress block size'
-
         self.selection_block_size = selection_block_size
 
         assert num_selected_blocks >= 0
@@ -376,8 +360,6 @@ class SparseAttention(Module):
         seq_len = cache_len + 1
 
         sliding_window = self.sliding_window_size
-        compress_divisible_seq_len = round_down_mult(seq_len, self.compress_block_size)
-        compress_overlap_len = self.compress_block_overlap_len
 
         fine_divisible_seq_len = round_up_mult(seq_len, self.selection_block_size)
         num_fine_blocks = fine_divisible_seq_len // self.selection_block_size
@@ -435,7 +417,7 @@ class SparseAttention(Module):
 
         running_compress_seq_len = run_k.shape[-2]
 
-        if divisible_by(running_compress_seq_len, self.compress_block_size + compress_overlap_len):
+        if divisible_by(running_compress_seq_len, self.compress_block_size):
             k_compress_input = rearrange(run_k, 'b h n d -> b h 1 n d')
             v_compress_input = rearrange(run_v, 'b h n d -> b h 1 n d')
 
@@ -445,6 +427,7 @@ class SparseAttention(Module):
             next_ck = self.k_compress(k_compress_input)
             next_cv = self.v_compress(v_compress_input)
 
+            compress_overlap_len = self.compress_block_size - self.compress_block_sliding_stride
             run_kv_slice = slice(-compress_overlap_len, None) if compress_overlap_len > 0 else slice(0, 0)
 
             run_k = run_k[..., run_kv_slice, :]
@@ -461,9 +444,9 @@ class SparseAttention(Module):
         importance_scores = csim[..., self.num_mem_compress_kv:]
 
         num_compress_blocks = importance_scores.shape[-1]
-        num_compress_per_fine = self.selection_block_size // self.compress_block_size
+        num_compress_per_fine = self.selection_block_size // self.compress_block_sliding_stride
 
-        if self.compress_block_size != self.selection_block_size:
+        if self.compress_block_sliding_stride != self.selection_block_size:
             compress_seq_len = round_down_mult(num_compress_blocks, num_compress_per_fine)
             importance_scores = importance_scores[..., :compress_seq_len]
             importance_scores = reduce(importance_scores, '... (j num_compress_per_fine) -> ... j', 'mean', num_compress_per_fine = num_compress_per_fine)
@@ -582,10 +565,10 @@ class SparseAttention(Module):
 
         batch, seq_len, scale, heads, kv_heads, device = *inp.shape[:2], self.scale, self.heads, self.kv_heads, inp.device
 
-        compress_divisible_seq_len = round_down_mult(seq_len, self.compress_block_size)
-        num_compress_blocks = compress_divisible_seq_len // self.compress_block_size
+        compress_divisible_seq_len = round_down_mult(seq_len, self.compress_block_sliding_stride)
+        num_compress_blocks = compress_divisible_seq_len // self.compress_block_sliding_stride
 
-        compress_overlap_len = self.compress_block_overlap_len
+        compress_overlap_len = self.compress_block_size - self.compress_block_sliding_stride
         has_compress_overlap = compress_overlap_len > 0
 
         fine_divisible_seq_len = round_up_mult(seq_len, self.selection_block_size)
@@ -609,7 +592,7 @@ class SparseAttention(Module):
             k_compress_input = self.split_compress_window(k_compress_input)
             v_compress_input = self.split_compress_window(v_compress_input)
         else:
-            k_compress_input, v_compress_input = tuple(t.reshape(batch, kv_heads, 0, self.compress_window_size, self.dim_head) for t in (k_compress_input, v_compress_input))
+            k_compress_input, v_compress_input = tuple(t.reshape(batch, kv_heads, 0, self.compress_block_size, self.dim_head) for t in (k_compress_input, v_compress_input))
 
         # add the intra block positions
 
@@ -645,10 +628,10 @@ class SparseAttention(Module):
         # compressed masking
 
         cmask = None
-
+        # TODO
         if self.causal:
             cq_seq = arange(seq_len, device = device)
-            ck_seq = ((arange(num_compress_blocks, device = device) + 1) * self.compress_block_size) - 1
+            ck_seq = ((arange(num_compress_blocks, device = device) + 1) * self.compress_block_sliding_stride) - 1
             ck_seq = F.pad(ck_seq, (num_mem_compress_kv, 0), value = -1)
 
             cmask = einx.less('j, i -> i j', ck_seq, cq_seq)
@@ -686,9 +669,9 @@ class SparseAttention(Module):
 
         if has_selected_kv_for_fine_attn:
 
-            if self.compress_block_size != self.selection_block_size:
+            if self.compress_block_sliding_stride != self.selection_block_size:
 
-                num_compress_per_fine = self.selection_block_size // self.compress_block_size
+                num_compress_per_fine = self.selection_block_size // self.compress_block_sliding_stride
 
                 round_down_score_len = round_down_mult(importance_scores.shape[-1], num_compress_per_fine)
                 importance_scores = importance_scores[..., :round_down_score_len]
@@ -729,10 +712,7 @@ class SparseAttention(Module):
 
             selected_importance_values, selected_block_indices = importance_scores.topk(num_selected, dim = -1)
 
-            gates = None
-
-            if self.use_diff_topk:
-                gates = straight_through(selected_importance_values, 1.)
+            gates = straight_through(selected_importance_values, 1.) if self.use_diff_topk else None
 
             if self.use_triton_kernel and not disable_triton_kernel:
 
@@ -762,9 +742,7 @@ class SparseAttention(Module):
                 fmask = selected_importance_values > 1e-10
 
                 if seq_len < fine_divisible_seq_len:
-                    fk = pad_to_multiple(fk)
-                    fv = pad_to_multiple(fv)
-                    fq = pad_to_multiple(fq)
+                    fk, fv, fq = map(pad_to_multiple, (fk, fv, fq))
 
                     fmask = pad_at_dim(fmask, (0, remainder), value = False, dim = -2)
 
@@ -846,9 +824,7 @@ class SparseAttention(Module):
             seq_len = fk.shape[-2]
             fmask = None
 
-            fk = pad_to_multiple(fk)
-            fv = pad_to_multiple(fv)
-            fq = pad_to_multiple(fq)
+            fk, fv, fq = map(pad_to_multiple, (fk, fv, fq))
 
             fq, fk, fv = tuple(rearrange(t, 'b h (w n) d -> (b w) h n d', n = self.selection_block_size) for t in (fq, fk, fv))
 

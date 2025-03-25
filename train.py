@@ -40,7 +40,7 @@ QUERY_HEADS_SHARE_SELECTION = True    # if set to False, each query head can loo
 
 SLIDING_WINDOW_SIZE = 64
 COMPRESS_BLOCK_SIZE = 16
-COMPRESS_BLOCK_OVERLAP_LEN = 2
+COMPRESS_BLOCK_SLIDING_STRIDE = 8
 
 FINE_BLOCK_SIZE = 16
 NUM_FINE_SELECTED = 4
@@ -96,10 +96,10 @@ model = Transformer(
     sparse_attn_kwargs = dict(
         sliding_window_size = SLIDING_WINDOW_SIZE,
         compress_block_size = COMPRESS_BLOCK_SIZE,
-        compress_block_overlap_len = COMPRESS_BLOCK_OVERLAP_LEN,
+        compress_block_sliding_stride = COMPRESS_BLOCK_SLIDING_STRIDE,
         compress_mlp = GroupedMLP(
             dim_head = 64,
-            compress_window_size = COMPRESS_BLOCK_SIZE + COMPRESS_BLOCK_OVERLAP_LEN,
+            compress_window_size = COMPRESS_BLOCK_SIZE,
             heads = KV_HEADS,
         ),
         selection_block_size = FINE_BLOCK_SIZE,

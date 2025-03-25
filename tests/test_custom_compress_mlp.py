@@ -26,6 +26,7 @@ def test_alternative_compress_mlp():
         heads = 8,
         sliding_window_size = 2,
         compress_block_size = 4,
+        compress_block_sliding_stride=2,
         selection_block_size = 4,
         num_selected_blocks = 2,
         compress_mlp = compress_mlp
@@ -47,6 +48,7 @@ def test_compress_networks():
         heads = 8,
         sliding_window_size = 2,
         compress_block_size = 4,
+        compress_block_sliding_stride=2,
         selection_block_size = 4,
         num_selected_blocks = 2,
         compress_mlp = AttentionPool(64, 4)
@@ -67,6 +69,7 @@ def test_group_mlp():
         heads = 8,
         sliding_window_size = 2,
         compress_block_size = 4,
+        compress_block_sliding_stride=2,
         selection_block_size = 4,
         num_selected_blocks = 2,
         compress_mlp = GroupedMLP(64, 4, 8)
@@ -88,6 +91,7 @@ def test_single_projection_mlp(grouped):
         heads = 8,
         sliding_window_size = 2,
         compress_block_size = 4,
+        compress_block_sliding_stride=2,
         selection_block_size = 4,
         num_selected_blocks = 2,
         compress_mlp = SingleProjection(64, 4, 8 if grouped else 1)
@@ -117,6 +121,7 @@ def test_compress_transformer():
         heads=8,
         sliding_window_size=64,
         compress_block_size=16,
+        compress_block_sliding_stride=2,
         selection_block_size=16,
         num_selected_blocks=2,
         kv_heads=num_kv_heads,
