@@ -6,7 +6,7 @@ from einops.layers.torch import Rearrange
 
 from native_sparse_attention_pytorch import SparseAttention
 
-device = 'cuda:4'
+device = 'cpu'
 
 @pytest.mark.parametrize('use_diff_topk', (False, True))
 @pytest.mark.parametrize('causal', (False, True))
