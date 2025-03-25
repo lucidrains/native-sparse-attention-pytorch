@@ -16,6 +16,8 @@ This will be my last open sourced project under Meta
 
 - <a href="https://github.com/Pasewark">Eric Pasewark</a> for submitting a simple transformer based compression network
 
+- <a href="https://github.com/Mr-Grin">@Mr-Grin</a> for a pull request that fixes compression block hyperparameters
+
 ## Install
 
 ```bash

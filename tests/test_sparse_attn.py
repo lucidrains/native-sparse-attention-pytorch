@@ -6,8 +6,6 @@ from einops.layers.torch import Rearrange
 
 from native_sparse_attention_pytorch import SparseAttention
 
-device = 'cpu'
-
 @pytest.mark.parametrize('use_diff_topk', (False, True))
 @pytest.mark.parametrize('causal', (False, True))
 @pytest.mark.parametrize('seq_len', (1, 4, 31, 32, 120))
@@ -41,9 +39,9 @@ def test_sparse_attn(
         num_selected_blocks = num_selected_block,
         use_diff_topk = use_diff_topk,
         query_heads_share_selected_kv = query_heads_share_selected_kv,
-    ).to(device)
+    )
 
-    tokens = torch.randn(2, seq_len, 512).to(device)
+    tokens = torch.randn(2, seq_len, 512)
 
     attended = attn(tokens)
 
@@ -70,9 +68,9 @@ def test_inference(
         selection_block_size = selection_block_size,
         num_selected_blocks = num_selected_blocks,
         compress_block_sliding_stride = compress_block_sliding_stride
-    ).to(device)
+    )
 
-    tokens = torch.randn(2, seq_len, 512).to(device)
+    tokens = torch.randn(2, seq_len, 512)
 
     parallel_out = attn(tokens)
 
@@ -106,9 +104,9 @@ def test_transformer_inference(
             selection_block_size = selection_block_size,
             num_selected_blocks = 2
         )
-    ).to(device)
+    )
 
-    prompt = torch.randint(0, 256, (1, 1)).to(device)
+    prompt = torch.randint(0, 256, (1, 1))
 
     sampled = model.sample(prompt, 128, temperature = 0., use_cache_kv = False)
     sampled_cached = model.sample(prompt, 128, temperature = 0., use_cache_kv = True)

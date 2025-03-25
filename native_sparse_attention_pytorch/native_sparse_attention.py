@@ -439,7 +439,7 @@ class SparseAttention(Module):
         if return_cache:
             cache_compressed_kv = ((ck, cv), (run_k, run_v))
 
-        # 2. fine attention inference (todo - compress and fine diff block sizes)
+        # 2. fine attention inference
 
         importance_scores = csim[..., self.num_mem_compress_kv:]
 
@@ -628,7 +628,7 @@ class SparseAttention(Module):
         # compressed masking
 
         cmask = None
-        # TODO
+
         if self.causal:
             cq_seq = arange(seq_len, device = device)
             ck_seq = ((arange(num_compress_blocks, device = device) + 1) * self.compress_block_sliding_stride) - 1
