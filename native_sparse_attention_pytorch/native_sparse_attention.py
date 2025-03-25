@@ -263,6 +263,7 @@ class SparseAttention(Module):
         self.compress_block_size = compress_block_size
         self.compress_block_sliding_stride = compress_block_sliding_stride
         assert self.compress_block_size >= self.compress_block_sliding_stride, 'compress_block_size must be >= compress_block_sliding_stride'
+        assert self.compress_block_sliding_stride > 0, 'compress_block_sliding_stride must be greater than 0'
         assert divisible_by(selection_block_size, self.compress_block_sliding_stride), f'selection_block_size {selection_block_size} must be divisible by compress_block_sliding_stride {self.compress_block_sliding_stride}'
 
         # Compression window splitting
