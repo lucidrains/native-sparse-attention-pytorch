@@ -278,7 +278,7 @@ def forward_kernel_causal_and_sparse(
 
             qk += tl.where(causal_mask, 0, float("-inf"))
 
-            m_ij = tl.maximum(tl.max(qk, 2) * softmax_scale, lse_i)
+            m_ij = tl.maximum(tl.max(qk, 2) * softmax_scale, m_i)
             p = tl.exp(qk * softmax_scale - m_ij[:, :, None])
 
             l_ij = tl.sum(p, 2)
@@ -408,7 +408,7 @@ def forward_kernel_causal_and_sparse(
 
             # attention
 
-            m_ij = tl.maximum(tl.max(sel_qk, 2) * softmax_scale, lse_i)
+            m_ij = tl.maximum(tl.max(sel_qk, 2) * softmax_scale, m_i)
             block_p = tl.exp(sel_qk * softmax_scale - m_ij[:, :, None])
 
             l_ij = tl.sum(block_p, 2)
