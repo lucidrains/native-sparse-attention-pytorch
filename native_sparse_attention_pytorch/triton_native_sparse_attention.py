@@ -1064,10 +1064,12 @@ def backward_kernel_one_col_block_sparse(
             offs_m * stride_kvbl_m
         )
 
-        sel_grads = ds * qk
+        sel_grads = ds * qk # (q block, q head group, k block)
+
         sel_grads = tl.where(block_masks[:, None, None], sel_grads, 0.)
-        sel_grads = sel_grads.reshape(BLOCK, QUERY_HEAD_GROUPS * BLOCK)
-        sel_grads = tl.sum(sel_grads, 1)
+
+        sel_grads = tl.sum(sel_grads, 2) # for k block
+        sel_grads = tl.sum(sel_grads, 1) # for q head groups
 
         tl.atomic_add(
             kv_block_grads_ptrs + OFF_SEL_KV_BLOCKS,
@@ -1677,8 +1679,6 @@ def native_sparse_attn_backward(
     assert divisible_by(block_size, 16)
 
     num_blocks_per_sel = block_size // 16
-
-    orig_kv_block_grads = kv_block_grads
 
     num_sel_fine_blocks = kv_block_indices.shape[-1]
     assert kv_block_indices.shape == kv_block_mask.shape
