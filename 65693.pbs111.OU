@@ -1,0 +1,64 @@
+/var/spool/pbs/mom_priv/jobs/65693.pbs111.SC: line 10: deactivate: command not found
+wandb: Using wandb-core as the SDK backend.  Please refer to https://wandb.me/wandb-core for more information.
+wandb: Currently logged in as: runjiachen (runjiachen-nus). Use `wandb login --relogin` to force relogin
+wandb: Tracking run with wandb version 0.18.7
+wandb: Run data is saved locally in /home/users/nus/e1113744/native-sparse-attention-pytorch/wandb/run-20250707_181437-cjdzttf7
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run morning-paper-3
+wandb: ⭐️ View project at https://wandb.ai/runjiachen-nus/native-sparse-attention
+wandb: 🚀 View run at https://wandb.ai/runjiachen-nus/native-sparse-attention/runs/cjdzttf7
+wandb: WARNING Calling wandb.run.save without any arguments is deprecated.Changes to attributes are automatically persisted.
+training:   0%|          | 0/100000 [00:00<?, ?it/s]training:   0%|          | 0/100000 [00:00<?, ?it/s]
+Traceback (most recent call last):
+  File "/home/users/nus/e1113744/native-sparse-attention-pytorch/train.py", line 160, in <module>
+    loss = model(data, return_loss = True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/users/nus/e1113744/llm-foundry/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/users/nus/e1113744/llm-foundry/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/users/nus/e1113744/native-sparse-attention-pytorch/native_sparse_attention_pytorch/transformer.py", line 308, in forward
+    attn_out, layer_cache = attn(
+                            ^^^^^
+  File "/home/users/nus/e1113744/llm-foundry/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/users/nus/e1113744/llm-foundry/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: Attention.forward() got an unexpected keyword argument 'cache'
+
+real	0m14.447s
+user	0m12.093s
+sys	0m3.989s
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+			Resource Usage on 2025-07-07 18:14:45.053803:
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+	JobId: 65693.pbs111
+	Project: 71001002
+	Exit Status: 1
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+	NCPUs: Requested(14), Used(14)
+	CPU Time Used: 00:00:16
+	Memory: Requested(235gb), Used(1141256kb)
+	Vmem Used: 521964248kb
+	Walltime: Requested(12:00:00), Used(00:00:16)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+	Execution Nodes Used: (a2ap-dgx034:ngpus=1:ncpus=14:mem=246415360kb)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+	GPU Duration: 17.99secs
+	GPU Power Consumed: 56.66W
+	GPU Max GPU Memory Used: 704.0MB
+	Memory Throughput Rate (Average): a2ap-dgx034:(gpu7:0%)
+	Memory Throughput Rate (Max): a2ap-dgx034:(gpu7:0%)
+	Memory Throughput Rate (Min): a2ap-dgx034:(gpu7:0%)
+	GPU SM Utilization (Average): a2ap-dgx034:(gpu7:0%)
+	GPU SM Utilization (Max): a2ap-dgx034:(gpu7:0%)
+	GPU SM Utilization (Min): a2ap-dgx034:(gpu7:0%)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Warning: All GPUs have a percentage of 0 utilisation.
+GPU application profile: Idle
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+

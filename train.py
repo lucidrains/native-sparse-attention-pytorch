@@ -31,8 +31,8 @@ SEQ_LEN = 512
 HEADS = 8
 KV_HEADS = 4
 
-USE_SPARSE_ATTN = True
-USE_TRITON_NSA = True
+USE_SPARSE_ATTN = False
+USE_TRITON_NSA = False
 USE_FLEX_FOR_FINE_SELECTION = False   # will push flex a bit, won't be efficient as each layer needs sparsity dynmically generated, but may be enough just to compare to full attention before going all-in on triton kernels
 QUERY_HEADS_SHARE_SELECTION = True    # if set to False, each query head can look at a different segment of their corresponding key / value head in GQA
 
@@ -53,7 +53,7 @@ USE_EFFICIENT_INFERENCE = True # needs validation still
 
 PROJECT_NAME = 'native-sparse-attention'
 RUN_NAME = 'baseline' if not USE_SPARSE_ATTN else f'sparse-attn: compress size {COMPRESS_BLOCK_SIZE} | fine size {FINE_BLOCK_SIZE} | {NUM_FINE_SELECTED} selected'
-WANDB_ONLINE = False # turn this on to pipe experiment to cloud
+WANDB_ONLINE = True # turn this on to pipe experiment to cloud
 
 # helpers
 

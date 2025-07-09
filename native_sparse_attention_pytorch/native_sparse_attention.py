@@ -19,6 +19,8 @@ import einx
 from einops import einsum, repeat, rearrange, reduce, pack, unpack
 from einops.layers.torch import Rearrange
 
+import time
+
 # b - batch
 # h - heads
 # qh - grouped query heads
@@ -185,6 +187,42 @@ def attend(
 
 # classes
 
+class Timer: 
+
+    def __init__(self): 
+        self.t1 = 0 
+        self.t2 = 0 
+        self.t3 = 0 
+        self.t4 = 0
+        self.counter = 0 
+
+    def add_t1(self, val): 
+        self.t1 += val
+        ##self.counter += 1
+
+    def add_t2(self, val): 
+        self.t2 += val
+        ##self.counter += 1
+
+    def add_t3(self, val): 
+        self.t3 += val
+        ##self.counter += 1
+
+    def add_t4(self, val): 
+        self.t4 += val
+        ##self.counter += 1
+
+    def __str__(self):
+        return (
+            f"time spent in t1 is: {self.t1}, "
+            f"time spent in t2 is: {self.t2}, "
+            f"time spent in t3 is: {self.t3}"
+            f"time spent in t4 is: {self.t4}"
+            f"counter is: {self.counter}"
+
+        )
+
+
 class SparseAttention(Module):
     def __init__(
         self,
@@ -205,9 +243,11 @@ class SparseAttention(Module):
         query_heads_share_selected_kv = True, # if set to True, importance score is averaged across query heads to select top-n buckets of kv per kv head - but can be set to False for each query head within a group to look at different sets of kv buckets. will be more memory and compute of course
         compress_mlp: Module | None = None,
         compress_mlp_expand_factor = 1.,
-        strategy_combine_mlp: Module | None = None
+        strategy_combine_mlp: Module | None = None, 
     ):
         super().__init__()
+
+        self.timer = Timer()
 
         # attention heads
         # handling gqa if `kv_heads` is set
@@ -246,6 +286,8 @@ class SparseAttention(Module):
         self.qkv_split = qkv_split
 
         # sliding window strategy
+
+        
 
         self.sliding_window = LocalAttention(
             dim = dim_head,
@@ -553,8 +595,9 @@ class SparseAttention(Module):
         disable_triton_kernel = False,
         sliding_window_flex_mask = None,
         fine_selection_flex_mask = None,
-        return_cache = False
+        return_cache = False,
     ):
+        ##start = time.perf_counter()
         is_inferencing = exists(cache)
 
         if is_inferencing:
@@ -618,6 +661,7 @@ class SparseAttention(Module):
 
         # 1. coarse attention over compressed
 
+        start = time.perf_counter() 
         mem_ck, mem_cv = repeat(self.compress_mem_kv, 'kv ... -> kv b ...', b = batch)
 
         num_mem_compress_kv = mem_ck.shape[-2]
@@ -636,7 +680,9 @@ class SparseAttention(Module):
 
             cmask = einx.less('j, i -> i j', ck_seq, cq_seq)
 
+        
         compressed_attn_out, csim = attend(cq, ck, cv, mask = cmask, return_sim = True)
+        self.timer.add_t1(time.perf_counter() - start)
 
         # for 2. and 3., will give them relative positions with rotary - compressed needs to be handled separately (even if they already have intra block absolute positions)
 
@@ -706,6 +752,8 @@ class SparseAttention(Module):
         remainder = fine_divisible_seq_len - seq_len
         pad_to_multiple = partial(pad_at_dim, pad = (0, remainder), dim = -2)
 
+        start = time.perf_counter()
+
         if has_selected_kv_for_fine_attn:
 
             # get the top-n kv segments for fine attention
@@ -716,10 +764,11 @@ class SparseAttention(Module):
 
             if self.use_triton_kernel and not disable_triton_kernel:
 
-                from native_sparse_attention_pytorch.triton_native_sparse_attention import native_sparse_attend
+                from triton_native_sparse_attention import native_sparse_attend
 
                 fmask = selected_importance_values > 1e-10
 
+                
                 fine_attn_out = native_sparse_attend(
                     fq, fk, fv,
                     self.selection_block_size,
@@ -728,6 +777,7 @@ class SparseAttention(Module):
                     sel_scale = gates,
                     include_block_causal = self.causal
                 )
+                
 
             elif exists(fine_selection_flex_mask):
                 assert not self.use_diff_topk, 'differential topk is not available for flex attention'
@@ -836,6 +886,8 @@ class SparseAttention(Module):
             fine_attn_out = rearrange(fine_attn_out, '(b w) h n d -> b h (w n) d', b = batch)
             fine_attn_out = fine_attn_out[..., :seq_len, :]
 
+        self.timer.add_t2(time.perf_counter() - start)
+
         # 3. overlapping sliding window, this is unsurprising and expected - `s` for sliding
 
         sq = q
@@ -847,7 +899,9 @@ class SparseAttention(Module):
         else:
             sk, sv = tuple(repeat(t, 'b h ... -> b (h num_grouped_queries) ...', num_grouped_queries = self.num_grouped_queries) for t in (sk, sv))
 
+            start = time.perf_counter()
             sliding_window_attn_out = self.sliding_window(sq, sk, sv)
+            self.timer.add_t3(time.perf_counter() - start)
 
         # combine strategies
 
@@ -863,5 +917,7 @@ class SparseAttention(Module):
 
         if not return_cache:
             return out
+        
+        ##self.timer.add_t4(time.perf_counter() - start)
 
         return out, (cache_kv, cache_compressed_kv)

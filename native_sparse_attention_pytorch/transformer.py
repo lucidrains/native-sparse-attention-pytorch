@@ -11,7 +11,7 @@ from einops.layers.torch import Rearrange
 
 from rotary_embedding_torch import RotaryEmbedding
 
-from native_sparse_attention_pytorch.native_sparse_attention import (
+from native_sparse_attention import (
     SparseAttention,
     create_compress_mask,
     create_fine_mask,
@@ -62,68 +62,85 @@ def top_k(logits, thres = 0.9):
 
 # attention
 
-class Attention(Module):
+class Attention(nn.Module):
     def __init__(
         self,
         dim,
-        dim_head = 64,
-        heads = 8,
-        causal = True,
-        kv_heads = None
+        dim_head=64,
+        heads=8,
+        causal=True,
+        kv_heads=None
     ):
         super().__init__()
         self.norm = RMSNorm(dim)
 
         self.heads = heads
-        kv_heads = default(kv_heads, heads)
-        dim_inner = heads * dim_head
-        dim_kv_inner = kv_heads * dim_head
-
+        kv_heads = kv_heads or heads
         self.kv_heads = kv_heads
         self.causal = causal
 
+        dim_inner = heads * dim_head
+        dim_kv_inner = kv_heads * dim_head
+
         self.rotary_embed = RotaryEmbedding(dim_head)
 
-        self.to_q = nn.Linear(dim, dim_inner, bias = False)
-        self.to_k = nn.Linear(dim, dim_kv_inner, bias = False)
-        self.to_v = nn.Linear(dim, dim_kv_inner, bias = False)
+        self.to_q = nn.Linear(dim, dim_inner, bias=False)
+        self.to_k = nn.Linear(dim, dim_kv_inner, bias=False)
+        self.to_v = nn.Linear(dim, dim_kv_inner, bias=False)
 
-        self.split_heads = Rearrange('b n (h d) -> b h n d', d = dim_head)
-        self.merge_heads = Rearrange('b h n d -> b n (h d)')
+        self.split_heads = lambda x: rearrange(x, 'b n (h d) -> b h n d', d=dim_head)
+        self.merge_heads = lambda x: rearrange(x, 'b h n d -> b n (h d)')
 
-        self.to_out = nn.Linear(dim_inner, dim, bias = False)
+        self.to_out = nn.Linear(dim_inner, dim, bias=False)
 
     def forward(
         self,
-        x
+        x,
+        cache=None,
+        return_cache=False
     ):
-
+        # Layer normalization
         x = self.norm(x)
 
+        # Project to Q, K, V
         q = self.to_q(x)
         k = self.to_k(x)
         v = self.to_v(x)
 
+        # Split into heads
         q, k, v = map(self.split_heads, (q, k, v))
 
-        # relative positions
-
+        # Apply rotary embeddings
         q, k = self.rotary_embed.rotate_queries_with_cached_keys(q, k)
 
-        # naive gqa
+        # Group key and value heads for attention
+        k_grouped = repeat(k, 'b h n d -> b (g h) n d', g=self.heads // self.kv_heads)
+        v_grouped = repeat(v, 'b h n d -> b (g h) n d', g=self.heads // self.kv_heads)
 
-        k, v = tuple(repeat(t, 'b h ... -> b (g h) ...', g = self.heads // self.kv_heads) for t in (k, v))
+        # Prepend past key/value if provided
+        if cache is not None:
+            past_k, past_v = cache
+            k_grouped = torch.cat([past_k, k_grouped], dim=2)
+            v_grouped = torch.cat([past_v, v_grouped], dim=2)
 
-        # attention branch
-
+        # Compute attention (q still has original head count)
         out = F.scaled_dot_product_attention(
-            q, k, v,
-            is_causal = self.causal
+            q,
+            k_grouped,
+            v_grouped,
+            is_causal=self.causal
         )
 
+        # Merge heads and project out
         out = self.merge_heads(out)
+        out = self.to_out(out)
 
-        return self.to_out(out)
+        # Return output and new cache if requested
+        if return_cache:
+            return out, (k_grouped, v_grouped)
+        return out
+
+
 
 # feedforward
 
@@ -309,7 +326,6 @@ class Transformer(Module):
                 tokens,
                 cache = next(iter_cache, None),
                 return_cache = True,
-                **attn_kwargs
             )
 
             next_cache.append(layer_cache)
