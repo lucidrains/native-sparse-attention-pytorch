@@ -771,20 +771,21 @@ def backward_store_dk_dv(
 ):
     # [2022-11-01] TD: Same bug. In the case of EVEN_N=True and EVEN_M=False,
     # if we just call tl.store(dv_ptrs), there's a race condition
+    mask_n = offs_n[:, None] >= 0
     if EVEN_N & EVEN_M:
         if EVEN_HEADDIM:
-            tl.atomic_add(dv_ptrs, dv, sem = 'relaxed')
-            tl.atomic_add(dk_ptrs, dk, sem = 'relaxed')
+            tl.atomic_add(dv_ptrs, dv, mask=mask_n, sem = 'relaxed')
+            tl.atomic_add(dk_ptrs, dk, mask=mask_n, sem = 'relaxed')
         else:
-            tl.atomic_add(dv_ptrs, dv, mask=offs_d[None, :] < headdim, sem = 'relaxed')
-            tl.atomic_add(dk_ptrs, dk, mask=offs_d[None, :] < headdim, sem = 'relaxed')
+            tl.atomic_add(dv_ptrs, dv, mask=mask_n & (offs_d[None, :] < headdim), sem = 'relaxed')
+            tl.atomic_add(dk_ptrs, dk, mask=mask_n & (offs_d[None, :] < headdim), sem = 'relaxed')
     else:
         if EVEN_HEADDIM:
-            tl.atomic_add(dv_ptrs, dv, mask=offs_n[:, None] < seqlen_k, sem = 'relaxed')
-            tl.atomic_add(dk_ptrs, dk, mask=offs_n[:, None] < seqlen_k, sem = 'relaxed')
+            tl.atomic_add(dv_ptrs, dv, mask=mask_n & (offs_n[:, None] < seqlen_k), sem = 'relaxed')
+            tl.atomic_add(dk_ptrs, dk, mask=mask_n & (offs_n[:, None] < seqlen_k), sem = 'relaxed')
         else:
-            tl.atomic_add(dv_ptrs, dv, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim), sem = 'relaxed')
-            tl.atomic_add(dk_ptrs, dk, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim), sem = 'relaxed')
+            tl.atomic_add(dv_ptrs, dv, mask=mask_n & (offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim), sem = 'relaxed')
+            tl.atomic_add(dk_ptrs, dk, mask=mask_n & (offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim), sem = 'relaxed')
 
 
 @triton.jit
