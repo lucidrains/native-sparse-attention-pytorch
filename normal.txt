@@ -1,0 +1,3 @@
+using custom triton kernel
+[1;34mwandb[0m: 🚀 View run [33mmorning-paper-3[0m at: [34mhttps://wandb.ai/runjiachen-nus/native-sparse-attention/runs/cjdzttf7[0m
+[1;34mwandb[0m: Find logs at: [1;35mwandb/run-20250707_181437-cjdzttf7/logs[0m

@@ -1,0 +1,15 @@
+#!/bin/bash
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=12:00:00
+#PBS -o ./
+#PBS -j oe
+#PBS -N submit
+#PBS -q ic102
+#PBS -P 71001002
+
+deactivate 
+cd llm-foundry 
+source .venv/bin/activate 
+cd ~ 
+cd native-sparse-attention-pytorch 
+time python train.py >> out_triton.txt
