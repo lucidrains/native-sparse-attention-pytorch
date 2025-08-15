@@ -18,6 +18,8 @@ This will be my last open sourced project under Meta
 
 - <a href="https://github.com/Mr-Grin">@Mr-Grin</a> for a pull request that fixes compression block hyperparameters
 
+- <a href="https://github.com/StrongSpoon">@StrongSpoon</a> for a memory access guard
+
 ## Install
 
 ```bash
