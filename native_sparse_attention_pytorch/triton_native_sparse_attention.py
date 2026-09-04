@@ -1,5 +1,10 @@
 from __future__ import annotations
 from native_sparse_attention_pytorch.tensor_typing import Float, Int, Bool
+from native_sparse_attention_pytorch.kernel_config import (
+    get_shared_memory_limit,
+    launch_with_shared_memory_fallback,
+    select_kernel_config,
+)
 
 # taken from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/flash_attn_triton.py
 # with fixes for triton 2.3
@@ -615,7 +620,6 @@ def native_sparse_attn_forward(
 
     assert divisible_by(block_size, 16)
 
-    num_blocks_per_sel = block_size // 16
     num_selected_fine_blocks = kv_block_indices.shape[-1]
     assert kv_block_indices.shape == kv_block_mask.shape
 
@@ -637,7 +641,8 @@ def native_sparse_attn_forward(
     slide_o = torch.empty_like(q)
 
     BLOCK_HEADDIM = max(triton.next_power_of_2(dim), 16)
-    num_warps = 4 if dim <= 64 else 8
+    shared_memory_limit = get_shared_memory_limit(device)
+    query_block, num_warps, num_stages = select_kernel_config(dim, shared_memory_limit)
 
     grid = lambda META: (
         triton.cdiv(seqlen_q, META["BLOCK"]),
@@ -645,50 +650,56 @@ def native_sparse_attn_forward(
         (2 if return_sliding_window_out else 1)
     ) # kv heads here, as grouped query heads all loaded, following the paper
 
-    forward_kernel[grid](
-        q,
-        k,
-        v,
-        kv_block_indices,
-        kv_block_mask,
-        o,
-        slide_o,
-        lse,
-        slide_lse,
-        softmax_scale,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        o.stride(0),
-        o.stride(1),
-        o.stride(2),
-        kv_block_indices.stride(0),
-        kv_block_indices.stride(1),
-        kv_block_indices.stride(2),
-        lse.stride(0),
-        kv_heads,
-        seqlen_q,
-        seqlen_k,
-        seqlen_q_rounded,
-        dim,
-        seqlen_q // 32,
-        seqlen_k // 32,
-        BLOCK_HEADDIM,
-        BLOCK = 16,
-        SEL_BLOCK = block_size,
-        QUERY_HEAD_GROUPS = head_groups,
-        NUM_SEL_KV_BLOCKS = num_selected_fine_blocks,
-        NUM_BLOCKS_PER_SEL = num_blocks_per_sel,
-        INCLUDE_BLOCK_CAUSAL = include_block_causal,
-        RETURN_SLIDING_OUT = return_sliding_window_out,
-        num_warps = num_warps,
-        num_stages = 1,
+    def launch_forward(query_block, num_warps, num_stages):
+        forward_kernel[grid](
+            q,
+            k,
+            v,
+            kv_block_indices,
+            kv_block_mask,
+            o,
+            slide_o,
+            lse,
+            slide_lse,
+            softmax_scale,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            o.stride(0),
+            o.stride(1),
+            o.stride(2),
+            kv_block_indices.stride(0),
+            kv_block_indices.stride(1),
+            kv_block_indices.stride(2),
+            lse.stride(0),
+            kv_heads,
+            seqlen_q,
+            seqlen_k,
+            seqlen_q_rounded,
+            dim,
+            seqlen_q // 32,
+            seqlen_k // 32,
+            BLOCK_HEADDIM,
+            BLOCK = query_block,
+            SEL_BLOCK = block_size,
+            QUERY_HEAD_GROUPS = head_groups,
+            NUM_SEL_KV_BLOCKS = num_selected_fine_blocks,
+            NUM_BLOCKS_PER_SEL = block_size // query_block,
+            INCLUDE_BLOCK_CAUSAL = include_block_causal,
+            RETURN_SLIDING_OUT = return_sliding_window_out,
+            num_warps = num_warps,
+            num_stages = num_stages,
+        )
+
+    launch_with_shared_memory_fallback(
+        launch_forward,
+        (query_block, num_warps, num_stages),
     )
 
     return o, slide_o, lse, slide_lse
@@ -1679,8 +1690,6 @@ def native_sparse_attn_backward(
 
     assert divisible_by(block_size, 16)
 
-    num_blocks_per_sel = block_size // 16
-
     num_sel_fine_blocks = kv_block_indices.shape[-1]
     assert kv_block_indices.shape == kv_block_mask.shape
 
@@ -1696,6 +1705,8 @@ def native_sparse_attn_backward(
     # delta = torch.zeros_like(lse)
 
     BLOCK_HEADDIM = max(triton.next_power_of_2(dim), 16)
+    shared_memory_limit = get_shared_memory_limit(device)
+    query_block, num_warps, num_stages = select_kernel_config(dim, shared_memory_limit)
 
     delta = torch.empty_like(lse)
     slide_delta = torch.empty_like(slide_lse)
@@ -1740,79 +1751,83 @@ def native_sparse_attn_backward(
         )
 
     grid = lambda META: (
-        int(include_block_causal) + int(sliding) + (num_sel_fine_blocks * num_blocks_per_sel),
+        int(include_block_causal) + int(sliding) + (num_sel_fine_blocks * (block_size // META['BLOCK'])),
         batch * kv_heads,
         triton.cdiv(seqlen_k, META['BLOCK'])
     )
 
-    backward_kernel[grid](
-        q,
-        k,
-        v,
-        kv_block_indices,
-        kv_block_mask,
-        kv_block_grads,
-        do,
-        dq,
-        dk,
-        dv,
-        lse,
-        delta,
-        do_slide,
-        slide_lse,
-        slide_delta,
-        softmax_scale,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        do.stride(0),
-        do.stride(1),
-        do.stride(2),
-        dq.stride(0),
-        dq.stride(1),
-        dq.stride(2),
-        dk.stride(0),
-        dk.stride(1),
-        dk.stride(2),
-        dv.stride(0),
-        dv.stride(1),
-        dv.stride(2),
-        kv_block_indices.stride(0),
-        kv_block_indices.stride(1),
-        kv_block_indices.stride(2),
-        lse.stride(0),
-        delta.stride(0),
-        kv_heads,
-        seqlen_q,
-        seqlen_k,
-        seqlen_q_rounded,
-        dim,
-        seqlen_q // 32,
-        seqlen_k // 32,  # key for triton cache (limit number of compilations)
-        # Can't use kwargs here because triton autotune expects key to be args, not kwargs
-        # IS_CAUSAL=causal, BLOCK_HEADDIM=d,
-        BLOCK_HEADDIM,
-        BLOCK = 16,
-        SEL_BLOCK = block_size,
-        QUERY_HEAD_GROUPS = head_groups,
-        EVEN_M = divisible_by(seqlen_q, block_size),
-        EVEN_N = divisible_by(seqlen_k, block_size),
-        EVEN_HEADDIM = BLOCK_HEADDIM == dim,
-        RETURN_SEL_GRADS = return_sel_grads,
-        INCLUDE_BLOCK_CAUSAL = include_block_causal,
-        SLIDING = sliding,
-        NUM_BLOCKS_PER_SEL = num_blocks_per_sel,
-        BLOCK_DV_USE_DOT = default(block_dk_dv_use_dot, head_groups > 1),
-        BLOCK_DK_USE_DOT = default(block_dk_dv_use_dot, head_groups > 1)
-        # BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        # num_warps=num_warps,
-        # num_stages=1,
+    def launch_backward(query_block, num_warps, num_stages):
+        backward_kernel[grid](
+            q,
+            k,
+            v,
+            kv_block_indices,
+            kv_block_mask,
+            kv_block_grads,
+            do,
+            dq,
+            dk,
+            dv,
+            lse,
+            delta,
+            do_slide,
+            slide_lse,
+            slide_delta,
+            softmax_scale,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            do.stride(0),
+            do.stride(1),
+            do.stride(2),
+            dq.stride(0),
+            dq.stride(1),
+            dq.stride(2),
+            dk.stride(0),
+            dk.stride(1),
+            dk.stride(2),
+            dv.stride(0),
+            dv.stride(1),
+            dv.stride(2),
+            kv_block_indices.stride(0),
+            kv_block_indices.stride(1),
+            kv_block_indices.stride(2),
+            lse.stride(0),
+            delta.stride(0),
+            kv_heads,
+            seqlen_q,
+            seqlen_k,
+            seqlen_q_rounded,
+            dim,
+            seqlen_q // 32,
+            seqlen_k // 32,  # key for triton cache (limit number of compilations)
+            # Can't use kwargs because Triton autotune expects key arguments.
+            BLOCK_HEADDIM,
+            BLOCK = query_block,
+            SEL_BLOCK = block_size,
+            QUERY_HEAD_GROUPS = head_groups,
+            EVEN_M = divisible_by(seqlen_q, block_size),
+            EVEN_N = divisible_by(seqlen_k, block_size),
+            EVEN_HEADDIM = BLOCK_HEADDIM == dim,
+            RETURN_SEL_GRADS = return_sel_grads,
+            INCLUDE_BLOCK_CAUSAL = include_block_causal,
+            SLIDING = sliding,
+            NUM_BLOCKS_PER_SEL = block_size // query_block,
+            BLOCK_DV_USE_DOT = default(block_dk_dv_use_dot, head_groups > 1),
+            BLOCK_DK_USE_DOT = default(block_dk_dv_use_dot, head_groups > 1),
+            num_warps = num_warps,
+            num_stages = num_stages,
+        )
+
+    launch_with_shared_memory_fallback(
+        launch_backward,
+        (query_block, num_warps, num_stages),
     )
 
     return delta, slide_delta
